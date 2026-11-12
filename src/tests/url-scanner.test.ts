@@ -1,0 +1,196 @@
+import { describe, expect, test } from "bun:test";
+import {
+  deriveUrlFilenameParts,
+  extractMediaTokensFromText,
+  extractNativeGalleryUrlsFromCharacter,
+  filterScanItemsForDownload,
+  scanCharacterMedia,
+} from "../shared/url-scanner.ts";
+
+describe("url-scanner", () => {
+  test("extracts Markdown (inline & reference), HTML img/srcset/video/source, CSS url(), and bare media URLs while ignoring local/font URLs", () => {
+    const sample = `
+      Here is a markdown image: ![Banner](https://files.catbox.moe/abc123.png "Title")
+      And balanced parens: ![Wiki](https://example.com/char_(v2).webp)
+      And reference markdown: ![RefBanner][hero-ref]
+      [hero-ref]: https://cdn.example.org/hero_ref.png "Hero"
+      And HTML img with entity and srcset: <img src="https://i.imgur.com/pic.jpg?foo=1&amp;bar=2" srcset="https://i.imgur.com/pic_1x.jpg 1x, https://i.imgur.com/pic_2x.jpg 2x" />
+      And video with poster: <video src="https://cdn.example.org/intro.mp4" poster="https://cdn.example.org/poster.jpg"></video>
+      And CSS background: <div style="background-image: url('https://assets.example.net/bg.gif')"></div>
+      And bare URL: https://media.example.com/standalone.avif.
+      Ignored local: ![Local](/api/v1/images/11111111-2222-3333-4444-555555555555)
+      Ignored data: <img src="data:image/png;base64,iVBORw0KGgo=" />
+      Ignored font: @import url('https://fonts.googleapis.com/css2?family=Inter');
+      Ignored woff2: url("https://example.com/font.woff2")
+    `;
+
+    const tokens = extractMediaTokensFromText(sample, { scanBareUrls: true });
+    const urls = tokens.map((t) => t.normalizedUrl);
+
+    expect(urls).toContain("https://files.catbox.moe/abc123.png");
+    expect(urls).toContain("https://example.com/char_(v2).webp");
+    expect(urls).toContain("https://cdn.example.org/hero_ref.png");
+    expect(urls).toContain("https://i.imgur.com/pic.jpg?foo=1&bar=2");
+    expect(urls).toContain("https://i.imgur.com/pic_1x.jpg");
+    expect(urls).toContain("https://i.imgur.com/pic_2x.jpg");
+    expect(urls).toContain("https://cdn.example.org/intro.mp4");
+    expect(urls).toContain("https://cdn.example.org/poster.jpg");
+    expect(urls).toContain("https://assets.example.net/bg.gif");
+    expect(urls).toContain("https://media.example.com/standalone.avif");
+    expect(urls.length).toBe(10);
+
+    const videoToken = tokens.find(
+      (t) => t.normalizedUrl === "https://cdn.example.org/intro.mp4",
+    );
+    expect(videoToken?.mediaKind).toBe("video");
+  });
+
+  test("deriveUrlFilenameParts extracts extension from query format parameter when path lacks one", () => {
+    const parts = deriveUrlFilenameParts(
+      "https://pbs.twimg.com/media/GH12345abc?format=jpg&name=large",
+    );
+    expect(parts.cleanedStem).toBe("GH12345abc");
+    expect(parts.ext).toBe("jpg");
+    expect(parts.basename).toBe("GH12345abc.jpg");
+  });
+
+  test("scans character fields, deduplicates shared divider across greetings, and filters granularly", () => {
+    const scan = scanCharacterMedia(
+      {
+        id: "char-1",
+        name: "Aurelia",
+        creator_notes: `<div style="background:url(https://files.catbox.moe/notes_bg.png)"><img src="https://files.catbox.moe/divider.png"></div>`,
+        first_mes: `![Opening](https://files.catbox.moe/divider.png)\n![Scene1](https://i.imgur.com/scene1.jpg)`,
+        description: `![Avatar](https://i.imgur.com/desc.png)`,
+        alternate_greetings: [
+          `![Divider](https://files.catbox.moe/divider.png)\n![G1](https://files.catbox.moe/g1.png)`,
+          `![Divider](https://files.catbox.moe/divider.png)\n![G2](https://files.catbox.moe/g2.mp4)`,
+          `![G3](https://cdn.other.org/g3.webp)`,
+        ],
+      },
+      [
+        {
+          id: "wb-1",
+          name: "World Lore",
+          entries: [
+            {
+              id: "e-1",
+              comment: "Map",
+              content: `![Map](https://lore.example.com/map.png)`,
+            },
+          ],
+        },
+      ],
+      [
+        {
+          id: "rx-1",
+          script_name: "HUD",
+          replace_string: `<img src="https://hud.example.com/frame.png">`,
+        },
+      ],
+      {
+        localizedByNormalizedUrl: new Map(),
+        failedByNormalizedUrl: new Map(),
+      },
+    );
+
+    // Total unique URLs: notes_bg, divider, scene1, desc, g1, g2, g3, map, frame = 9
+    expect(scan.items.length).toBe(9);
+    // divider appears 4 times, so totalOccurrences = 9 + 3 = 12
+    expect(scan.totalOccurrences).toBe(12);
+    expect(scan.greetingBreakdown.length).toBe(3);
+
+    // Filter 1: Only Creator's Notes & First Message
+    const notesAndFirst = filterScanItemsForDownload(scan, {
+      sections: ["creator_notes", "first_mes"],
+    });
+    expect(notesAndFirst.map((i) => i.normalizedUrl).sort()).toEqual([
+      "https://files.catbox.moe/divider.png",
+      "https://files.catbox.moe/notes_bg.png",
+      "https://i.imgur.com/scene1.jpg",
+    ]);
+
+    // Filter 2: Only Alternate Greeting #2
+    const onlyGreeting2 = filterScanItemsForDownload(scan, {
+      sections: ["alternate_greetings"],
+      greetingIndices: [2],
+    });
+    expect(onlyGreeting2.map((i) => i.normalizedUrl).sort()).toEqual([
+      "https://files.catbox.moe/divider.png",
+      "https://files.catbox.moe/g2.mp4",
+    ]);
+
+    // Filter 3: Filter by domain `i.imgur.com` and exclude `desc.png`
+    const imgurFiltered = filterScanItemsForDownload(scan, {
+      domains: ["i.imgur.com"],
+      excludedUrls: ["https://i.imgur.com/desc.png"],
+    });
+    expect(imgurFiltered.map((i) => i.normalizedUrl)).toEqual([
+      "https://i.imgur.com/scene1.jpg",
+    ]);
+  });
+
+  test("extractNativeGalleryUrlsFromCharacter matches native Lumiverse /gallery/extract order", () => {
+    const urls = extractNativeGalleryUrlsFromCharacter({
+      id: "char-native",
+      name: "Native Extract Order",
+      first_mes: "![First](https://files.catbox.moe/first.png)",
+      description: "<img src='https://files.catbox.moe/desc.jpg'>",
+      creator_notes: "https://files.catbox.moe/notes.webp",
+      alternate_greetings: ["![Alt1](https://files.catbox.moe/alt1.gif)"],
+    });
+
+    expect(urls).toEqual([
+      "https://files.catbox.moe/first.png",
+      "https://files.catbox.moe/desc.jpg",
+      "https://files.catbox.moe/notes.webp",
+      "https://files.catbox.moe/alt1.gif",
+    ]);
+  });
+
+  test("scanCharacterMedia skips chub.expressions and chub.alt_expressions while scanning chub.background_image", () => {
+    const scan = scanCharacterMedia(
+      {
+        id: "char-chub-expr",
+        name: "Chloe",
+        first_mes: "Hello!",
+        extensions: {
+          chub: {
+            id: 2225508,
+            full_path: "Anonymous/chloe",
+            background_image: "https://avatars.charhub.io/avatars/bg.png",
+            expressions: {
+              version: "default",
+              expressions: {
+                joy: "https://avatars.charhub.io/avatars/joy.png",
+                anger: "https://avatars.charhub.io/avatars/anger.png",
+              },
+            },
+            alt_expressions: {
+              blush: "https://avatars.charhub.io/avatars/blush.png",
+            },
+          },
+          expressions: {
+            enabled: true,
+            defaultExpression: "joy",
+            mappings: {
+              joy: "img-joy",
+              anger: "img-anger",
+            },
+          },
+        },
+      },
+      [],
+      [],
+      {
+        localizedByNormalizedUrl: new Map(),
+        failedByNormalizedUrl: new Map(),
+      },
+    );
+
+    expect(scan.items.map((i) => i.normalizedUrl)).toEqual([
+      "https://avatars.charhub.io/avatars/bg.png",
+    ]);
+  });
+});
+

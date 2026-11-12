@@ -1,0 +1,20 @@
+{
+  "identifier": "media_localizer",
+  "version": "1.0.0",
+  "name": "Media Localizer",
+  "author": "Developer",
+  "description": "Non-destructively localizes external media embedded in character cards, world books, and regex scripts with granular download filters and display-time swapping.",
+  "permissions": [
+    "characters",
+    "chats",
+    "world_books",
+    "regex_scripts",
+    "images",
+    "cors_proxy",
+    "ui_panels"
+  ],
+  "entry_backend": "dist/backend.js",
+  "entry_frontend": "dist/frontend.js",
+  "minimum_lumiverse_version": "1.2.0"
+}
+
