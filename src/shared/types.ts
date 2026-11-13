@@ -143,6 +143,7 @@ export interface LibraryExpressionItem {
 export interface LibraryMediaCharacter {
   characterId: string;
   characterName: string;
+  tags?: string[];
   avatarImageId: string | null;
   avatarUrl: string | null;
   localizedAssets: LocalizedAssetEntry[];

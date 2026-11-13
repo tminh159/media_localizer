@@ -13,7 +13,7 @@ import {
   type LocalizedAssetEntry,
   type MediaLocalizerSettings,
 } from "../shared/types.ts";
-import { LibraryGalleryView } from "../ui/library-gallery.ts";
+import { LibraryGalleryView, parseGallerySearchQuery } from "../ui/library-gallery.ts";
 import { PortraitPanelLocalizeController } from "../ui/portrait-button.ts";
 
 function createMemoryStorageWithInitial(
@@ -679,6 +679,233 @@ describe("LibraryGalleryView filters, sorting direction, random, and All Cards",
       } finally {
         Math.random = prevRandom;
       }
+    } finally {
+      if (prevDoc === undefined) {
+        delete (globalThis as { document?: unknown }).document;
+      } else {
+        (globalThis as { document?: unknown }).document = prevDoc;
+      }
+    }
+  });
+
+  test("supports searching by character tags and paginating large libraries", async () => {
+    const prevDoc = (globalThis as { document?: unknown }).document;
+    (globalThis as { document: unknown }).document = {
+      createElement: (tag: string) => createMockElement(tag),
+      createElementNS: (_ns: string, tag: string) => createMockElement(tag),
+      querySelectorAll: () => [],
+    };
+
+    try {
+      const chars: LibraryMediaCharacter[] = Array.from({ length: 60 }, (_, idx) => {
+        const num = String(idx + 1).padStart(2, "0");
+        return {
+          characterId: `c-${num}`,
+          characterName: idx === 0 ? "Bot #1" : `Card ${num}`,
+          tags:
+            idx === 0
+              ? ["Dark Fantasy", "RPG"]
+              : idx % 2 === 0
+                ? ["Sci-Fi"]
+                : ["Slice of Life"],
+          avatarImageId: `av-${num}`,
+          avatarUrl: `/api/v1/images/av-${num}`,
+          localizedAssets: [],
+          expressions: [
+            {
+              label: "neutral",
+              imageId: `exp-${num}`,
+              localUrl: `/api/v1/images/exp-${num}`,
+            },
+          ],
+          totalSizeBytes: 0,
+          lastLocalizedAt: idx + 1,
+        };
+      });
+
+      const root = createMockElement("div");
+      const gallery = new LibraryGalleryView(root as unknown as HTMLElement, {
+        onLoadLibraryMedia: async () => chars,
+        onPurgeAsset: async () => {},
+      });
+
+      await gallery.ensureLoaded();
+
+      const getCardNames = () =>
+        findMockElements(root, (el) => el.className.includes("ml-char-card-name")).map(
+          (el) => el.textContent,
+        );
+      const getSearchInput = () =>
+        findMockElements(root, (el) => el.tagName === "INPUT" && el.type === "search")[0]!;
+      const getNextBtn = () =>
+        findMockElements(root, (el) => el.tagName === "BUTTON" && el.title === "Next page")[0];
+      const getPageSelect = () =>
+        findMockElements(root, (el) => el.tagName === "SELECT" && el.title === "Items per page")[0]!;
+
+      // Default page size 48 renders 48 cards on page 1, then 12 on page 2
+      expect(getCardNames().length).toBe(48);
+      getNextBtn()?.dispatch("click");
+      expect(getCardNames().length).toBe(12);
+
+      // Change page size to 24 -> resets to page 1 with 24 cards
+      getPageSelect().value = "24";
+      getPageSelect().dispatch("change");
+      expect(getCardNames().length).toBe(24);
+
+      // Search by explicit quoted tag (tag:"dark fantasy")
+      const search = getSearchInput();
+      search.value = 'tag:"dark fantasy"';
+      search.dispatch("input");
+      expect(getCardNames()).toEqual(["Bot #1"]);
+
+      // Search by #tag shorthand
+      search.value = "#rpg";
+      search.dispatch("input");
+      expect(getCardNames()).toEqual(["Bot #1"]);
+
+      // Literal #1 still matches "Bot #1" by name
+      search.value = "#1";
+      search.dispatch("input");
+      expect(getCardNames()).toEqual(["Bot #1"]);
+
+      // Plain text matches tags in Flat Media view too
+      const groupBtn = findMockElements(
+        root,
+        (el) => el.tagName === "BUTTON" && el.title.includes("Grouped by character card"),
+      )[0];
+      groupBtn?.dispatch("click");
+      search.value = "tag:rpg";
+      search.dispatch("input");
+      const tiles = findMockElements(root, (el) => el.className.includes("ml-asset-card"));
+      expect(tiles.length).toBe(2); // Avatar + Expr for Bot #1
+    } finally {
+      if (prevDoc === undefined) {
+        delete (globalThis as { document?: unknown }).document;
+      } else {
+        (globalThis as { document?: unknown }).document = prevDoc;
+      }
+    }
+  });
+
+  test("parseGallerySearchQuery ignores incomplete trailing tag:/# prefixes", () => {
+    expect(parseGallerySearchQuery("tag:")).toEqual({
+      hasQuery: false,
+      tagFilters: [],
+      hashOrTextFilters: [],
+      textTerms: [],
+    });
+    expect(parseGallerySearchQuery("#")).toEqual({
+      hasQuery: false,
+      tagFilters: [],
+      hashOrTextFilters: [],
+      textTerms: [],
+    });
+    expect(parseGallerySearchQuery('tag:"')).toEqual({
+      hasQuery: false,
+      tagFilters: [],
+      hashOrTextFilters: [],
+      textTerms: [],
+    });
+    expect(parseGallerySearchQuery("alice tag:")).toEqual({
+      hasQuery: true,
+      tagFilters: [],
+      hashOrTextFilters: [],
+      textTerms: ["alice"],
+    });
+    expect(parseGallerySearchQuery("alice #")).toEqual({
+      hasQuery: true,
+      tagFilters: [],
+      hashOrTextFilters: [],
+      textTerms: ["alice"],
+    });
+    expect(parseGallerySearchQuery('tag:"dark fantasy" #rpg')).toEqual({
+      hasQuery: true,
+      tagFilters: ["dark fantasy"],
+      hashOrTextFilters: ["rpg"],
+      textTerms: [],
+    });
+  });
+
+  test("batches randomWeights onCacheChange updates and respects destroy() on pending refresh", async () => {
+    const prevDoc = (globalThis as { document?: unknown }).document;
+    (globalThis as { document: unknown }).document = {
+      createElement: (tag: string) => createMockElement(tag),
+      createElementNS: (_ns: string, tag: string) => createMockElement(tag),
+      querySelectorAll: () => [],
+    };
+
+    try {
+      const chars: LibraryMediaCharacter[] = Array.from({ length: 30 }, (_, idx) => ({
+        characterId: `c-${idx}`,
+        characterName: `Card ${idx}`,
+        tags: [],
+        avatarImageId: null,
+        avatarUrl: null,
+        localizedAssets: [
+          {
+            normalizedUrl: `https://cdn.example.com/${idx}.png`,
+            rawUrls: [`https://cdn.example.com/${idx}.png`],
+            imageId: `img-${idx}`,
+            localUrl: `/api/v1/images/img-${idx}`,
+            mediaKind: "image",
+            mimeType: "image/png",
+            sizeBytes: 128,
+            filename: `${idx}.png`,
+            localizedAt: idx + 1,
+            characterIds: [`c-${idx}`],
+            galleryItemIds: {},
+          },
+        ],
+        expressions: [],
+        totalSizeBytes: 128,
+        lastLocalizedAt: idx + 1,
+      }));
+
+      let cacheUpdates = 0;
+      const root = createMockElement("div");
+      const view = new LibraryGalleryView(
+        root as unknown as HTMLElement,
+        {
+          onLoadLibraryMedia: async () => chars,
+          onPurgeAsset: async () => {},
+          onStateChange: () => {},
+          onCacheChange: () => {
+            cacheUpdates++;
+          },
+        },
+        {
+          state: { sortMode: "random" },
+        },
+      );
+
+      await view.ensureLoaded();
+      // 1 emit from reshuffleRandomOrder + 1 from setting characters + 1 batched emit for all randomWeights
+      expect(cacheUpdates).toBe(3);
+
+      // Now test destroy() cancels in-flight load before mutating cache/DOM
+      let resolvePending!: (value: LibraryMediaCharacter[]) => void;
+      let postDestroyCacheUpdates = 0;
+      let postDestroyStateUpdates = 0;
+      const root2 = createMockElement("div");
+      const view2 = new LibraryGalleryView(root2 as unknown as HTMLElement, {
+        onLoadLibraryMedia: () =>
+          new Promise<LibraryMediaCharacter[]>((resolve) => {
+            resolvePending = resolve;
+          }),
+        onPurgeAsset: async () => {},
+        onStateChange: () => {
+          postDestroyStateUpdates++;
+        },
+        onCacheChange: () => {
+          postDestroyCacheUpdates++;
+        },
+      });
+      const ensurePromise = view2.ensureLoaded();
+      view2.destroy();
+      resolvePending(chars);
+      await ensurePromise;
+      expect(postDestroyCacheUpdates).toBe(0);
+      expect(postDestroyStateUpdates).toBe(0);
     } finally {
       if (prevDoc === undefined) {
         delete (globalThis as { document?: unknown }).document;

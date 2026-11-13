@@ -436,11 +436,62 @@ describe("downloader & index-store & queue", () => {
     expect(() => detectMediaMimeType(json, undefined, "https://x.com/file")).toThrow(
       /Unrecognized media format/,
     );
-    // CDNs that serve octet-stream still work via the URL extension
+    // JSON error bodies must NOT bypass via octet-stream + media extension
+    expect(() =>
+      detectMediaMimeType(json, "application/octet-stream", "https://x.com/a.webp"),
+    ).toThrow(/JSON/i);
+    // CDNs that serve binary bytes as octet-stream still work via the URL extension
+    const binaryBytes = new Uint8Array([0x01, 0x02, 0x03, 0x04]);
     expect(
-      detectMediaMimeType(json, "application/octet-stream", "https://x.com/a.webp")
+      detectMediaMimeType(binaryBytes, "application/octet-stream", "https://x.com/a.webp")
         .mimeType,
     ).toBe("image/webp");
+  });
+
+  test("MediaIndexStore avoids caching undefined userId and cleans character metadata only on full character removal", async () => {
+    const storage = createMemoryStorage();
+    const store = new MediaIndexStore(storage);
+
+    await store.recordLocalizedAsset("default", {
+      normalizedUrl: "https://example.com/a.png",
+      rawUrls: ["https://example.com/a.png"],
+      imageId: "img-a",
+      localUrl: "/api/v1/images/img-a",
+      mimeType: "image/png",
+      sizeBytes: 100,
+      filename: "a.png",
+      characterIds: ["char-1"],
+      localizedAt: 1,
+    });
+    const undefinedMap = await store.buildActiveDisplayUrlMap(undefined);
+    expect(undefinedMap.allUrlsMap["https://example.com/a.png"]).toBe("/api/v1/images/img-a");
+    expect((store as unknown as { cache: Map<string, unknown> }).cache.has(undefined as unknown as string)).toBe(false);
+
+    await store.setCharacterOverride("u1", "char-1", { sections: ["first_mes"] });
+    await store.markAutoLocalized("u1", "char-1");
+    await store.recordLocalizedAsset("u1", {
+      normalizedUrl: "https://example.com/b.png",
+      rawUrls: ["https://example.com/b.png"],
+      imageId: "img-b",
+      localUrl: "/api/v1/images/img-b",
+      mimeType: "image/png",
+      sizeBytes: 100,
+      filename: "b.png",
+      characterIds: ["char-1"],
+      localizedAt: 2,
+    });
+
+    // Partial URL removal keeps override & autoLocalized status
+    await store.removeCharacterAssets("u1", "char-1", ["https://example.com/b.png"]);
+    let st = await store.getState("u1");
+    expect(st.characterOverrides["char-1"]).toBeDefined();
+    expect(st.autoLocalizedCharacterIds).toContain("char-1");
+
+    // Full character removal clears override & autoLocalized status
+    await store.removeCharacterAssets("u1", "char-1");
+    st = await store.getState("u1");
+    expect(st.characterOverrides["char-1"]).toBeUndefined();
+    expect(st.autoLocalizedCharacterIds).not.toContain("char-1");
   });
 
   test("downloadAndStoreMedia fails on truncated staged files", async () => {

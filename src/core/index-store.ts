@@ -286,11 +286,17 @@ function sanitizeFailedRecord(raw: unknown): FailedUrlRecord | null {
 function applyRecordLocalizedAsset(
   state: PersistedUserMediaState,
   entry: LocalizedAssetEntry,
+  options?: { replaceIfImageId?: string },
 ): { changed: boolean; result: LocalizedAssetEntry } {
   if (!isSafeRecordKey(entry.normalizedUrl)) {
     throw new Error("Invalid normalizedUrl key");
   }
   const existing = getOwnRecordValue(state.assets, entry.normalizedUrl);
+  const isReplacingDeadImage = Boolean(
+    existing &&
+      options?.replaceIfImageId &&
+      existing.imageId === options.replaceIfImageId,
+  );
   const mergedRawUrls = Array.from(
     new Set([...(existing?.rawUrls ?? []), ...entry.rawUrls, entry.normalizedUrl]),
   );
@@ -298,7 +304,9 @@ function applyRecordLocalizedAsset(
     new Set([...(existing?.characterIds ?? []), ...entry.characterIds]),
   );
   const mergedGalleryItemIds = createNullProtoRecord<string>();
-  if (existing?.galleryItemIds) {
+  // When healing a dead imageId, drop stale galleryItemIds from the dead image so the
+  // replacement upload is not treated as already linked to a missing Gallery row.
+  if (!isReplacingDeadImage && existing?.galleryItemIds) {
     for (const [k, v] of Object.entries(existing.galleryItemIds)) {
       if (isSafeRecordKey(k) && typeof v === "string") {
         mergedGalleryItemIds[k] = v;
@@ -313,9 +321,10 @@ function applyRecordLocalizedAsset(
     }
   }
 
-  // If a concurrent download already registered this URL with a different image, keep the
-  // existing one so Gallery links and display maps stay stable; the caller discards the duplicate.
-  const base = existing ?? entry;
+  // If a concurrent download already registered this URL with a different healthy image, keep
+  // the existing one so Gallery links and display maps stay stable; the caller discards the duplicate.
+  // Only replace `existing` when its `imageId` still matches the dead `replaceIfImageId`.
+  const base = existing && !isReplacingDeadImage ? existing : entry;
   const saved: LocalizedAssetEntry = {
     normalizedUrl: entry.normalizedUrl,
     rawUrls: mergedRawUrls,
@@ -466,7 +475,10 @@ function applyRemoveByImageId(
 
 export interface MediaIndexBatchTransaction {
   readonly state: PersistedUserMediaState;
-  recordLocalizedAsset(entry: LocalizedAssetEntry): LocalizedAssetEntry;
+  recordLocalizedAsset(
+    entry: LocalizedAssetEntry,
+    options?: { replaceIfImageId?: string },
+  ): LocalizedAssetEntry;
   linkExistingAssetToCharacter(
     normalizedUrl: string,
     rawUrls: string[],
@@ -489,6 +501,8 @@ export interface MediaIndexBatchTransaction {
   removeByImageId(imageId: string): number;
 }
 
+const MAX_CACHED_USERS = 500;
+
 export class MediaIndexStore {
   private readonly cache = new Map<string, PersistedUserMediaState>();
   private readonly loading = new Map<string, Promise<PersistedUserMediaState>>();
@@ -497,15 +511,38 @@ export class MediaIndexStore {
 
   constructor(private readonly userStorage: UserStorageAPI) {}
 
+  private setCachedState(userId: string, state: PersistedUserMediaState): void {
+    if (this.cache.has(userId)) {
+      this.cache.delete(userId);
+    }
+    this.cache.set(userId, state);
+    if (this.cache.size <= MAX_CACHED_USERS) return;
+    for (const candidateKey of this.cache.keys()) {
+      if (this.cache.size <= MAX_CACHED_USERS) break;
+      if (candidateKey === userId) continue;
+      if (this.writeLocks.has(candidateKey) || this.loading.has(candidateKey)) {
+        continue;
+      }
+      this.cache.delete(candidateKey);
+    }
+  }
+
   getState(userId: string): Promise<PersistedUserMediaState> {
+    if (typeof userId !== "string" || userId.trim().length === 0) {
+      return this.loadState(userId);
+    }
     const cached = this.cache.get(userId);
-    if (cached) return Promise.resolve(cached);
+    if (cached) {
+      this.cache.delete(userId);
+      this.cache.set(userId, cached);
+      return Promise.resolve(cached);
+    }
     // Share a single in-flight load so concurrent first callers get the same state object.
     let pending = this.loading.get(userId);
     if (!pending) {
       pending = this.loadState(userId)
         .then((loaded) => {
-          this.cache.set(userId, loaded);
+          this.setCachedState(userId, loaded);
           return loaded;
         })
         .finally(() => {
@@ -643,6 +680,9 @@ export class MediaIndexStore {
     userId: string,
     fn: (draft: PersistedUserMediaState) => { changed: boolean; result: T },
   ): Promise<T> {
+    if (typeof userId !== "string" || userId.trim().length === 0) {
+      throw new Error("userId is required");
+    }
     const prevLock = this.writeLocks.get(userId) ?? Promise.resolve();
     const task = prevLock
       .catch(() => {})
@@ -652,7 +692,7 @@ export class MediaIndexStore {
         const outcome = fn(draft);
         if (outcome.changed) {
           await this.writeStateToStorage(userId, draft);
-          this.cache.set(userId, draft);
+          this.setCachedState(userId, draft);
         }
         return outcome.result;
       });
@@ -682,8 +722,8 @@ export class MediaIndexStore {
       let changed = false;
       const tx: MediaIndexBatchTransaction = {
         state: draft,
-        recordLocalizedAsset(entry) {
-          const res = applyRecordLocalizedAsset(draft, entry);
+        recordLocalizedAsset(entry, options) {
+          const res = applyRecordLocalizedAsset(draft, entry, options);
           if (res.changed) changed = true;
           return res.result;
         },
@@ -769,8 +809,11 @@ export class MediaIndexStore {
   async recordLocalizedAsset(
     userId: string,
     entry: LocalizedAssetEntry,
+    options?: { replaceIfImageId?: string },
   ): Promise<LocalizedAssetEntry> {
-    return this.mutateState(userId, (draft) => applyRecordLocalizedAsset(draft, entry));
+    return this.mutateState(userId, (draft) =>
+      applyRecordLocalizedAsset(draft, entry, options),
+    );
   }
 
   async linkExistingAssetToCharacter(
@@ -922,8 +965,24 @@ export class MediaIndexStore {
         (id) => !stillUsedImageIds.has(id),
       );
 
+      let metadataChanged = false;
+      if (!targetFilter) {
+        const prevLen = draft.autoLocalizedCharacterIds.length;
+        if (prevLen > 0) {
+          draft.autoLocalizedCharacterIds = draft.autoLocalizedCharacterIds.filter(
+            (id) => id !== characterId,
+          );
+          if (draft.autoLocalizedCharacterIds.length !== prevLen) {
+            metadataChanged = true;
+          }
+        }
+        if (deleteOwnRecordValue(draft.characterOverrides, characterId)) {
+          metadataChanged = true;
+        }
+      }
+
       return {
-        changed: removedCount > 0,
+        changed: removedCount > 0 || metadataChanged,
         result: {
           orphanedImageIds,
           removedCount,
@@ -959,8 +1018,11 @@ export class MediaIndexStore {
     };
   }
 
-  async buildActiveDisplayUrlMap(userId: string): Promise<ActiveDisplayUrlMapPayload> {
-    const state = await this.getState(userId);
+  async buildActiveDisplayUrlMap(userId?: string): Promise<ActiveDisplayUrlMapPayload> {
+    const state =
+      typeof userId === "string" && userId.trim().length > 0
+        ? await this.getState(userId)
+        : await this.loadState(undefined as unknown as string);
     const characterUrlMaps = createNullProtoRecord<Record<string, string>>();
     const allUrlsMap = createNullProtoRecord<string>();
 

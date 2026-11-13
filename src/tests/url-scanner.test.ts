@@ -4,6 +4,7 @@ import {
   extractMediaTokensFromText,
   extractNativeGalleryUrlsFromCharacter,
   filterScanItemsForDownload,
+  parseSrcsetCandidates,
   scanCharacterMedia,
 } from "../shared/url-scanner.ts";
 
@@ -191,6 +192,61 @@ describe("url-scanner", () => {
     expect(scan.items.map((i) => i.normalizedUrl)).toEqual([
       "https://avatars.charhub.io/avatars/bg.png",
     ]);
+  });
+
+  test("does not skip subsequent markdown images after an unclosed ![alt]( prefix", () => {
+    const junk = "![broken](" + "not-a-closing-paren ".repeat(100);
+    const text = `${junk} ![Valid](https://cdn.example.com/valid.png) and ![Ref][r1]\n[r1]: https://cdn.example.com/ref.webp`;
+    const tokens = extractMediaTokensFromText(text);
+    const urls = tokens.map((t) => t.rawUrl);
+    expect(urls).toContain("https://cdn.example.com/valid.png");
+    expect(urls).toContain("https://cdn.example.com/ref.webp");
+
+    // Repeated unclosed prefixes should not trigger quadratic scanning
+    const manyBroken = "![unclosed](".repeat(200) + "![ok](https://cdn.example.com/final.png)";
+    const start = Date.now();
+    const fastTokens = extractMediaTokensFromText(manyBroken);
+    expect(Date.now() - start).toBeLessThan(1000);
+    expect(fastTokens.map((t) => t.rawUrl)).toContain("https://cdn.example.com/final.png");
+  });
+
+  test("preserves comma-containing CDN transform URLs in srcset parsing and extraction", () => {
+    const srcset =
+      "https://cdn.example.com/cdn-cgi/image/w_800,f_auto/hero.png 800w, https://res.cloudinary.com/demo/image/upload/c_fill,w_1200,q_auto/card.webp 1200w";
+    const parsed = parseSrcsetCandidates(srcset);
+    expect(parsed.map((p) => p.url)).toEqual([
+      "https://cdn.example.com/cdn-cgi/image/w_800,f_auto/hero.png",
+      "https://res.cloudinary.com/demo/image/upload/c_fill,w_1200,q_auto/card.webp",
+    ]);
+
+    const html = `<img srcset="${srcset}" />`;
+    const tokens = extractMediaTokensFromText(html, { scanBareUrls: false });
+    expect(tokens.map((t) => t.rawUrl)).toEqual([
+      "https://cdn.example.com/cdn-cgi/image/w_800,f_auto/hero.png",
+      "https://res.cloudinary.com/demo/image/upload/c_fill,w_1200,q_auto/card.webp",
+    ]);
+  });
+
+  test("extractNativeGalleryUrlsFromCharacter handles uppercase schemes and JSON-escaped quotes", () => {
+    const char = {
+      id: "char-gallery-edge",
+      name: "Edge",
+      extensions: {
+        gallery: [
+          "HTTPS://avatars.charhub.io/avatars/upper1.png",
+          "HTTP://avatars.charhub.io/avatars/upper2.jpg",
+          {
+            html: '<img src="https://avatars.charhub.io/avatars/nested.webp">',
+            escapedRaw: 'https://avatars.charhub.io/avatars/trailing.png\\"',
+          },
+        ],
+      },
+    };
+    const urls = extractNativeGalleryUrlsFromCharacter(char as any);
+    expect(urls).toContain("https://avatars.charhub.io/avatars/upper1.png");
+    expect(urls).toContain("http://avatars.charhub.io/avatars/upper2.jpg");
+    expect(urls).toContain("https://avatars.charhub.io/avatars/nested.webp");
+    expect(urls).toContain("https://avatars.charhub.io/avatars/trailing.png");
   });
 });
 

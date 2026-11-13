@@ -433,6 +433,11 @@ function extractMarkdownImageCandidates(text) {
           continue;
         }
       }
+      const nextParen = text.indexOf(")", i);
+      if (nextParen === -1 || nextParen >= urlLimit) {
+        idx = bangIdx + 2;
+        continue;
+      }
       const urlStart = i;
       let parenDepth = 0;
       let stoppedCleanly = false;
@@ -444,20 +449,23 @@ function extractMarkdownImageCandidates(text) {
         }
         if (ch === "(") {
           parenDepth++;
+          if (parenDepth > MAX_MD_BRACKET_DEPTH) {
+            break;
+          }
         } else if (ch === ")") {
           if (parenDepth === 0) {
             stoppedCleanly = true;
             break;
           }
           parenDepth--;
-        } else if (parenDepth === 0 && isAsciiWhitespace(ch)) {
-          stoppedCleanly = true;
+        } else if (isAsciiWhitespace(ch)) {
+          stoppedCleanly = parenDepth === 0;
           break;
         }
         i++;
       }
-      if (!stoppedCleanly && i >= urlLimit) {
-        idx = urlLimit;
+      if (!stoppedCleanly) {
+        idx = bangIdx + 2;
         continue;
       }
       const raw = text.slice(urlStart, i).trim();
@@ -734,20 +742,59 @@ function scanHtmlMediaTags(text, allowedTags, onTag) {
     }
   }
 }
-function emitSrcsetCandidates(srcsetVal, valStart, hint, pushCandidate) {
-  let cursor = 0;
-  for (const candidate of srcsetVal.split(",")) {
-    const leadingWs = candidate.length - candidate.trimStart().length;
-    const trimmed = candidate.trim();
-    if (trimmed) {
-      const wsIdx = trimmed.search(/\s/);
-      const firstToken = wsIdx === -1 ? trimmed : trimmed.slice(0, wsIdx);
-      if (firstToken) {
-        const absStart = valStart + cursor + leadingWs;
-        pushCandidate(firstToken, hint, absStart, absStart + firstToken.length);
+function parseSrcsetCandidates(srcsetVal) {
+  const candidates = [];
+  const len = srcsetVal.length;
+  let i = 0;
+  while (i < len) {
+    while (i < len && (isAsciiWhitespace(srcsetVal[i]) || srcsetVal[i] === ",")) {
+      i++;
+    }
+    if (i >= len)
+      break;
+    const urlStart = i;
+    while (i < len && !isAsciiWhitespace(srcsetVal[i])) {
+      i++;
+    }
+    let urlEnd = i;
+    let hadTrailingComma = false;
+    while (urlEnd > urlStart && srcsetVal[urlEnd - 1] === ",") {
+      urlEnd--;
+      hadTrailingComma = true;
+    }
+    const url = srcsetVal.slice(urlStart, urlEnd);
+    let descriptors = "";
+    if (!hadTrailingComma) {
+      while (i < len && isAsciiWhitespace(srcsetVal[i])) {
+        i++;
+      }
+      const descStart = i;
+      let parenDepth = 0;
+      while (i < len) {
+        const ch = srcsetVal[i];
+        if (ch === "(") {
+          parenDepth++;
+        } else if (ch === ")" && parenDepth > 0) {
+          parenDepth--;
+        } else if (ch === "," && parenDepth === 0) {
+          break;
+        }
+        i++;
+      }
+      descriptors = srcsetVal.slice(descStart, i).trim();
+      if (i < len && srcsetVal[i] === ",") {
+        i++;
       }
     }
-    cursor += candidate.length + 1;
+    if (url) {
+      candidates.push({ url, urlStart, urlEnd, descriptors });
+    }
+  }
+  return candidates;
+}
+function emitSrcsetCandidates(srcsetVal, valStart, hint, pushCandidate) {
+  for (const candidate of parseSrcsetCandidates(srcsetVal)) {
+    pushCandidate(candidate.url, hint, valStart + candidate.urlStart, valStart + candidate.urlEnd);
   }
 }
 function extractCssUrlCandidates(text) {
@@ -918,9 +965,16 @@ function deriveUrlFilenameParts(normalizedUrl) {
 var NATIVE_IMG_TAGS = new Set(["img"]);
 var NATIVE_BARE_URL_RE = /\bhttps?:\/\/[^\s<>"']+/gi;
 var NATIVE_IMAGE_PATH_RE = /\.(?:apng|avif|bmp|gif|heic|heif|ico|jpe?g|jfif|pjp|pjpeg|png|svg|webp)$/i;
-var NATIVE_TRAILING_PUNCTUATION_CHARS = "),.;!?'\"`]}";
+var NATIVE_TRAILING_PUNCTUATION_CHARS = "),.;!?'\"`]}\\";
 function normalizeNativeExtractedCandidateUrl(raw) {
-  const cleaned = stripTrailingChars(stripWrappingAngleBrackets(stripTrailingChars(raw.trim(), NATIVE_TRAILING_PUNCTUATION_CHARS)), NATIVE_TRAILING_PUNCTUATION_CHARS);
+  let candidate = raw.trim();
+  if (candidate.startsWith("\\\"") || candidate.startsWith("\\'")) {
+    candidate = candidate.slice(2);
+  }
+  if (candidate.endsWith("\\\"") || candidate.endsWith("\\'")) {
+    candidate = candidate.slice(0, -2);
+  }
+  const cleaned = stripTrailingChars(stripWrappingAngleBrackets(stripTrailingChars(candidate, NATIVE_TRAILING_PUNCTUATION_CHARS)), NATIVE_TRAILING_PUNCTUATION_CHARS);
   const lower = cleaned.toLowerCase();
   if (!lower.startsWith("http://") && !lower.startsWith("https://")) {
     return null;
@@ -991,9 +1045,31 @@ function extractNativeGalleryUrlsFromCharacter(character) {
     ...character.alternate_greetings ?? []
   ];
   if (character.extensions && Object.keys(character.extensions).length > 0) {
-    try {
-      fieldsToScan.push(JSON.stringify(character.extensions));
-    } catch {}
+    const visited = new Set;
+    const collectExtStrings = (val, depth) => {
+      if (depth > 32 || val == null)
+        return;
+      if (typeof val === "string") {
+        if (val)
+          fieldsToScan.push(val);
+        return;
+      }
+      if (typeof val !== "object")
+        return;
+      if (visited.has(val))
+        return;
+      visited.add(val);
+      if (Array.isArray(val)) {
+        for (const item of val) {
+          collectExtStrings(item, depth + 1);
+        }
+        return;
+      }
+      for (const v of Object.values(val)) {
+        collectExtStrings(v, depth + 1);
+      }
+    };
+    collectExtStrings(character.extensions, 0);
   }
   const allUrls = new Set;
   for (const field of fieldsToScan) {
@@ -1231,7 +1307,8 @@ function scanCharacterMedia(character, worldBooks, regexScripts, lookup) {
       if (depth > 5 || val == null)
         return;
       if (typeof val === "string") {
-        if (val.includes("http://") || val.includes("https://")) {
+        const lowerVal = val.toLowerCase();
+        if (lowerVal.includes("http://") || lowerVal.includes("https://")) {
           recordText(val, {
             section: "core_fields",
             label
@@ -1496,6 +1573,122 @@ function validateRemoteMediaUrl(rawUrl) {
   }
   return parsed;
 }
+var TEXT_PREFIX_SCAN_BYTES = 16 * 1024;
+function isAsciiPrintableOrSpaceByte(b) {
+  return b === 9 || b === 10 || b === 13 || b >= 32 && b <= 126;
+}
+function decodeTextPrefix(bytes) {
+  const prefix = bytes.subarray(0, Math.min(bytes.byteLength, TEXT_PREFIX_SCAN_BYTES));
+  if (prefix.byteLength === 0)
+    return "";
+  if (prefix.byteLength >= 4) {
+    const isUtf32Le = prefix[0] === 255 && prefix[1] === 254 && prefix[2] === 0 && prefix[3] === 0;
+    const isUtf32Be = prefix[0] === 0 && prefix[1] === 0 && prefix[2] === 254 && prefix[3] === 255;
+    if (isUtf32Le || isUtf32Be) {
+      let out = "";
+      for (let i = 4;i + 3 < prefix.byteLength; i += 4) {
+        const cp = isUtf32Le ? (prefix[i] | prefix[i + 1] << 8 | prefix[i + 2] << 16 | prefix[i + 3] << 24) >>> 0 : (prefix[i] << 24 | prefix[i + 1] << 16 | prefix[i + 2] << 8 | prefix[i + 3]) >>> 0;
+        if (cp >= 1 && cp <= 1114111) {
+          out += String.fromCodePoint(cp);
+        }
+      }
+      return out;
+    }
+  }
+  if (prefix.byteLength >= 3 && prefix[0] === 239 && prefix[1] === 187 && prefix[2] === 191) {
+    return new TextDecoder().decode(prefix.subarray(3));
+  }
+  if (prefix.byteLength >= 2 && prefix[0] === 255 && prefix[1] === 254) {
+    const body = prefix.subarray(2);
+    return new TextDecoder("utf-16le").decode(body.subarray(0, body.byteLength - body.byteLength % 2));
+  }
+  if (prefix.byteLength >= 2 && prefix[0] === 254 && prefix[1] === 255) {
+    const body = prefix.subarray(2);
+    return new TextDecoder("utf-16be").decode(body.subarray(0, body.byteLength - body.byteLength % 2));
+  }
+  if (prefix.byteLength >= 6) {
+    const samplePairs = Math.min(Math.floor(prefix.byteLength / 2), 32);
+    let leZeros = 0;
+    let leChars = 0;
+    let beZeros = 0;
+    let beChars = 0;
+    for (let p = 0;p < samplePairs; p++) {
+      const b0 = prefix[p * 2];
+      const b1 = prefix[p * 2 + 1];
+      if (b1 === 0 && isAsciiPrintableOrSpaceByte(b0))
+        leChars++;
+      if (b1 === 0)
+        leZeros++;
+      if (b0 === 0 && isAsciiPrintableOrSpaceByte(b1))
+        beChars++;
+      if (b0 === 0)
+        beZeros++;
+    }
+    if (leZeros === samplePairs && leChars === samplePairs) {
+      return new TextDecoder("utf-16le").decode(prefix.subarray(0, prefix.byteLength - prefix.byteLength % 2));
+    }
+    if (beZeros === samplePairs && beChars === samplePairs) {
+      return new TextDecoder("utf-16be").decode(prefix.subarray(0, prefix.byteLength - prefix.byteLength % 2));
+    }
+  }
+  return new TextDecoder().decode(prefix);
+}
+function stripLeadingMarkupNoise(text) {
+  let current = text.replace(/^\uFEFF/, "");
+  let sawXmlDecl = false;
+  while (true) {
+    current = current.trimStart();
+    if (current.startsWith("<!--")) {
+      const end = current.indexOf("-->", 4);
+      if (end === -1)
+        break;
+      current = current.slice(end + 3);
+      continue;
+    }
+    if (current.startsWith("<?")) {
+      if (/^<\?xml\b/i.test(current)) {
+        sawXmlDecl = true;
+      }
+      const end = current.indexOf("?>", 2);
+      if (end === -1)
+        break;
+      current = current.slice(end + 2);
+      continue;
+    }
+    break;
+  }
+  return { stripped: current.trimStart(), sawXmlDecl };
+}
+function isPrintableTextPrefix(text) {
+  if (!text)
+    return false;
+  let hasVisibleChar = false;
+  const limit = Math.min(text.length, 4096);
+  for (let i = 0;i < limit; i++) {
+    const code = text.charCodeAt(i);
+    if (code === 65533)
+      return false;
+    if (code < 32 && code !== 9 && code !== 10 && code !== 13) {
+      return false;
+    }
+    if (code > 32 && code !== 127) {
+      hasVisibleChar = true;
+    }
+  }
+  return hasVisibleChar;
+}
+function looksLikeJsonBody(bytes, strippedText) {
+  if (!strippedText.startsWith("{") && !strippedText.startsWith("[")) {
+    return false;
+  }
+  if (bytes.byteLength <= 64 * 1024) {
+    try {
+      JSON.parse(strippedText);
+      return true;
+    } catch {}
+  }
+  return /^(?:\{\s*(?:"(?:[^"\\]|\\.)*"\s*:|\})|\[\s*(?:\{|"|-?\d|true\b|false\b|null\b|\]))/.test(strippedText);
+}
 function detectMediaMimeType(bytes, headerMimeType, urlPath) {
   if (bytes.byteLength >= 12) {
     if (bytes[0] === 137 && bytes[1] === 80 && bytes[2] === 78 && bytes[3] === 71) {
@@ -1527,25 +1720,38 @@ function detectMediaMimeType(bytes, headerMimeType, urlPath) {
       return { mimeType: "video/mp4", ext: "mp4" };
     }
   }
-  const headText = new TextDecoder().decode(bytes.subarray(0, Math.min(bytes.byteLength, 1024))).replace(/^\uFEFF/, "").trimStart();
-  if (/^<!doctype\s+html/i.test(headText) || /^<html\b/i.test(headText)) {
-    throw new Error("Remote server returned an HTML page instead of media");
-  }
-  if (/^<svg\b/i.test(headText) || /^<!doctype\s+svg\b/i.test(headText) || headText.startsWith("<?xml") && /<svg\b/i.test(headText)) {
+  const headText = decodeTextPrefix(bytes);
+  const { stripped: strippedHead, sawXmlDecl } = stripLeadingMarkupNoise(headText);
+  const printableText = isPrintableTextPrefix(headText);
+  if (/^<svg\b/i.test(strippedHead) || /^<!doctype\s+svg\b/i.test(strippedHead) || (sawXmlDecl || printableText) && (/<svg[\s>/]/i.test(headText) || /xmlns\s*=\s*["']http:\/\/www\.w3\.org\/2000\/svg["']/i.test(headText))) {
     throw new Error("SVG media is disallowed for security reasons");
   }
-  if (/^<script\b/i.test(headText)) {
+  if (/^<script\b/i.test(strippedHead) || printableText && /<script[\s>/]/i.test(headText)) {
     throw new Error("Remote server returned script content instead of media");
+  }
+  if (/^(?:<!doctype\s+html\b|<html\b|<head\b|<body\b|<title\b|<meta\b|<iframe\b|<object\b|<embed\b|<style\b)/i.test(strippedHead) || printableText && /<(?:!doctype\s+html|html|head|body|iframe|object|embed)\b/i.test(headText)) {
+    throw new Error("Remote server returned an HTML page instead of media");
+  }
+  if (sawXmlDecl || printableText && (/^<!--/.test(strippedHead) || /^<[a-zA-Z_][\w:-]*(?:\s[^>]*)?>/.test(strippedHead))) {
+    throw new Error("Remote server returned XML/markup content instead of media");
   }
   const cleanHeader = (headerMimeType ?? "").split(";")[0]?.trim().toLowerCase() ?? "";
   if (cleanHeader === "image/svg+xml" || cleanHeader === "image/svg") {
     throw new Error("SVG media (image/svg+xml) is disallowed for security reasons");
   }
+  if (cleanHeader.startsWith("text/") || cleanHeader === "application/json" || cleanHeader.endsWith("+json") || cleanHeader === "application/xml" || cleanHeader.endsWith("+xml") || cleanHeader === "application/xhtml+xml" || cleanHeader === "application/javascript" || cleanHeader === "application/ecmascript") {
+    throw new Error(`Unsupported response content-type: ${cleanHeader}`);
+  }
+  if (printableText) {
+    if (looksLikeJsonBody(bytes, strippedHead)) {
+      throw new Error("Unrecognized media format: remote server returned JSON instead of media");
+    }
+    if (bytes.byteLength >= 8) {
+      throw new Error("Unrecognized media format: remote server returned plain text instead of media");
+    }
+  }
   if (cleanHeader && MIME_TO_EXT[cleanHeader]) {
     return { mimeType: cleanHeader, ext: MIME_TO_EXT[cleanHeader] };
-  }
-  if (cleanHeader.startsWith("text/") || cleanHeader === "application/json" || cleanHeader === "application/xml" || cleanHeader === "application/xhtml+xml" || cleanHeader === "application/javascript" || cleanHeader === "text/javascript") {
-    throw new Error(`Unsupported response content-type: ${cleanHeader}`);
   }
   if (urlPath) {
     const extMatch = /\.([a-z0-9]{2,5})(?:$|[?#])/i.exec(urlPath);
@@ -1806,7 +2012,8 @@ async function downloadAndStoreMedia(spindle2, options) {
             filename,
             characterIds: [characterId],
             ...cand.galleryItemId ? { galleryItemIds: { [characterId]: cand.galleryItemId } } : {},
-            localizedAt: Date.now()
+            localizedAt: Date.now(),
+            reusedExistingImage: true
           };
         }
       } catch {}
@@ -1934,14 +2141,16 @@ async function reconcileCharacterGalleryWithIndex(spindle2, indexStore, userId, 
           userId
         });
         const rows = Array.isArray(listRes?.data) ? listRes.data : [];
+        if (rows.length === 0)
+          break;
         for (const img of rows) {
           if (img && typeof img.id === "string") {
             imageMetaById.set(img.id, img);
           }
         }
         offset += rows.length;
-        const total = typeof listRes?.total === "number" ? listRes.total : rows.length;
-        if (rows.length < pageLimit || offset >= total)
+        const total = typeof listRes?.total === "number" ? listRes.total : undefined;
+        if (total !== undefined ? offset >= total : rows.length < pageLimit)
           break;
       }
     } catch {}
@@ -2423,6 +2632,7 @@ function uniqueNumbers(values) {
   }
   return out;
 }
+var MAX_BATCH_ITEMS = 2000;
 function clampBoundedInt(value, min, max, fallback) {
   if (typeof value !== "number" || !Number.isFinite(value))
     return fallback;
@@ -2472,7 +2682,7 @@ function sanitizeOverride(raw) {
   }
   const maxItems = sanitizeNonNegativeInt(obj.maxItems);
   if (maxItems !== undefined) {
-    out.maxItems = maxItems;
+    out.maxItems = Math.min(MAX_BATCH_ITEMS, maxItems);
   }
   const excludedUrls = uniqueStrings(obj.excludedUrls);
   if (excludedUrls && excludedUrls.length > 0) {
@@ -2483,7 +2693,8 @@ function sanitizeOverride(raw) {
 function isOverrideEmpty(override) {
   if (!override)
     return true;
-  return (!override.sections || override.sections.length === 0) && (!override.greetingIndices || override.greetingIndices.length === 0) && (!override.worldBookIds || override.worldBookIds.length === 0) && (!override.domains || override.domains.length === 0) && (!override.mediaKinds || override.mediaKinds.length === 0) && typeof override.includeFailed !== "boolean" && sanitizeNonNegativeInt(override.maxItems) === undefined && (!override.excludedUrls || override.excludedUrls.length === 0);
+  const clean = sanitizeOverride(override);
+  return Object.keys(clean).length === 0;
 }
 function buildEffectiveFilter(settings, scan, override) {
   const rawOverride = override !== undefined ? override : scan?.override ?? null;
@@ -2493,7 +2704,7 @@ function buildEffectiveFilter(settings, scan, override) {
   const settingsKinds = Array.isArray(settings.defaultMediaKinds) ? Array.from(new Set(settings.defaultMediaKinds.filter((k) => ALL_MEDIA_KINDS.includes(k)))) : [];
   const mediaKinds = effOverride?.mediaKinds && effOverride.mediaKinds.length > 0 ? [...effOverride.mediaKinds] : settingsKinds.length > 0 ? settingsKinds : [...ALL_MEDIA_KINDS];
   const includeFailed = typeof effOverride?.includeFailed === "boolean" ? effOverride.includeFailed : typeof settings.defaultIncludeFailed === "boolean" ? settings.defaultIncludeFailed : DEFAULT_SETTINGS.defaultIncludeFailed;
-  const defaultBatchCap = sanitizeNonNegativeInt(settings.defaultBatchCap) ?? DEFAULT_SETTINGS.defaultBatchCap;
+  const defaultBatchCap = Math.min(MAX_BATCH_ITEMS, sanitizeNonNegativeInt(settings.defaultBatchCap) ?? DEFAULT_SETTINGS.defaultBatchCap);
   const maxItems = effOverride?.maxItems !== undefined ? effOverride.maxItems : defaultBatchCap;
   const maxFileSizeMb = clampBoundedInt(settings.maxFileSizeMb, 1, 200, DEFAULT_SETTINGS.maxFileSizeMb);
   const timeoutSeconds = clampBoundedInt(settings.timeoutSeconds, 5, 120, DEFAULT_SETTINGS.timeoutSeconds);
@@ -2695,15 +2906,16 @@ function sanitizeFailedRecord(raw) {
     lastAttemptAt: typeof r.lastAttemptAt === "number" ? r.lastAttemptAt : 0
   };
 }
-function applyRecordLocalizedAsset(state, entry) {
+function applyRecordLocalizedAsset(state, entry, options) {
   if (!isSafeRecordKey(entry.normalizedUrl)) {
     throw new Error("Invalid normalizedUrl key");
   }
   const existing = getOwnRecordValue(state.assets, entry.normalizedUrl);
+  const isReplacingDeadImage = Boolean(existing && options?.replaceIfImageId && existing.imageId === options.replaceIfImageId);
   const mergedRawUrls = Array.from(new Set([...existing?.rawUrls ?? [], ...entry.rawUrls, entry.normalizedUrl]));
   const mergedCharIds = Array.from(new Set([...existing?.characterIds ?? [], ...entry.characterIds]));
   const mergedGalleryItemIds = createNullProtoRecord();
-  if (existing?.galleryItemIds) {
+  if (!isReplacingDeadImage && existing?.galleryItemIds) {
     for (const [k, v] of Object.entries(existing.galleryItemIds)) {
       if (isSafeRecordKey(k) && typeof v === "string") {
         mergedGalleryItemIds[k] = v;
@@ -2717,7 +2929,7 @@ function applyRecordLocalizedAsset(state, entry) {
       }
     }
   }
-  const base = existing ?? entry;
+  const base = existing && !isReplacingDeadImage ? existing : entry;
   const saved = {
     normalizedUrl: entry.normalizedUrl,
     rawUrls: mergedRawUrls,
@@ -2830,6 +3042,7 @@ function applyRemoveByImageId(state, imageId) {
   }
   return { changed: removed > 0, result: removed };
 }
+var MAX_CACHED_USERS = 500;
 
 class MediaIndexStore {
   userStorage;
@@ -2840,14 +3053,38 @@ class MediaIndexStore {
   constructor(userStorage) {
     this.userStorage = userStorage;
   }
+  setCachedState(userId, state) {
+    if (this.cache.has(userId)) {
+      this.cache.delete(userId);
+    }
+    this.cache.set(userId, state);
+    if (this.cache.size <= MAX_CACHED_USERS)
+      return;
+    for (const candidateKey of this.cache.keys()) {
+      if (this.cache.size <= MAX_CACHED_USERS)
+        break;
+      if (candidateKey === userId)
+        continue;
+      if (this.writeLocks.has(candidateKey) || this.loading.has(candidateKey)) {
+        continue;
+      }
+      this.cache.delete(candidateKey);
+    }
+  }
   getState(userId) {
+    if (typeof userId !== "string" || userId.trim().length === 0) {
+      return this.loadState(userId);
+    }
     const cached = this.cache.get(userId);
-    if (cached)
+    if (cached) {
+      this.cache.delete(userId);
+      this.cache.set(userId, cached);
       return Promise.resolve(cached);
+    }
     let pending = this.loading.get(userId);
     if (!pending) {
       pending = this.loadState(userId).then((loaded) => {
-        this.cache.set(userId, loaded);
+        this.setCachedState(userId, loaded);
         return loaded;
       }).finally(() => {
         if (this.loading.get(userId) === pending) {
@@ -2946,6 +3183,9 @@ class MediaIndexStore {
     }
   }
   async mutateState(userId, fn) {
+    if (typeof userId !== "string" || userId.trim().length === 0) {
+      throw new Error("userId is required");
+    }
     const prevLock = this.writeLocks.get(userId) ?? Promise.resolve();
     const task = prevLock.catch(() => {}).then(async () => {
       const current = await this.getState(userId);
@@ -2953,7 +3193,7 @@ class MediaIndexStore {
       const outcome = fn(draft);
       if (outcome.changed) {
         await this.writeStateToStorage(userId, draft);
-        this.cache.set(userId, draft);
+        this.setCachedState(userId, draft);
       }
       return outcome.result;
     });
@@ -2974,8 +3214,8 @@ class MediaIndexStore {
       let changed = false;
       const tx = {
         state: draft,
-        recordLocalizedAsset(entry) {
-          const res = applyRecordLocalizedAsset(draft, entry);
+        recordLocalizedAsset(entry, options) {
+          const res = applyRecordLocalizedAsset(draft, entry, options);
           if (res.changed)
             changed = true;
           return res.result;
@@ -3041,8 +3281,8 @@ class MediaIndexStore {
       return { changed: true, result: draft.settings };
     });
   }
-  async recordLocalizedAsset(userId, entry) {
-    return this.mutateState(userId, (draft) => applyRecordLocalizedAsset(draft, entry));
+  async recordLocalizedAsset(userId, entry, options) {
+    return this.mutateState(userId, (draft) => applyRecordLocalizedAsset(draft, entry, options));
   }
   async linkExistingAssetToCharacter(userId, normalizedUrl, rawUrls, characterId, galleryItemId) {
     return this.mutateState(userId, (draft) => applyLinkExistingAssetToCharacter(draft, normalizedUrl, rawUrls, characterId, galleryItemId));
@@ -3132,8 +3372,21 @@ class MediaIndexStore {
         stillUsedImageIds.add(entry.imageId);
       }
       const orphanedImageIds = Array.from(candidateOrphanImageIds).filter((id) => !stillUsedImageIds.has(id));
+      let metadataChanged = false;
+      if (!targetFilter) {
+        const prevLen = draft.autoLocalizedCharacterIds.length;
+        if (prevLen > 0) {
+          draft.autoLocalizedCharacterIds = draft.autoLocalizedCharacterIds.filter((id) => id !== characterId);
+          if (draft.autoLocalizedCharacterIds.length !== prevLen) {
+            metadataChanged = true;
+          }
+        }
+        if (deleteOwnRecordValue(draft.characterOverrides, characterId)) {
+          metadataChanged = true;
+        }
+      }
       return {
-        changed: removedCount > 0,
+        changed: removedCount > 0 || metadataChanged,
         result: {
           orphanedImageIds,
           removedCount,
@@ -3165,7 +3418,7 @@ class MediaIndexStore {
     };
   }
   async buildActiveDisplayUrlMap(userId) {
-    const state = await this.getState(userId);
+    const state = typeof userId === "string" && userId.trim().length > 0 ? await this.getState(userId) : await this.loadState(undefined);
     const characterUrlMaps = createNullProtoRecord();
     const allUrlsMap = createNullProtoRecord();
     const addUrlVariants = (target, url, localUrl) => {
@@ -3245,6 +3498,7 @@ class UserDownloadQueue {
   runPromise = null;
   enqueueLock = Promise.resolve();
   inFlight = new Map;
+  cancelledCharacterUrls = new Map;
   constructor(userId, spindle2, indexStore, onUpdate) {
     this.userId = userId;
     this.spindle = spindle2;
@@ -3322,6 +3576,7 @@ class UserDownloadQueue {
         this.resumeResolver = null;
         this.pendingTasks = [...incoming];
         this.inFlight.clear();
+        this.cancelledCharacterUrls.clear();
         const gen = ++this.generation;
         this.progress = {
           status: incoming.length > 0 ? "running" : "completed",
@@ -3346,6 +3601,17 @@ class UserDownloadQueue {
           this.runPromise = run;
         }
       } else {
+        for (const t of incoming) {
+          const cancelled = this.cancelledCharacterUrls.get(t.characterId);
+          if (cancelled === null) {
+            this.cancelledCharacterUrls.delete(t.characterId);
+          } else if (cancelled) {
+            cancelled.delete(t.normalizedUrl);
+            if (cancelled.size === 0) {
+              this.cancelledCharacterUrls.delete(t.characterId);
+            }
+          }
+        }
         this.pendingTasks.push(...incoming);
         this.progress.totalQueued += incoming.length;
         if (cappedByLimit) {
@@ -3409,6 +3675,62 @@ class UserDownloadQueue {
     }
     this.emit();
     return this.getProgress();
+  }
+  isTaskCancelledForCharacter(characterId, normalizedUrl) {
+    const entry = this.cancelledCharacterUrls.get(characterId);
+    if (entry === undefined)
+      return false;
+    return entry === null || entry.has(normalizedUrl);
+  }
+  cancelCharacterTasks(characterId, onlyUrls) {
+    if (!characterId)
+      return 0;
+    const isActive = this.progress.status === "running" || this.progress.status === "paused" || this.progress.status === "cancelling";
+    if (!isActive)
+      return 0;
+    const urlSet = onlyUrls && onlyUrls.length > 0 ? new Set(onlyUrls) : null;
+    if (!urlSet) {
+      this.cancelledCharacterUrls.set(characterId, null);
+    } else {
+      const existing = this.cancelledCharacterUrls.get(characterId);
+      if (existing !== null) {
+        const next = existing ?? new Set;
+        for (const u of urlSet)
+          next.add(u);
+        this.cancelledCharacterUrls.set(characterId, next);
+      }
+    }
+    let affected = 0;
+    if (this.pendingTasks.length > 0) {
+      const remaining = [];
+      let droppedPending = 0;
+      for (const t of this.pendingTasks) {
+        if (t.characterId === characterId && (!urlSet || urlSet.has(t.normalizedUrl))) {
+          droppedPending++;
+        } else {
+          remaining.push(t);
+        }
+      }
+      if (droppedPending > 0) {
+        this.pendingTasks = remaining;
+        this.progress.skippedCount += droppedPending;
+        this.progress.completedCount += droppedPending;
+        affected += droppedPending;
+      }
+    }
+    for (const active of this.activeControls.values()) {
+      if (active.characterId === characterId && (!urlSet || urlSet.has(active.url))) {
+        if (!active.skipped) {
+          active.skipped = true;
+          active.controller.abort(new DOMException("Cancelled by character purge", "AbortError"));
+          affected++;
+        }
+      }
+    }
+    if (affected > 0) {
+      this.emit();
+    }
+    return affected;
   }
   cancelAll() {
     if (this.progress.status !== "running" && this.progress.status !== "paused") {
@@ -3477,7 +3799,7 @@ class UserDownloadQueue {
       while (true) {
         if (gen !== this.generation)
           return;
-        if (this.cancelRequested) {
+        if (this.cancelRequested || this.isTaskCancelledForCharacter(task.characterId, key)) {
           this.progress.completedCount++;
           this.progress.skippedCount++;
           this.emit();
@@ -3489,7 +3811,7 @@ class UserDownloadQueue {
         const outcome = await prior.catch(() => "failed");
         if (gen !== this.generation)
           return;
-        if (this.cancelRequested || outcome === "aborted") {
+        if (this.cancelRequested || outcome === "aborted" || this.isTaskCancelledForCharacter(task.characterId, key)) {
           this.progress.completedCount++;
           this.progress.skippedCount++;
           this.emit();
@@ -3507,7 +3829,7 @@ class UserDownloadQueue {
           } catch {}
           if (gen !== this.generation)
             return;
-          if (this.cancelRequested) {
+          if (this.cancelRequested || this.isTaskCancelledForCharacter(task.characterId, key)) {
             this.progress.completedCount++;
             this.progress.skippedCount++;
             this.emit();
@@ -3529,7 +3851,7 @@ class UserDownloadQueue {
       }
       if (gen !== this.generation)
         return;
-      if (this.cancelRequested) {
+      if (this.cancelRequested || this.isTaskCancelledForCharacter(task.characterId, key)) {
         this.progress.completedCount++;
         this.progress.skippedCount++;
         this.emit();
@@ -3550,7 +3872,7 @@ class UserDownloadQueue {
     const checkAbortedOrStale = () => {
       if (gen !== this.generation)
         return "aborted";
-      if (this.cancelRequested) {
+      if (this.cancelRequested || this.isTaskCancelledForCharacter(task.characterId, task.normalizedUrl)) {
         this.progress.completedCount++;
         this.progress.skippedCount++;
         this.emit();
@@ -3558,21 +3880,29 @@ class UserDownloadQueue {
       }
       return null;
     };
-    const preStateAborted = checkAbortedOrStale();
-    if (preStateAborted)
-      return preStateAborted;
-    const state = await this.indexStore.getState(this.userId);
-    const postStateAborted = checkAbortedOrStale();
-    if (postStateAborted)
-      return postStateAborted;
-    const existing = Object.hasOwn(state.assets, task.normalizedUrl) ? state.assets[task.normalizedUrl] : undefined;
-    if (existing) {
-      try {
-        const img = await this.spindle.images.get(existing.imageId, this.userId);
+    let controlId = null;
+    let control = null;
+    try {
+      const preStateAborted = checkAbortedOrStale();
+      if (preStateAborted)
+        return preStateAborted;
+      const state = await this.indexStore.getState(this.userId);
+      const postStateAborted = checkAbortedOrStale();
+      if (postStateAborted)
+        return postStateAborted;
+      const existing = Object.hasOwn(state.assets, task.normalizedUrl) ? state.assets[task.normalizedUrl] : undefined;
+      let deadImageId;
+      if (existing) {
+        let existingImg = null;
+        try {
+          existingImg = await this.spindle.images.get(existing.imageId, this.userId);
+        } catch {
+          existingImg = null;
+        }
         const postGetAborted = checkAbortedOrStale();
         if (postGetAborted)
           return postGetAborted;
-        if (img) {
+        if (existingImg) {
           const linked = await this.indexStore.linkExistingAssetToCharacter(this.userId, task.normalizedUrl, task.rawUrls, task.characterId);
           const postLinkAborted = checkAbortedOrStale();
           if (postLinkAborted)
@@ -3582,34 +3912,30 @@ class UserDownloadQueue {
           this.emit(linked ?? existing);
           return "ok";
         }
-      } catch {
-        const errAborted = checkAbortedOrStale();
-        if (errAborted)
-          return errAborted;
+        deadImageId = existing.imageId;
       }
-    }
-    const preControlAborted = checkAbortedOrStale();
-    if (preControlAborted)
-      return preControlAborted;
-    const controlId = `ctrl_${Date.now()}_${++this.seq}`;
-    const controller = new AbortController;
-    const control = {
-      id: controlId,
-      url: task.normalizedUrl,
-      characterId: task.characterId,
-      characterName: task.characterName,
-      startedAt: Date.now(),
-      controller,
-      skipped: false
-    };
-    this.activeControls.set(controlId, control);
-    if (this.cancelRequested || gen !== this.generation) {
-      this.activeControls.delete(controlId);
-      return checkAbortedOrStale() ?? "aborted";
-    }
-    this.emit();
-    try {
-      const entry = await downloadAndStoreMedia(this.spindle, {
+      const preControlAborted = checkAbortedOrStale();
+      if (preControlAborted)
+        return preControlAborted;
+      controlId = `ctrl_${Date.now()}_${++this.seq}`;
+      const controller = new AbortController;
+      control = {
+        id: controlId,
+        url: task.normalizedUrl,
+        characterId: task.characterId,
+        characterName: task.characterName,
+        startedAt: Date.now(),
+        controller,
+        skipped: false
+      };
+      this.activeControls.set(controlId, control);
+      if (this.cancelRequested || gen !== this.generation || this.isTaskCancelledForCharacter(task.characterId, task.normalizedUrl)) {
+        this.activeControls.delete(controlId);
+        controlId = null;
+        return checkAbortedOrStale() ?? "aborted";
+      }
+      this.emit();
+      const downloadResult = await downloadAndStoreMedia(this.spindle, {
         userId: this.userId,
         characterId: task.characterId,
         normalizedUrl: task.normalizedUrl,
@@ -3619,8 +3945,9 @@ class UserDownloadQueue {
         signal: controller.signal,
         unmatchedGalleryCandidates: task.unmatchedGalleryCandidates
       });
-      if (gen !== this.generation || this.cancelRequested || control.skipped) {
-        if (!entry.galleryItemIds && typeof this.spindle.images?.deleteMany === "function") {
+      const { reusedExistingImage, ...entry } = downloadResult;
+      if (gen !== this.generation || this.cancelRequested || control.skipped || this.isTaskCancelledForCharacter(task.characterId, task.normalizedUrl)) {
+        if (!reusedExistingImage && !entry.galleryItemIds && typeof this.spindle.images?.deleteMany === "function") {
           try {
             await this.spindle.images.deleteMany([entry.imageId], {
               userId: this.userId
@@ -3628,6 +3955,7 @@ class UserDownloadQueue {
           } catch {}
         }
         this.activeControls.delete(controlId);
+        controlId = null;
         if (gen === this.generation) {
           this.progress.completedCount++;
           this.progress.skippedCount++;
@@ -3635,8 +3963,8 @@ class UserDownloadQueue {
         }
         return "aborted";
       }
-      const saved = await this.indexStore.recordLocalizedAsset(this.userId, entry);
-      if (saved.imageId !== entry.imageId && !entry.galleryItemIds && typeof this.spindle.images?.deleteMany === "function") {
+      const saved = await this.indexStore.recordLocalizedAsset(this.userId, entry, deadImageId ? { replaceIfImageId: deadImageId } : undefined);
+      if (saved.imageId !== entry.imageId && !reusedExistingImage && !entry.galleryItemIds && typeof this.spindle.images?.deleteMany === "function") {
         try {
           await this.spindle.images.deleteMany([entry.imageId], {
             userId: this.userId
@@ -3644,6 +3972,7 @@ class UserDownloadQueue {
         } catch {}
       }
       this.activeControls.delete(controlId);
+      controlId = null;
       if (gen !== this.generation)
         return "aborted";
       this.progress.completedCount++;
@@ -3651,11 +3980,14 @@ class UserDownloadQueue {
       this.emit(saved);
       return "ok";
     } catch (err) {
-      this.activeControls.delete(controlId);
+      if (controlId) {
+        this.activeControls.delete(controlId);
+        controlId = null;
+      }
       if (gen !== this.generation)
         return "aborted";
       this.progress.completedCount++;
-      const isAborted = control.skipped || this.cancelRequested || controller.signal.aborted || err instanceof Error && err.name === "AbortError" || err instanceof Error && /AbortError|cancelled|Skipped/i.test(err.message);
+      const isAborted = Boolean(control?.skipped) || this.cancelRequested || Boolean(control?.controller.signal.aborted) || this.isTaskCancelledForCharacter(task.characterId, task.normalizedUrl) || err instanceof Error && err.name === "AbortError" || err instanceof Error && /AbortError|cancelled|Skipped/i.test(err.message);
       if (isAborted) {
         this.progress.skippedCount++;
         this.emit();
@@ -3679,10 +4011,13 @@ class UserDownloadQueue {
       this.emit();
       return "failed";
     } finally {
-      this.activeControls.delete(controlId);
+      if (controlId) {
+        this.activeControls.delete(controlId);
+      }
     }
   }
 }
+var MAX_QUEUED_USERS = 500;
 
 class MediaQueueManager {
   spindle;
@@ -3696,9 +4031,24 @@ class MediaQueueManager {
   }
   getQueue(userId) {
     let q = this.queues.get(userId);
-    if (!q) {
-      q = new UserDownloadQueue(userId, this.spindle, this.indexStore, this.onUpdate);
+    if (q) {
+      this.queues.delete(userId);
       this.queues.set(userId, q);
+      return q;
+    }
+    q = new UserDownloadQueue(userId, this.spindle, this.indexStore, this.onUpdate);
+    this.queues.set(userId, q);
+    if (this.queues.size > MAX_QUEUED_USERS) {
+      for (const [uid, candidate] of this.queues.entries()) {
+        if (this.queues.size <= MAX_QUEUED_USERS)
+          break;
+        if (uid === userId)
+          continue;
+        const st = candidate.getProgress().status;
+        if (st === "idle" || st === "completed" || st === "cancelled") {
+          this.queues.delete(uid);
+        }
+      }
     }
     return q;
   }
@@ -3710,7 +4060,7 @@ class MediaQueueManager {
 }
 
 // src/shared/library-media.ts
-function buildLibraryMedia(characters, assets, options) {
+function groupLibraryAssetsByCharacter(assets) {
   const byCharacter = new Map;
   for (const entry of Object.values(assets)) {
     if (!Array.isArray(entry.characterIds))
@@ -3726,53 +4076,69 @@ function buildLibraryMedia(characters, assets, options) {
       list.push(entry);
     }
   }
-  const result = [];
-  for (const char of characters) {
-    const avatarImageId = typeof char.image_id === "string" && char.image_id.trim() ? char.image_id.trim() : null;
-    const avatarUrl = avatarImageId ? `/api/v1/images/${encodeURIComponent(avatarImageId)}` : null;
-    const expressions = extractCharacterExpressions(char.extensions);
-    const exprImageIds = new Set(expressions.map((e) => e.imageId));
-    const rawAssets = byCharacter.get(char.id) ?? [];
-    let totalSizeBytes = 0;
-    let lastLocalizedAt = 0;
-    const seenAssetIds = new Set;
-    const localizedAssets = [];
-    for (const entry of rawAssets) {
-      if (entry.localizedAt > lastLocalizedAt) {
-        lastLocalizedAt = entry.localizedAt;
-      }
-      if (seenAssetIds.has(entry.imageId)) {
-        continue;
-      }
-      seenAssetIds.add(entry.imageId);
-      totalSizeBytes += entry.sizeBytes || 0;
-      if (exprImageIds.has(entry.imageId)) {
-        continue;
-      }
-      localizedAssets.push(entry);
+  return byCharacter;
+}
+function buildLibraryMediaCharacter(char, byCharacter, options) {
+  const avatarImageId = typeof char.image_id === "string" && char.image_id.trim() ? char.image_id.trim() : null;
+  const avatarUrl = avatarImageId ? `/api/v1/images/${encodeURIComponent(avatarImageId)}` : null;
+  const expressions = extractCharacterExpressions(char.extensions);
+  const exprImageIds = new Set(expressions.map((e) => e.imageId));
+  const rawAssets = byCharacter.get(char.id) ?? [];
+  let totalSizeBytes = 0;
+  let lastLocalizedAt = 0;
+  const seenAssetIds = new Set;
+  const localizedAssets = [];
+  for (const entry of rawAssets) {
+    const localizedAt = typeof entry.localizedAt === "number" && Number.isFinite(entry.localizedAt) ? entry.localizedAt : 0;
+    if (localizedAt > lastLocalizedAt) {
+      lastLocalizedAt = localizedAt;
     }
-    localizedAssets.sort((a, b) => b.localizedAt - a.localizedAt || a.filename.localeCompare(b.filename));
-    if (!options?.includeEmpty && localizedAssets.length === 0 && expressions.length === 0) {
+    if (seenAssetIds.has(entry.imageId)) {
       continue;
     }
-    result.push({
-      characterId: char.id,
-      characterName: char.name,
-      avatarImageId,
-      avatarUrl,
-      localizedAssets,
-      expressions,
-      totalSizeBytes,
-      lastLocalizedAt
-    });
+    seenAssetIds.add(entry.imageId);
+    const sizeBytes = typeof entry.sizeBytes === "number" && Number.isFinite(entry.sizeBytes) && entry.sizeBytes > 0 ? entry.sizeBytes : 0;
+    totalSizeBytes += sizeBytes;
+    if (exprImageIds.has(entry.imageId)) {
+      continue;
+    }
+    localizedAssets.push(entry);
+  }
+  localizedAssets.sort((a, b) => (Number.isFinite(b.localizedAt) ? b.localizedAt : 0) - (Number.isFinite(a.localizedAt) ? a.localizedAt : 0) || String(a.filename ?? "").localeCompare(String(b.filename ?? "")));
+  if (!options?.includeEmpty && localizedAssets.length === 0 && expressions.length === 0) {
+    return null;
+  }
+  const tags = Array.isArray(char.tags) ? Array.from(new Set(char.tags.filter((t) => typeof t === "string").map((t) => t.trim()).filter(Boolean))) : [];
+  return {
+    characterId: char.id,
+    characterName: char.name,
+    ...tags.length > 0 ? { tags } : {},
+    avatarImageId,
+    avatarUrl,
+    localizedAssets,
+    expressions,
+    totalSizeBytes,
+    lastLocalizedAt
+  };
+}
+function buildLibraryMedia(characters, assets, options) {
+  const byCharacter = groupLibraryAssetsByCharacter(assets);
+  const result = [];
+  for (const char of characters) {
+    const item = buildLibraryMediaCharacter(char, byCharacter, options);
+    if (item) {
+      result.push(item);
+    }
   }
   return result;
 }
 
 // src/backend.ts
 var MAX_KNOWN_USERS = 500;
-var MAX_CHARACTER_CACHE_ENTRIES = 500;
+var MAX_CHARACTER_CACHE_ENTRIES = 2000;
 var CHARACTER_SCAN_CACHE_TTL_MS = 60000;
+var CHARACTER_LIST_PAGE_LIMIT = 200;
+var MAX_CHARACTER_LIST_PAGES = 1000;
 var MIN_FILE_SIZE_BYTES2 = 1 * 1024 * 1024;
 var MAX_FILE_SIZE_BYTES2 = 200 * 1024 * 1024;
 var MIN_TIMEOUT_MS2 = 5000;
@@ -3936,7 +4302,7 @@ try {
     }
     if (knownUsers.size === 0) {
       try {
-        return await indexStore.buildActiveDisplayUrlMap(undefined);
+        return await indexStore.buildActiveDisplayUrlMap();
       } catch (err) {
         logWarn("media_localizer.url_map could not resolve default user storage before any user session:", err);
         return null;
@@ -4072,8 +4438,8 @@ async function fetchWorldBookWithEntries(wbId, userId, onError) {
         });
       }
       offset += rows.length;
-      const total = typeof entriesRes?.total === "number" ? entriesRes.total : offset;
-      if (rows.length < pageLimit || offset >= total)
+      const total = typeof entriesRes?.total === "number" ? entriesRes.total : undefined;
+      if (total !== undefined ? offset >= total : rows.length < pageLimit)
         break;
     }
     return {
@@ -4112,8 +4478,8 @@ async function fetchCharacterRegexScripts(characterId, userId) {
         });
       }
       offset += scripts.length;
-      const total = typeof scriptsRes?.total === "number" ? scriptsRes.total : offset;
-      if (scripts.length < pageLimit || offset >= total)
+      const total = typeof scriptsRes?.total === "number" ? scriptsRes.total : undefined;
+      if (total !== undefined ? offset >= total : scripts.length < pageLimit)
         break;
     }
   } catch (err) {
@@ -4213,12 +4579,15 @@ async function performCharacterScan(userId, characterId, includeResources = true
       }, MAX_CHARACTER_CACHE_ENTRIES);
     }
   }
+  const itemsToLink = scan.items.filter((item) => item.status === "localized" && item.localizedEntry && !item.localizedEntry.characterIds.includes(characterId));
   let linkedAny = false;
-  for (const item of scan.items) {
-    if (item.status === "localized" && item.localizedEntry && !item.localizedEntry.characterIds.includes(characterId)) {
-      await indexStore.linkExistingAssetToCharacter(userId, item.normalizedUrl, item.rawUrls, characterId);
-      linkedAny = true;
-    }
+  if (itemsToLink.length > 0) {
+    const linkBatch = await indexStore.batchUpdate(userId, (tx) => {
+      for (const item of itemsToLink) {
+        tx.linkExistingAssetToCharacter(item.normalizedUrl, item.rawUrls, characterId);
+      }
+    });
+    linkedAny = linkBatch.changed;
   }
   const reconciliation = await reconcileCharacterGalleryWithIndex(spindle, indexStore, userId, character, scan.items);
   if (reconciliation.unmatchedGalleryCandidates.length > 0) {
@@ -4244,18 +4613,19 @@ async function performCharacterScan(userId, characterId, includeResources = true
     refreshScanResultWithIndexState(scan, updatedState.assets, updatedState.failedUrls);
     scheduleUrlMapSync(userId);
   }
-  {
+  if (!options?.skipMedia) {
     const mediaState = await indexStore.getState(userId);
     scan.media = buildLibraryMedia([
       {
         id: character.id,
         name: character.name,
         image_id: character.image_id ?? null,
+        tags: Array.isArray(character.tags) ? character.tags : [],
         extensions: character.extensions ?? null
       }
     ], mediaState.assets, { includeEmpty: true })[0] ?? null;
   }
-  if (state.settings.autoLinkGallery && reconciliation.pendingGalleryLinks.length > 0) {
+  if (!options?.skipGalleryLinkBroadcast && state.settings.autoLinkGallery && reconciliation.pendingGalleryLinks.length > 0) {
     try {
       spindle.sendToFrontend({
         type: "ENSURE_GALLERY_LINKS",
@@ -4268,30 +4638,45 @@ async function performCharacterScan(userId, characterId, includeResources = true
   }
   return scan;
 }
-async function performLibraryScan(userId, options) {
-  const allCharacters = [];
+async function forEachCharacterPage(userId, onPage) {
   let offset = 0;
-  const pageLimit = 500;
-  for (let page = 0;page < 20; page++) {
-    const allCharactersRes = await spindle.characters.list({
-      limit: pageLimit,
+  const seenIds = new Set;
+  for (let page = 0;page < MAX_CHARACTER_LIST_PAGES; page++) {
+    const res = await spindle.characters.list({
+      limit: CHARACTER_LIST_PAGE_LIMIT,
       offset,
       userId
     });
-    const rows = Array.isArray(allCharactersRes?.data) ? allCharactersRes.data : [];
-    allCharacters.push(...rows);
-    offset += rows.length;
-    const total = typeof allCharactersRes?.total === "number" ? allCharactersRes.total : rows.length;
-    if (rows.length < pageLimit || offset >= total)
+    const rows = Array.isArray(res?.data) ? res.data : [];
+    if (rows.length === 0)
       break;
+    const freshRows = [];
+    for (const row of rows) {
+      if (!row || typeof row.id !== "string" || seenIds.has(row.id))
+        continue;
+      seenIds.add(row.id);
+      freshRows.push(row);
+    }
+    if (freshRows.length > 0) {
+      await onPage(freshRows);
+    }
+    offset += rows.length;
+    const total = typeof res?.total === "number" ? res.total : undefined;
+    if (total !== undefined ? offset >= total : rows.length < CHARACTER_LIST_PAGE_LIMIT) {
+      break;
+    }
   }
+}
+async function performLibraryScan(userId, options) {
   const summaries = [];
   const globalRemoteUrls = new Set;
   const worldBookCache = new Map;
   const scanOneCharacter = async (char) => {
     const scan = await performCharacterScan(userId, char.id, true, worldBookCache, {
       preloadedCharacter: char,
-      forceRefresh: Boolean(options?.forceRefresh)
+      forceRefresh: Boolean(options?.forceRefresh),
+      skipMedia: true,
+      skipGalleryLinkBroadcast: true
     });
     let localizedCount = 0;
     let remoteCount = 0;
@@ -4329,27 +4714,105 @@ async function performLibraryScan(userId, options) {
     };
   };
   const concurrency = 6;
-  let cursor = 0;
-  const workers = Array.from({ length: Math.min(concurrency, allCharacters.length) }, async () => {
-    while (cursor < allCharacters.length) {
-      const idx = cursor++;
-      const char = allCharacters[idx];
-      if (!char)
-        continue;
-      try {
-        const summary = await scanOneCharacter(char);
-        summaries.push(summary);
-      } catch (err) {
-        logWarn(`Failed to scan character ${char.id} (${char.name}) during library scan:`, err);
+  await forEachCharacterPage(userId, async (pageRows) => {
+    let cursor = 0;
+    const workers = Array.from({ length: Math.min(concurrency, pageRows.length) }, async () => {
+      while (cursor < pageRows.length) {
+        const idx = cursor++;
+        const char = pageRows[idx];
+        if (!char)
+          continue;
+        try {
+          const summary = await scanOneCharacter(char);
+          summaries.push(summary);
+        } catch (err) {
+          logWarn(`Failed to scan character ${char.id} (${char.name}) during library scan:`, err);
+        }
       }
-    }
+    });
+    await Promise.all(workers);
   });
-  await Promise.all(workers);
   summaries.sort((a, b) => b.remoteCount + b.failedCount - (a.remoteCount + a.failedCount) || b.totalUnique - a.totalUnique || a.characterName.localeCompare(b.characterName));
   return {
     characters: summaries,
     totalUniqueRemote: globalRemoteUrls.size
   };
+}
+function sanitizeDownloadFilter(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return { characterIds: [] };
+  }
+  const obj = raw;
+  const baseOverride = sanitizeOverride(obj);
+  const characterIds = Array.isArray(obj.characterIds) ? Array.from(new Set(obj.characterIds.filter((id) => typeof id === "string" && id.trim().length > 0).map((id) => id.trim()))) : [];
+  const explicitUrls = Array.isArray(obj.explicitUrls) ? Array.from(new Set(obj.explicitUrls.filter((u) => typeof u === "string" && u.trim().length > 0).map((u) => u.trim()))) : undefined;
+  const result = {
+    characterIds,
+    ...baseOverride
+  };
+  if (explicitUrls && explicitUrls.length > 0) {
+    result.explicitUrls = explicitUrls;
+  }
+  if (typeof obj.maxFileSizeBytes === "number" && Number.isFinite(obj.maxFileSizeBytes) && obj.maxFileSizeBytes > 0) {
+    result.maxFileSizeBytes = obj.maxFileSizeBytes;
+  }
+  if (typeof obj.timeoutMs === "number" && Number.isFinite(obj.timeoutMs) && obj.timeoutMs > 0) {
+    result.timeoutMs = obj.timeoutMs;
+  }
+  if (typeof obj.concurrency === "number" && Number.isFinite(obj.concurrency) && obj.concurrency > 0) {
+    result.concurrency = obj.concurrency;
+  }
+  return result;
+}
+async function enqueueDownloadInternal(userId, rawFilter, useCharacterOverrides, preloadedScans) {
+  const filter = sanitizeDownloadFilter(rawFilter);
+  const charIds = filter.characterIds;
+  if (charIds.length === 0) {
+    throw new Error("Select at least one character to localize");
+  }
+  const state = await indexStore.getState(userId);
+  const settings = state.settings;
+  const tasks = [];
+  const worldBookCache = new Map;
+  const { characterIds: _ignoredCharIds, ...definedFilter } = filter;
+  const hasValidFilterMaxItems = typeof filter.maxItems === "number" && Number.isFinite(filter.maxItems) && filter.maxItems >= 0;
+  let resolvedMaxItems = hasValidFilterMaxItems ? Math.floor(filter.maxItems) : settings.defaultBatchCap;
+  for (const charId of charIds) {
+    const scan = preloadedScans?.get(charId) ?? await performCharacterScan(userId, charId, true, worldBookCache);
+    const unmatchedCandidates = getLruMapEntry(unmatchedGalleryCache, `${userId}:${scan.characterId}`)?.items;
+    const effective = useCharacterOverrides ? buildEffectiveFilter(settings, scan) : null;
+    if (effective && charIds.length === 1 && !hasValidFilterMaxItems && typeof effective.maxItems === "number" && Number.isFinite(effective.maxItems) && effective.maxItems >= 0) {
+      resolvedMaxItems = Math.floor(effective.maxItems);
+    }
+    const charFilter = effective ? { ...effective, ...definedFilter } : definedFilter;
+    const matchingItems = filterScanItemsForDownload(scan, charFilter);
+    for (const item of matchingItems) {
+      tasks.push({
+        characterId: scan.characterId,
+        characterName: scan.characterName,
+        normalizedUrl: item.normalizedUrl,
+        rawUrls: item.rawUrls,
+        ...unmatchedCandidates && unmatchedCandidates.length > 0 ? { unmatchedGalleryCandidates: unmatchedCandidates } : {}
+      });
+    }
+  }
+  const clampPositiveInt = (raw, fallback, min, max) => {
+    const value = typeof raw === "number" && Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : fallback;
+    return Math.min(max, Math.max(min, value));
+  };
+  const maxItems = resolvedMaxItems;
+  const maxFileSizeBytes = clampPositiveInt(filter.maxFileSizeBytes, settings.maxFileSizeMb * 1024 * 1024, MIN_FILE_SIZE_BYTES2, MAX_FILE_SIZE_BYTES2);
+  const timeoutMs = clampPositiveInt(filter.timeoutMs, settings.timeoutSeconds * 1000, MIN_TIMEOUT_MS2, MAX_TIMEOUT_MS2);
+  const concurrency = clampPositiveInt(filter.concurrency, settings.concurrency, MIN_CONCURRENCY, MAX_CONCURRENCY);
+  const queueProgress = await queueManager.getQueue(userId).startOrAppendBatch({
+    userId,
+    tasks,
+    maxItems,
+    maxFileSizeBytes,
+    timeoutMs,
+    concurrency
+  });
+  return { queueProgress };
 }
 async function handleFrontendRpcAction(userId, action, payload = {}) {
   switch (action) {
@@ -4381,54 +4844,7 @@ async function handleFrontendRpcAction(userId, action, payload = {}) {
       return { ...result, urlMapPayload };
     }
     case "enqueue_download": {
-      const filter = payload.filter ?? {};
-      const useCharacterOverrides = Boolean(payload.useCharacterOverrides);
-      const charIds = Array.isArray(filter.characterIds) ? filter.characterIds.filter((id) => typeof id === "string" && id.trim().length > 0) : [];
-      if (charIds.length === 0) {
-        throw new Error("Select at least one character to localize");
-      }
-      const state = await indexStore.getState(userId);
-      const settings = state.settings;
-      const tasks = [];
-      const definedFilter = Object.fromEntries(Object.entries(filter).filter(([, v]) => v !== undefined));
-      const hasValidFilterMaxItems = typeof filter.maxItems === "number" && Number.isFinite(filter.maxItems) && filter.maxItems >= 0;
-      let resolvedMaxItems = hasValidFilterMaxItems ? Math.floor(filter.maxItems) : settings.defaultBatchCap;
-      for (const charId of charIds) {
-        const scan = await performCharacterScan(userId, charId, true);
-        const unmatchedCandidates = getLruMapEntry(unmatchedGalleryCache, `${userId}:${scan.characterId}`)?.items;
-        const effective = useCharacterOverrides ? buildEffectiveFilter(settings, scan) : null;
-        if (effective && charIds.length === 1 && !hasValidFilterMaxItems && typeof effective.maxItems === "number" && Number.isFinite(effective.maxItems) && effective.maxItems >= 0) {
-          resolvedMaxItems = Math.floor(effective.maxItems);
-        }
-        const charFilter = effective ? { ...effective, ...definedFilter } : filter;
-        const matchingItems = filterScanItemsForDownload(scan, charFilter);
-        for (const item of matchingItems) {
-          tasks.push({
-            characterId: scan.characterId,
-            characterName: scan.characterName,
-            normalizedUrl: item.normalizedUrl,
-            rawUrls: item.rawUrls,
-            ...unmatchedCandidates && unmatchedCandidates.length > 0 ? { unmatchedGalleryCandidates: unmatchedCandidates } : {}
-          });
-        }
-      }
-      const clampPositiveInt = (raw, fallback, min, max) => {
-        const value = typeof raw === "number" && Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : fallback;
-        return Math.min(max, Math.max(min, value));
-      };
-      const maxItems = resolvedMaxItems;
-      const maxFileSizeBytes = clampPositiveInt(filter.maxFileSizeBytes, settings.maxFileSizeMb * 1024 * 1024, MIN_FILE_SIZE_BYTES2, MAX_FILE_SIZE_BYTES2);
-      const timeoutMs = clampPositiveInt(filter.timeoutMs, settings.timeoutSeconds * 1000, MIN_TIMEOUT_MS2, MAX_TIMEOUT_MS2);
-      const concurrency = clampPositiveInt(filter.concurrency, settings.concurrency, MIN_CONCURRENCY, MAX_CONCURRENCY);
-      const queueProgress = await queueManager.getQueue(userId).startOrAppendBatch({
-        userId,
-        tasks,
-        maxItems,
-        maxFileSizeBytes,
-        timeoutMs,
-        concurrency
-      });
-      return { queueProgress };
+      return await enqueueDownloadInternal(userId, payload.filter, Boolean(payload.useCharacterOverrides));
     }
     case "queue_control": {
       const control = String(payload.control ?? "");
@@ -4457,42 +4873,40 @@ async function handleFrontendRpcAction(userId, action, payload = {}) {
     }
     case "list_library_media": {
       const includeEmpty = Boolean(payload?.includeEmpty);
-      const allCharacters = [];
-      let offset = 0;
-      const pageLimit = 500;
-      for (let page = 0;page < 20; page++) {
-        const res = await spindle.characters.list({ limit: pageLimit, offset, userId });
-        const rows = Array.isArray(res?.data) ? res.data : [];
-        allCharacters.push(...rows);
-        offset += rows.length;
-        const total = typeof res?.total === "number" ? res.total : rows.length;
-        if (rows.length < pageLimit || offset >= total)
-          break;
-      }
       const { assets } = await indexStore.getState(userId);
-      const characters = buildLibraryMedia(allCharacters.map((c) => ({
-        id: c.id,
-        name: c.name,
-        image_id: c.image_id ?? null,
-        extensions: c.extensions ?? null
-      })), assets, { includeEmpty });
+      const byCharacter = groupLibraryAssetsByCharacter(assets);
+      const characters = [];
+      await forEachCharacterPage(userId, (rows) => {
+        for (const c of rows) {
+          const item = buildLibraryMediaCharacter({
+            id: c.id,
+            name: c.name,
+            image_id: c.image_id ?? null,
+            tags: Array.isArray(c.tags) ? c.tags : [],
+            extensions: c.extensions ?? null
+          }, byCharacter, { includeEmpty });
+          if (item) {
+            characters.push(item);
+          }
+        }
+      });
       return { characters };
     }
     case "auto_localize_character": {
       const characterId = String(payload.characterId ?? "").trim();
       if (!characterId)
         throw new Error("characterId is required");
-      const state = await indexStore.getState(userId);
-      if (!state.settings.autoLocalizeOnOpen)
-        return { started: false };
-      if (state.autoLocalizedCharacterIds.includes(characterId)) {
-        return { started: false };
-      }
       const lockKey = `${userId}:${characterId}`;
       if (inFlightAutoLocalize.has(lockKey))
         return { started: false };
       inFlightAutoLocalize.add(lockKey);
       try {
+        const state = await indexStore.getState(userId);
+        if (!state.settings.autoLocalizeOnOpen)
+          return { started: false };
+        if (state.autoLocalizedCharacterIds.includes(characterId)) {
+          return { started: false };
+        }
         const scan = await performCharacterScan(userId, characterId, true);
         const filter = buildEffectiveFilter(state.settings, scan);
         const matching = filterScanItemsForDownload(scan, filter);
@@ -4500,9 +4914,10 @@ async function handleFrontendRpcAction(userId, action, payload = {}) {
           await indexStore.markAutoLocalized(userId, characterId);
           return { started: false };
         }
-        const result = await handleFrontendRpcAction(userId, "enqueue_download", {
-          filter: { ...filter, characterIds: [characterId] }
-        });
+        const preloadedScans = new Map([
+          [characterId, scan]
+        ]);
+        const result = await enqueueDownloadInternal(userId, { ...filter, characterIds: [characterId] }, false, preloadedScans);
         await indexStore.markAutoLocalized(userId, characterId);
         return { started: true, queueProgress: result.queueProgress };
       } finally {
@@ -4559,7 +4974,10 @@ async function handleFrontendRpcAction(userId, action, payload = {}) {
       const allRemovedGalleryItemIds = new Set;
       const allRemovedImageIds = new Set;
       let removedCount = 0;
+      const userQueue = queueManager.getQueue(userId);
       for (const characterId of targetCharacterIds) {
+        userQueue.cancelCharacterTasks(characterId, urls);
+        evictCharacterCaches(characterId, [userId]);
         const res = await indexStore.removeCharacterAssets(userId, characterId, urls);
         removedCount += res.removedCount;
         for (const id of res.orphanedImageIds)
@@ -4608,12 +5026,15 @@ spindle.onFrontendMessage(async (msg, rawUserId) => {
   const payload = envelope.payload && typeof envelope.payload === "object" ? envelope.payload : {};
   const userId = resolveActingUser(rawUserId);
   if (!userId) {
-    if (requestId) {
+    const trimmedRawUserId = typeof rawUserId === "string" ? rawUserId.trim() : "";
+    if (requestId && trimmedRawUserId) {
       spindle.sendToFrontend({
         type: "RPC_RESPONSE",
         requestId,
         error: "Could not resolve active user session"
-      }, rawUserId);
+      }, trimmedRawUserId);
+    } else if (requestId) {
+      logWarn(`Dropping RPC_RESPONSE for ${action || "unknown"} (${requestId}) because active user session could not be resolved`);
     }
     return;
   }
@@ -4714,6 +5135,7 @@ spindle.on("CHARACTER_DELETED", async (event, rawUserId) => {
   evictCharacterCaches(characterId, explicitUserId ? [explicitUserId] : null);
   for (const userId of targetUsers) {
     try {
+      queueManager.getQueue(userId).cancelCharacterTasks(characterId);
       const { orphanedImageIds, removedCount } = await indexStore.removeCharacterAssets(userId, characterId);
       const { settings } = await indexStore.getState(userId);
       if (settings.deleteImagesOnPurge && orphanedImageIds.length > 0) {

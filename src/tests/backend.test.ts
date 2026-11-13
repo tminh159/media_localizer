@@ -25,6 +25,7 @@ interface MockController {
     failRegexForChars: Set<string>;
     worldBookFetchCounts: Map<string, number>;
     regexFetchCounts: Map<string, number>;
+    characterListMaxPageSize: number | null;
     corsHandler: ((url: string) => Promise<any>) | null;
     resetCallLogs: () => void;
     emitEvent: (eventName: string, ev: unknown, userId?: string) => Promise<void>;
@@ -56,6 +57,7 @@ function createBackendController(): MockController {
         failRegexForChars: new Set(),
         worldBookFetchCounts: new Map(),
         regexFetchCounts: new Map(),
+        characterListMaxPageSize: null,
         corsHandler: null,
         getStore(userId?: string): MemoryStorage {
             if (userId === undefined && !controller.allowUndefinedUser) {
@@ -151,7 +153,11 @@ function createBackendController(): MockController {
             list: async (opts?: { limit?: number; offset?: number }) => {
                 const all = Array.from(controller.characters.values());
                 const offset = opts?.offset ?? 0;
-                const limit = opts?.limit ?? all.length;
+                const requestedLimit = opts?.limit ?? all.length;
+                const limit =
+                    controller.characterListMaxPageSize !== null
+                        ? Math.min(requestedLimit, controller.characterListMaxPageSize)
+                        : requestedLimit;
                 return {
                     data: all.slice(offset, offset + limit),
                     total: all.length,
@@ -252,12 +258,37 @@ describe("backend url_map RPC pool & knownUsers disambiguation", () => {
         controller.allowUndefinedUser = false;
         expect(await reg!.handler({})).toBeNull();
 
-        // size === 0 but host resolves default user -> returns payload
+        // size === 0 but host resolves default user -> returns payload without stale undefined cache
         controller.allowUndefinedUser = true;
         const defaultRes = await reg!.handler({});
         expect(defaultRes).toBeDefined();
         expect((defaultRes as any).characterUrlMaps).toBeDefined();
         expect((defaultRes as any).allUrlsMap).toBeDefined();
+
+        // Updating default user storage while knownUsers.size === 0 must be reflected immediately (no stale undefined cache)
+        await controller.getStore(undefined).write(
+            "media_index.json",
+            JSON.stringify({
+                version: 1,
+                assets: {
+                    "https://cdn.example.com/fresh-default.png": {
+                        normalizedUrl: "https://cdn.example.com/fresh-default.png",
+                        rawUrls: ["https://cdn.example.com/fresh-default.png"],
+                        imageId: "def-img-1",
+                        localUrl: "/api/v1/images/def-img-1",
+                        mimeType: "image/png",
+                        sizeBytes: 12,
+                        filename: "fresh.png",
+                        characterIds: ["c-def"],
+                        localizedAt: 1,
+                    },
+                },
+            }),
+        );
+        const refreshedDefaultRes = (await reg!.handler({})) as any;
+        expect(refreshedDefaultRes.allUrlsMap["https://cdn.example.com/fresh-default.png"]).toBe(
+            "/api/v1/images/def-img-1",
+        );
 
         // Connect sole user (knownUsers size === 1)
         await controller.emitEvent("CONNECTED", {}, "rpc-sole-user");
@@ -362,6 +393,43 @@ describe("backend performCharacterScan caching, failure non-caching, and perform
         expect(libRes.characters.some((c) => c.characterId === "good-char")).toBe(true);
         expect(libRes.characters.some((c) => c.characterId === "bad-char")).toBe(false);
         expect(libRes.totalUniqueRemote).toBeGreaterThanOrEqual(1);
+    });
+
+    test("list_library_media and performLibraryScan paginate all characters even when host clamps page limit", async () => {
+        const userId = "u-paginated-lib";
+        const createdIds: string[] = [];
+        for (let i = 0; i < 7; i++) {
+            const id = `paged-char-${i}`;
+            createdIds.push(id);
+            controller.characters.set(id, {
+                id,
+                name: `Paged ${i}`,
+                updated_at: 2000 + i,
+                description: `![](https://cdn.example.com/paged-${i}.png)`,
+            });
+        }
+
+        controller.characterListMaxPageSize = 2;
+        try {
+            const mediaRes = (await backend.handleFrontendRpcAction(userId, "list_library_media", {
+                includeEmpty: true,
+            })) as { characters: Array<{ characterId: string }> };
+            const returnedMediaIds = new Set(mediaRes.characters.map((c) => c.characterId));
+            for (const id of createdIds) {
+                expect(returnedMediaIds.has(id)).toBe(true);
+            }
+
+            const scanRes = await backend.performLibraryScan(userId, { forceRefresh: true });
+            const scannedIds = new Set(scanRes.characters.map((c) => c.characterId));
+            for (const id of createdIds) {
+                expect(scannedIds.has(id)).toBe(true);
+            }
+        } finally {
+            controller.characterListMaxPageSize = null;
+            for (const id of createdIds) {
+                controller.characters.delete(id);
+            }
+        }
     });
 });
 
@@ -500,11 +568,12 @@ describe("backend handleFrontendRpcAction & onFrontendMessage", () => {
             { type: "RPC_REQUEST", requestId: "req-no-user", action: "get_init_state", payload: {} },
             "",
         );
+        // Must NOT broadcast an RPC_RESPONSE with empty userId `""`
         expect(
             controller.sentToFrontend.some(
-                (m) => m.msg.requestId === "req-no-user" && /active user session/.test(m.msg.error),
+                (m) => m.msg.requestId === "req-no-user" || m.userId === "",
             ),
-        ).toBe(true);
+        ).toBe(false);
 
         await controller.frontendMessageHandler!(
             { type: "RPC_REQUEST", requestId: "req-ok", action: "get_init_state", payload: {} },
@@ -634,5 +703,178 @@ describe("backend event cleanup hooks & Command Palette", () => {
             { userId },
         );
         expect(controller.toastCalls.error.length).toBe(1);
+    });
+});
+
+describe("backend audit fixes #8.7 (perf & filter validation) and #8.8 (cleanup)", () => {
+    test("#8.7 batches shared link writes in performCharacterScan, skips media/ENSURE_GALLERY_LINKS in performLibraryScan, and sanitizes malformed enqueue_download filters", async () => {
+        const userId = "u-perf-batch";
+        controller.resetCallLogs();
+
+        // Seed two characters sharing 3 already-localized URLs
+        controller.characters.set("char-seed-owner", {
+            id: "char-seed-owner",
+            name: "Owner",
+            updated_at: 1,
+            description: "![](https://cdn.example.com/sh1.png) ![](https://cdn.example.com/sh2.png) ![](https://cdn.example.com/sh3.png)",
+        });
+        await backend.handleFrontendRpcAction(userId, "enqueue_download", {
+            filter: { characterIds: ["char-seed-owner"], maxItems: 0 },
+        });
+        const dlDeadline = Date.now() + 2000;
+        while (Date.now() < dlDeadline) {
+            const p = (await backend.handleFrontendRpcAction(userId, "queue_control", { control: "status" })) as any;
+            if (p.queueProgress.status === "completed") break;
+            await new Promise((r) => setTimeout(r, 10));
+        }
+
+        controller.characters.set("char-batch-linker", {
+            id: "char-batch-linker",
+            name: "BatchLinker",
+            updated_at: 2,
+            description: "![](https://cdn.example.com/sh1.png) ![](https://cdn.example.com/sh2.png) ![](https://cdn.example.com/sh3.png) ![](https://cdn.example.com/rem-only.png)",
+        });
+
+        const store = controller.getStore(userId);
+        const writesBefore = store.calls.write.length;
+        const scan = await backend.performCharacterScan(userId, "char-batch-linker", true);
+        // All 3 shared URLs should be linked in a single batched write (1 temp write, not 3)
+        expect(store.calls.write.length).toBe(writesBefore + 1);
+        expect(scan.media).toBeDefined();
+
+        // performLibraryScan must NOT emit ENSURE_GALLERY_LINKS for unlinked localized items
+        controller.resetCallLogs();
+        await backend.performLibraryScan(userId, { forceRefresh: true });
+        expect(
+            controller.sentToFrontend.some((m) => m.msg.type === "ENSURE_GALLERY_LINKS"),
+        ).toBe(false);
+
+        // Single-character scan_character still emits ENSURE_GALLERY_LINKS
+        await backend.handleFrontendRpcAction(userId, "scan_character", {
+            characterId: "char-batch-linker",
+            forceRefresh: true,
+        });
+        expect(
+            controller.sentToFrontend.some(
+                (m) => m.msg.type === "ENSURE_GALLERY_LINKS" && m.msg.characterId === "char-batch-linker",
+            ),
+        ).toBe(true);
+
+        // Malformed enqueue_download filter fields must be safely sanitized without throwing TypeError
+        const queued = (await backend.handleFrontendRpcAction(userId, "enqueue_download", {
+            filter: {
+                characterIds: ["char-batch-linker", "char-batch-linker", "", 123 as any],
+                domains: "cdn.example.com" as any,
+                greetingIndices: 0 as any,
+                worldBookIds: "wb1" as any,
+                sections: ["invalid_sec", "core_fields"] as any,
+                mediaKinds: "image" as any,
+                explicitUrls: "https://cdn.example.com/rem-only.png" as any,
+                excludedUrls: 42 as any,
+                includeFailed: "false" as any,
+                maxItems: -5,
+            },
+        })) as any;
+        expect(queued.queueProgress.totalQueued).toBe(1);
+
+        const qDeadline = Date.now() + 2000;
+        while (Date.now() < qDeadline) {
+            const p = (await backend.handleFrontendRpcAction(userId, "queue_control", { control: "status" })) as any;
+            if (p.queueProgress.status === "completed") break;
+            await new Promise((r) => setTimeout(r, 10));
+        }
+
+        controller.characters.delete("char-seed-owner");
+        controller.characters.delete("char-batch-linker");
+    });
+
+    test("#8.8 purge_characters and CHARACTER_DELETED clear overrides, autoLocalized ids, scan cache, and active queue tasks", async () => {
+        const userId = "u-cleanup-88";
+        let releaseCors!: () => void;
+        const slowCorsGate = new Promise<void>((r) => {
+            releaseCors = r;
+        });
+        const prevCors = controller.corsHandler;
+        controller.corsHandler = async (url: string) => {
+            if (url.includes("slow-del")) {
+                await slowCorsGate;
+            }
+            return { status: 200, headers: { "content-type": "image/png" }, body: PNG_MAGIC.slice() };
+        };
+
+        try {
+            controller.characters.set("char-purge-me", {
+                id: "char-purge-me",
+                name: "PurgeMe",
+                updated_at: 300,
+                description: "![](https://cdn.example.com/slow-del-1.png) ![](https://cdn.example.com/slow-del-2.png)",
+                world_book_ids: ["wb-clean-88"],
+            });
+            controller.worldBooks.set("wb-clean-88", {
+                id: "wb-clean-88",
+                name: "CleanWB",
+                entries: [],
+            });
+
+            await backend.handleFrontendRpcAction(userId, "update_settings", {
+                patch: { autoLocalizeOnOpen: true },
+            });
+            await backend.handleFrontendRpcAction(userId, "save_character_override", {
+                characterId: "char-purge-me",
+                override: { sections: ["core_fields"] },
+            });
+
+            const wbCountBefore = controller.worldBookFetchCounts.get("wb-clean-88") ?? 0;
+            // auto_localize_character scans, starts slow download, and marks autoLocalizedCharacterIds
+            const autoRes = (await backend.handleFrontendRpcAction(userId, "auto_localize_character", {
+                characterId: "char-purge-me",
+            })) as { started: boolean };
+            expect(autoRes.started).toBe(true);
+            expect(controller.worldBookFetchCounts.get("wb-clean-88")).toBe(wbCountBefore + 1);
+
+            // Second scan hits cache while unpurged
+            await backend.performCharacterScan(userId, "char-purge-me", true);
+            expect(controller.worldBookFetchCounts.get("wb-clean-88")).toBe(wbCountBefore + 1);
+
+            // Purge character while slow-del-1 is in flight and slow-del-2 is pending
+            await backend.handleFrontendRpcAction(userId, "purge_characters", {
+                characterIds: ["char-purge-me"],
+            });
+            releaseCors();
+
+            const deadline = Date.now() + 2000;
+            while (Date.now() < deadline) {
+                const p = (await backend.handleFrontendRpcAction(userId, "queue_control", { control: "status" })) as any;
+                if (p.queueProgress.status === "completed" || p.queueProgress.status === "idle") break;
+                await new Promise((r) => setTimeout(r, 15));
+            }
+
+            // Cancelled tasks must not have written assets back into media_index.json,
+            // and override + autoLocalizedCharacterIds must be removed.
+            const rawJson = await controller.getStore(userId).read("media_index.json");
+            const persisted = JSON.parse(rawJson);
+            expect(Object.keys(persisted.assets)).toEqual([]);
+            expect(persisted.characterOverrides["char-purge-me"]).toBeUndefined();
+            expect(persisted.autoLocalizedCharacterIds).not.toContain("char-purge-me");
+
+            // Scan cache was evicted on purge so next scan re-fetches WB
+            await backend.performCharacterScan(userId, "char-purge-me", true);
+            expect(controller.worldBookFetchCounts.get("wb-clean-88")).toBe(wbCountBefore + 2);
+
+            // Also verify CHARACTER_DELETED clears override and autoLocalizedCharacterIds even with zero assets
+            await backend.handleFrontendRpcAction(userId, "save_character_override", {
+                characterId: "char-del-meta",
+                override: { maxItems: 3 },
+            });
+            await controller.emitEvent("CHARACTER_DELETED", { characterId: "char-del-meta" }, userId);
+            const rawAfterDel = await controller.getStore(userId).read("media_index.json");
+            const persistedAfterDel = JSON.parse(rawAfterDel);
+            expect(persistedAfterDel.characterOverrides["char-del-meta"]).toBeUndefined();
+        } finally {
+            releaseCors?.();
+            controller.corsHandler = prevCors;
+            controller.characters.delete("char-purge-me");
+            controller.worldBooks.delete("wb-clean-88");
+        }
     });
 });

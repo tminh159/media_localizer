@@ -9,6 +9,11 @@ export const MEDIA_LOCALIZER_STYLES = `
   overflow-y: auto;
 }
 
+/* Prevent the native gallery viewport from being squashed to 0px when Downloaded Media expands */
+[class*="galleryTab"].ml-gallery-tab-active > [class*="galleryScrollArea"] {
+  min-height: 180px;
+}
+
 .ml-gallery-host {
   margin-top: 12px;
   border: 1px solid var(--lumiverse-border, rgba(255, 255, 255, 0.12));
@@ -18,7 +23,7 @@ export const MEDIA_LOCALIZER_STYLES = `
   font-size: 12.5px;
   line-height: 1.45;
   flex-shrink: 0;
-  overflow: hidden;
+  overflow: visible;
 }
 
 .ml-drawer-root {
@@ -28,12 +33,14 @@ export const MEDIA_LOCALIZER_STYLES = `
   color: var(--lumiverse-text, #f1f5f9);
   font-size: 12.5px;
   line-height: 1.45;
-  overflow: hidden;
+  overflow: visible;
 }
 
 .ml-drawer-nav {
   display: flex;
+  flex-wrap: wrap;
   gap: 4px;
+  min-width: 0;
   padding: 8px 12px;
   border-bottom: 1px solid var(--lumiverse-border, rgba(255, 255, 255, 0.1));
   background: var(--lumiverse-bg-surface, rgba(15, 17, 23, 0.6));
@@ -41,7 +48,9 @@ export const MEDIA_LOCALIZER_STYLES = `
 }
 
 .ml-drawer-nav-btn {
-  flex: 1;
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: nowrap;
   padding: 6px 8px;
   border-radius: 6px;
   border: 1px solid transparent;
@@ -66,6 +75,7 @@ export const MEDIA_LOCALIZER_STYLES = `
 
 .ml-drawer-body {
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
   padding: 12px;
   display: flex;
@@ -193,6 +203,19 @@ export const MEDIA_LOCALIZER_STYLES = `
   font-size: 11px;
 }
 
+.ml-collapse-btn {
+  border-color: transparent;
+  background: transparent;
+  color: var(--lumiverse-text-muted, #94a3b8);
+  padding: 2px 4px;
+}
+
+.ml-collapse-btn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.14);
+  color: var(--lumiverse-text, #f1f5f9);
+}
+
 .ml-toggle-label {
   display: inline-flex;
   align-items: center;
@@ -251,9 +274,18 @@ export const MEDIA_LOCALIZER_STYLES = `
   display: flex;
   align-items: center;
   gap: 6px;
+  flex: 1;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.ml-check-card-left > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
 }
 
 .ml-subfilter-box {
@@ -503,6 +535,8 @@ export const MEDIA_LOCALIZER_STYLES = `
   border: 1px solid rgba(239, 68, 68, 0.35);
   color: #fca5a5;
   font-size: 11px;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .ml-download-bar {
@@ -608,9 +642,14 @@ export const MEDIA_LOCALIZER_STYLES = `
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+  min-width: 0;
   padding: 7px 9px;
   cursor: pointer;
   user-select: none;
+}
+
+.ml-lib-row .ml-header-actions {
+  flex-shrink: 0;
 }
 
 .ml-drawer-sticky-banner {
@@ -741,6 +780,8 @@ export const MEDIA_LOCALIZER_STYLES = `
   border: 1px solid rgba(239, 68, 68, 0.35);
   color: #fca5a5;
   font-size: 12px;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .ml-empty {
@@ -782,9 +823,8 @@ export const MEDIA_LOCALIZER_STYLES = `
 .ml-tip-popover {
   display: none;
   position: absolute;
-  left: 50%;
+  left: 0;
   top: calc(100% + 6px);
-  transform: translateX(-50%);
   width: max-content;
   max-width: min(240px, 65vw);
   padding: 6px 8px;
@@ -810,6 +850,12 @@ export const MEDIA_LOCALIZER_STYLES = `
 
 .ml-tip-wrap.is-open .ml-tip-popover {
   pointer-events: auto;
+}
+
+.ml-setting-toggle-row .ml-tip-popover,
+.ml-header-bar > .ml-tip-wrap:last-child .ml-tip-popover {
+  left: auto;
+  right: 0;
 }
 
 /* Active Character Header */
@@ -981,8 +1027,10 @@ export const MEDIA_LOCALIZER_STYLES = `
 }
 
 .ml-drawer-root .ml-asset-grid,
+.ml-drawer-root .ml-media-list,
 .ml-gallery-grid {
   max-height: none;
+  overflow-y: visible;
 }
 
 .ml-char-card-grid {
@@ -1047,6 +1095,29 @@ export const MEDIA_LOCALIZER_STYLES = `
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.ml-gallery-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 2px 0;
+}
+
+.ml-gallery-pagination-info {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11.5px;
+  color: var(--lumiverse-text-muted, #94a3b8);
+}
+
+.ml-gallery-pagination-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 
 /* Shared Lightbox */

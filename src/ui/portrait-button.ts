@@ -26,6 +26,7 @@ export class PortraitPanelLocalizeController {
   private justCompleted = false;
   private completedTimer: ReturnType<typeof setTimeout> | null = null;
   private longPressTimer: ReturnType<typeof setTimeout> | null = null;
+  private longPressResetTimer: ReturnType<typeof setTimeout> | null = null;
   private lastRenderKey = "";
   private stopped = false;
 
@@ -70,10 +71,14 @@ export class PortraitPanelLocalizeController {
     }
 
     const mountedPanel = this.wrapEl?.parentElement ?? null;
-    if (!mountedPanel || mountedPanel.isConnected === false) {
+    if (
+      mountedPanel &&
+      mountedPanel.isConnected !== false &&
+      (mountedPanel.contains(target) || target.contains?.(mountedPanel))
+    ) {
       return true;
     }
-    if (mountedPanel.contains(target) || target.contains?.(mountedPanel)) {
+    if (targetEl?.closest?.('[class*="panelOuter"] [class*="panel"]')) {
       return true;
     }
 
@@ -98,6 +103,10 @@ export class PortraitPanelLocalizeController {
     if (this.longPressTimer !== null) {
       clearTimeout(this.longPressTimer);
       this.longPressTimer = null;
+    }
+    if (this.longPressResetTimer !== null) {
+      clearTimeout(this.longPressResetTimer);
+      this.longPressResetTimer = null;
     }
   }
 
@@ -170,12 +179,12 @@ export class PortraitPanelLocalizeController {
 
     btn.addEventListener("pointerdown", (ev) => {
       if (this.stopped) return;
+      this.clearLongPress();
       longPressTriggered = false;
       // Only arm touch/pen/primary-mouse long-press so right-click uses contextmenu cleanly.
       if (ev.pointerType === "mouse" && ev.button !== 0) return;
       const charId = this.callbacks.getActiveCharacterId();
       if (!charId) return;
-      this.clearLongPress();
       this.longPressTimer = setTimeout(() => {
         this.longPressTimer = null;
         if (this.stopped) return;
@@ -183,10 +192,29 @@ export class PortraitPanelLocalizeController {
         this.callbacks.onOpenCharacterTab(charId);
       }, 520);
     });
-    const onCancelLongPress = () => this.clearLongPress();
-    btn.addEventListener("pointerup", onCancelLongPress);
-    btn.addEventListener("pointercancel", onCancelLongPress);
-    btn.addEventListener("pointerleave", onCancelLongPress);
+    const onPointerUp = () => {
+      if (this.longPressTimer !== null) {
+        clearTimeout(this.longPressTimer);
+        this.longPressTimer = null;
+      }
+      if (longPressTriggered) {
+        if (this.longPressResetTimer !== null) {
+          clearTimeout(this.longPressResetTimer);
+        }
+        // Reset on the next macrotask if no click event fires (e.g. pointer released off-target).
+        this.longPressResetTimer = setTimeout(() => {
+          this.longPressResetTimer = null;
+          longPressTriggered = false;
+        }, 0);
+      }
+    };
+    const onAbortLongPress = () => {
+      this.clearLongPress();
+      longPressTriggered = false;
+    };
+    btn.addEventListener("pointerup", onPointerUp);
+    btn.addEventListener("pointercancel", onAbortLongPress);
+    btn.addEventListener("pointerleave", onAbortLongPress);
 
     btn.addEventListener("contextmenu", (ev) => {
       ev.preventDefault();
@@ -201,6 +229,10 @@ export class PortraitPanelLocalizeController {
     btn.addEventListener("click", (ev) => {
       ev.preventDefault();
       ev.stopPropagation();
+      if (this.longPressResetTimer !== null) {
+        clearTimeout(this.longPressResetTimer);
+        this.longPressResetTimer = null;
+      }
       if (longPressTriggered) {
         longPressTriggered = false;
         return;

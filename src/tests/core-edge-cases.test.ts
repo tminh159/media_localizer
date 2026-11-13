@@ -1078,3 +1078,350 @@ describe("core/gallery-reconciler batched writes, bounded fetch, expression unli
         expect(refreshed.domainBreakdown[0]?.failedCount).toBe(1);
     });
 });
+
+describe("audit fixes #8.1, #8.2, #8.3, #8.5, and character queue cancellation", () => {
+    test("#8.1 heals dead imageId on re-download without deleting new upload while respecting concurrent newer uploads", async () => {
+        const { spindle, deletedImageBatches } = createCoreMockSpindle();
+        const store = new MediaIndexStore(spindle.userStorage);
+        const urlMissing = "https://cdn.example.com/dead-null.png";
+        const urlError = "https://cdn.example.com/dead-throw.png";
+
+        await store.batchUpdate("u1", (tx) => {
+            tx.recordLocalizedAsset({
+                normalizedUrl: urlMissing,
+                rawUrls: [urlMissing],
+                imageId: "dead-img-1",
+                localUrl: "/api/v1/images/dead-img-1",
+                mimeType: "image/png",
+                sizeBytes: 100,
+                filename: "dead.png",
+                characterIds: ["c-old"],
+                galleryItemIds: { "c-old": "dead-gal-1" },
+                localizedAt: 10,
+            });
+            tx.recordLocalizedAsset({
+                normalizedUrl: urlError,
+                rawUrls: [urlError],
+                imageId: "dead-img-throw",
+                localUrl: "/api/v1/images/dead-img-throw",
+                mimeType: "image/png",
+                sizeBytes: 100,
+                filename: "dead2.png",
+                characterIds: ["c-old"],
+                localizedAt: 10,
+            });
+        });
+
+        const origGet = spindle.images.get;
+        spindle.images.get = (async (id: string, uid?: string) => {
+            if (id === "dead-img-throw") throw new Error("image read failed");
+            return origGet(id, uid);
+        }) as typeof spindle.images.get;
+
+        const q = new UserDownloadQueue("u1", spindle, store, () => {});
+        await q.startOrAppendBatch({
+            userId: "u1",
+            concurrency: 2,
+            maxFileSizeBytes: 5 * 1024 * 1024,
+            timeoutMs: 5000,
+            maxItems: 0,
+            tasks: [
+                { characterId: "c1", characterName: "C1", normalizedUrl: urlMissing, rawUrls: [urlMissing] },
+                { characterId: "c1", characterName: "C1", normalizedUrl: urlError, rawUrls: [urlError] },
+            ],
+        });
+        await waitForQueueTerminal(q);
+
+        expect(q.getProgress().succeededCount).toBe(2);
+        expect(deletedImageBatches.flat()).toEqual([]);
+
+        const st = await store.getState("u1");
+        expect(st.assets[urlMissing]?.imageId).not.toBe("dead-img-1");
+        expect(st.assets[urlMissing]?.characterIds.sort()).toEqual(["c-old", "c1"]);
+        // Stale galleryItemIds from the dead image must not survive healing
+        expect(st.assets[urlMissing]?.galleryItemIds).toBeUndefined();
+        expect(st.assets[urlError]?.imageId).not.toBe("dead-img-throw");
+
+        // Concurrent upload race: if a newer healthy image already replaced the dead one,
+        // `replaceIfImageId: "dead-img-1"` must preserve the newer imageId instead of overwriting it.
+        const currentImgId = st.assets[urlMissing]!.imageId;
+        const raced = await store.recordLocalizedAsset(
+            "u1",
+            {
+                normalizedUrl: urlMissing,
+                rawUrls: [urlMissing],
+                imageId: "stale-competitor-img",
+                localUrl: "/api/v1/images/stale-competitor-img",
+                mimeType: "image/png",
+                sizeBytes: 12,
+                filename: "stale.png",
+                characterIds: ["c2"],
+                localizedAt: 999,
+            },
+            { replaceIfImageId: "dead-img-1" },
+        );
+        expect(raced.imageId).toBe(currentImgId);
+    });
+
+    test("#8.2 detects polyglot SVG/HTML/XML/script/JSON/plain-text across comments, >1KB prefixes, BOMs, and UTF-16", () => {
+        const enc = new TextEncoder();
+        const encodeUtf16Le = (str: string, withBom = false): Uint8Array => {
+            const out = new Uint8Array(str.length * 2 + (withBom ? 2 : 0));
+            let offset = 0;
+            if (withBom) {
+                out[0] = 0xff;
+                out[1] = 0xfe;
+                offset = 2;
+            }
+            for (let i = 0; i < str.length; i++) {
+                const code = str.charCodeAt(i);
+                out[offset + i * 2] = code & 0xff;
+                out[offset + i * 2 + 1] = (code >> 8) & 0xff;
+            }
+            return out;
+        };
+        const encodeUtf16Be = (str: string, withBom = false): Uint8Array => {
+            const out = new Uint8Array(str.length * 2 + (withBom ? 2 : 0));
+            let offset = 0;
+            if (withBom) {
+                out[0] = 0xfe;
+                out[1] = 0xff;
+                offset = 2;
+            }
+            for (let i = 0; i < str.length; i++) {
+                const code = str.charCodeAt(i);
+                out[offset + i * 2] = (code >> 8) & 0xff;
+                out[offset + i * 2 + 1] = code & 0xff;
+            }
+            return out;
+        };
+
+        // Comment-prefixed SVG & >1KB XML header before <svg>
+        expect(() =>
+            detectMediaMimeType(enc.encode("<!-- comment --><svg onload='alert(1)'/>"), "image/png", "https://a.com/x.png"),
+        ).toThrow(/SVG/i);
+        const paddedXmlSvg = `<?xml version="1.0"?><!-- ${"x".repeat(2048)} --><svg xmlns="http://www.w3.org/2000/svg"/>`;
+        expect(() =>
+            detectMediaMimeType(enc.encode(paddedXmlSvg), "image/png", "https://a.com/x.png"),
+        ).toThrow(/SVG/i);
+
+        // UTF-8 BOM + UTF-16LE/BE (with and without BOM) HTML/SVG/script
+        expect(() =>
+            detectMediaMimeType(new Uint8Array([0xef, 0xbb, 0xbf, ...enc.encode("<svg/>")]), "image/png", "https://a.com/x.png"),
+        ).toThrow(/SVG/i);
+        expect(() =>
+            detectMediaMimeType(encodeUtf16Le("<svg xmlns='http://www.w3.org/2000/svg'/>", true), "image/png", "https://a.com/x.png"),
+        ).toThrow(/SVG/i);
+        expect(() =>
+            detectMediaMimeType(encodeUtf16Le("<html lang='en'><body>hi</body></html>", false), "image/png", "https://a.com/x.png"),
+        ).toThrow(/HTML/i);
+        expect(() =>
+            detectMediaMimeType(encodeUtf16Be("<script>alert(1)</script>", true), "application/octet-stream", "https://a.com/x.png"),
+        ).toThrow(/script/i);
+        expect(() =>
+            detectMediaMimeType(encodeUtf16Be("<svg/>", false), "image/png", "https://a.com/x.png"),
+        ).toThrow(/SVG/i);
+
+        // HTML fragments, S3 XML error, JSON error, plain text error served as image/png or octet-stream + .png
+        expect(() =>
+            detectMediaMimeType(enc.encode("<body onload='alert(1)'>oops</body>"), "image/png", "https://a.com/x.png"),
+        ).toThrow(/HTML/i);
+        expect(() =>
+            detectMediaMimeType(enc.encode("<Error><Code>AccessDenied</Code></Error>"), "application/octet-stream", "https://a.com/x.png"),
+        ).toThrow(/XML|markup/i);
+        expect(() =>
+            detectMediaMimeType(enc.encode('{"error":"not found"}'), "image/png", "https://a.com/x.png"),
+        ).toThrow(/JSON/i);
+        expect(() =>
+            detectMediaMimeType(enc.encode("404 Not Found from CDN"), "image/png", "https://a.com/x.png"),
+        ).toThrow(/plain text/i);
+    });
+
+    test("#8.3 runTask catches indexStore.getState and linkExistingAssetToCharacter rejections and records failedCount", async () => {
+        // 1. indexStore.getState fails
+        const { spindle: s1 } = createCoreMockSpindle();
+        const store1 = new MediaIndexStore(s1.userStorage);
+        store1.getState = async () => {
+            throw new Error("storage offline");
+        };
+        const q1 = new UserDownloadQueue("u1", s1, store1, () => {});
+        await q1.startOrAppendBatch({
+            userId: "u1",
+            concurrency: 1,
+            maxFileSizeBytes: 5 * 1024 * 1024,
+            timeoutMs: 5000,
+            maxItems: 0,
+            tasks: [
+                { characterId: "c1", characterName: "C1", normalizedUrl: "https://cdn.example.com/1.png", rawUrls: ["https://cdn.example.com/1.png"] },
+                { characterId: "c2", characterName: "C2", normalizedUrl: "https://cdn.example.com/1.png", rawUrls: ["https://cdn.example.com/1.png"] },
+            ],
+        });
+        await waitForQueueTerminal(q1);
+        const p1 = q1.getProgress();
+        expect(p1.status).toBe("completed");
+        expect(p1.completedCount).toBe(2);
+        expect(p1.failedCount).toBe(2);
+        expect(p1.recentErrors[0]?.error).toContain("storage offline");
+
+        // 2. linkExistingAssetToCharacter fails after images.get succeeds -> must fail without re-uploading
+        const { spindle: s2, getUploadCount } = createCoreMockSpindle();
+        const store2 = new MediaIndexStore(s2.userStorage);
+        const uploaded = await s2.images.upload({ data: PNG_MAGIC, filename: "ok.png", mime_type: "image/png", owner_character_id: "c0" }, "u1");
+        await store2.recordLocalizedAsset("u1", {
+            normalizedUrl: "https://cdn.example.com/existing.png",
+            rawUrls: ["https://cdn.example.com/existing.png"],
+            imageId: uploaded.id,
+            localUrl: uploaded.url,
+            mimeType: "image/png",
+            sizeBytes: PNG_MAGIC.byteLength,
+            filename: "ok.png",
+            characterIds: ["c0"],
+            localizedAt: 1,
+        });
+        const uploadsBefore = getUploadCount();
+        store2.linkExistingAssetToCharacter = async () => {
+            throw new Error("link write failed");
+        };
+        const q2 = new UserDownloadQueue("u1", s2, store2, () => {});
+        await q2.startOrAppendBatch({
+            userId: "u1",
+            concurrency: 1,
+            maxFileSizeBytes: 5 * 1024 * 1024,
+            timeoutMs: 5000,
+            maxItems: 0,
+            tasks: [
+                { characterId: "c1", characterName: "C1", normalizedUrl: "https://cdn.example.com/existing.png", rawUrls: ["https://cdn.example.com/existing.png"] },
+            ],
+        });
+        await waitForQueueTerminal(q2);
+        expect(getUploadCount()).toBe(uploadsBefore);
+        expect(q2.getProgress().completedCount).toBe(1);
+        expect(q2.getProgress().failedCount).toBe(1);
+    });
+
+    test("#8.5 never deletes reused fallback unmatchedGalleryCandidates (without galleryItemId) on cancel or race-loss", async () => {
+        // 1. Cancel/skip right as downloadAndStoreMedia finishes reusing fallback candidate
+        let releaseReadBinary!: () => void;
+        const readBinaryGate = new Promise<void>((r) => {
+            releaseReadBinary = r;
+        });
+        const { spindle, deletedImageBatches } = createCoreMockSpindle({
+            images: {
+                readBinary: async () => {
+                    await readBinaryGate;
+                    return PNG_MAGIC.slice();
+                },
+                upload: async () => {
+                    throw new Error("should not upload");
+                },
+                deleteMany: async (ids: string[]) => {
+                    deletedImageBatches.push([...ids]);
+                    return { deletedCount: ids.length };
+                },
+            },
+        });
+        const store = new MediaIndexStore(spindle.userStorage);
+        const q = new UserDownloadQueue("u1", spindle, store, () => {});
+        await q.startOrAppendBatch({
+            userId: "u1",
+            concurrency: 1,
+            maxFileSizeBytes: 5 * 1024 * 1024,
+            timeoutMs: 5000,
+            maxItems: 0,
+            tasks: [
+                {
+                    characterId: "c1",
+                    characterName: "C1",
+                    normalizedUrl: "https://cdn.example.com/fallback.png",
+                    rawUrls: ["https://cdn.example.com/fallback.png"],
+                    // galleryItemId intentionally undefined (getGallery unavailable fallback)
+                    unmatchedGalleryCandidates: [{ imageId: "fallback-keep-id", byteSize: PNG_MAGIC.byteLength }],
+                },
+            ],
+        });
+        await new Promise((r) => setTimeout(r, 15));
+        q.cancelAll();
+        releaseReadBinary();
+        await waitForQueueTerminal(q);
+        expect(deletedImageBatches.flat()).not.toContain("fallback-keep-id");
+
+        // 2. Race-loss: recordLocalizedAsset returns a different winning imageId
+        const { spindle: sRace, deletedImageBatches: raceDeleted } = createCoreMockSpindle({
+            images: {
+                readBinary: async () => PNG_MAGIC.slice(),
+                upload: async () => {
+                    throw new Error("should not upload");
+                },
+                deleteMany: async (ids: string[]) => {
+                    raceDeleted.push([...ids]);
+                    return { deletedCount: ids.length };
+                },
+            },
+        });
+        const raceStore = new MediaIndexStore(sRace.userStorage);
+        const origRecord = raceStore.recordLocalizedAsset.bind(raceStore);
+        raceStore.recordLocalizedAsset = async (uid, entry, opts) => {
+            // Ensure reusedExistingImage internal flag is stripped before storage
+            expect((entry as unknown as { reusedExistingImage?: unknown }).reusedExistingImage).toBeUndefined();
+            await origRecord(uid, { ...entry, imageId: "winner-img", localUrl: "/api/v1/images/winner-img" }, opts);
+            return (await raceStore.getState(uid)).assets[entry.normalizedUrl]!;
+        };
+        const qRace = new UserDownloadQueue("u1", sRace, raceStore, () => {});
+        await qRace.startOrAppendBatch({
+            userId: "u1",
+            concurrency: 1,
+            maxFileSizeBytes: 5 * 1024 * 1024,
+            timeoutMs: 5000,
+            maxItems: 0,
+            tasks: [
+                {
+                    characterId: "c1",
+                    characterName: "C1",
+                    normalizedUrl: "https://cdn.example.com/fallback-race.png",
+                    rawUrls: ["https://cdn.example.com/fallback-race.png"],
+                    unmatchedGalleryCandidates: [{ imageId: "fallback-race-keep", byteSize: PNG_MAGIC.byteLength }],
+                },
+            ],
+        });
+        await waitForQueueTerminal(qRace);
+        expect(raceDeleted.flat()).not.toContain("fallback-race-keep");
+    });
+
+    test("#8.8 cancelCharacterTasks aborts active/pending tasks for deleted character without stopping other characters", async () => {
+        const { spindle } = createCoreMockSpindle({
+            cors: async (url: string) => {
+                if (url.includes("del-")) {
+                    await new Promise((r) => setTimeout(r, 80));
+                }
+                return { status: 200, headers: { "content-type": "image/png" }, body: PNG_MAGIC.slice() };
+            },
+        });
+        const store = new MediaIndexStore(spindle.userStorage);
+        const q = new UserDownloadQueue("u1", spindle, store, () => {});
+
+        await q.startOrAppendBatch({
+            userId: "u1",
+            concurrency: 1,
+            maxFileSizeBytes: 5 * 1024 * 1024,
+            timeoutMs: 5000,
+            maxItems: 0,
+            tasks: [
+                { characterId: "char-del", characterName: "Del", normalizedUrl: "https://cdn.example.com/del-1.png", rawUrls: ["https://cdn.example.com/del-1.png"] },
+                { characterId: "char-del", characterName: "Del", normalizedUrl: "https://cdn.example.com/del-2.png", rawUrls: ["https://cdn.example.com/del-2.png"] },
+                { characterId: "char-keep", characterName: "Keep", normalizedUrl: "https://cdn.example.com/keep-1.png", rawUrls: ["https://cdn.example.com/keep-1.png"] },
+            ],
+        });
+
+        await new Promise((r) => setTimeout(r, 15));
+        const affected = q.cancelCharacterTasks("char-del");
+        expect(affected).toBe(2);
+
+        await waitForQueueTerminal(q);
+        const st = await store.getState("u1");
+        expect(st.assets["https://cdn.example.com/del-1.png"]).toBeUndefined();
+        expect(st.assets["https://cdn.example.com/del-2.png"]).toBeUndefined();
+        expect(st.assets["https://cdn.example.com/keep-1.png"]?.characterIds).toEqual(["char-keep"]);
+        expect(q.getProgress().skippedCount).toBe(2);
+        expect(q.getProgress().succeededCount).toBe(1);
+    });
+});

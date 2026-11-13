@@ -516,6 +516,12 @@ function extractMarkdownImageCandidates(text: string): {
         }
       }
 
+      const nextParen = text.indexOf(")", i);
+      if (nextParen === -1 || nextParen >= urlLimit) {
+        idx = bangIdx + 2;
+        continue;
+      }
+
       const urlStart = i;
       let parenDepth = 0;
       let stoppedCleanly = false;
@@ -527,21 +533,24 @@ function extractMarkdownImageCandidates(text: string): {
         }
         if (ch === "(") {
           parenDepth++;
+          if (parenDepth > MAX_MD_BRACKET_DEPTH) {
+            break;
+          }
         } else if (ch === ")") {
           if (parenDepth === 0) {
             stoppedCleanly = true;
             break;
           }
           parenDepth--;
-        } else if (parenDepth === 0 && isAsciiWhitespace(ch)) {
-          stoppedCleanly = true;
+        } else if (isAsciiWhitespace(ch)) {
+          stoppedCleanly = parenDepth === 0;
           break;
         }
         i++;
       }
 
-      if (!stoppedCleanly && i >= urlLimit) {
-        idx = urlLimit;
+      if (!stoppedCleanly) {
+        idx = bangIdx + 2;
         continue;
       }
 
@@ -893,6 +902,73 @@ function scanHtmlMediaTags(
   }
 }
 
+export interface SrcsetCandidate {
+  url: string;
+  urlStart: number;
+  urlEnd: number;
+  descriptors: string;
+}
+
+/**
+ * Parses an HTML `srcset` attribute per the HTML Living Standard without splitting
+ * commas embedded inside CDN transformation URLs (e.g. `w_800,f_auto`).
+ */
+export function parseSrcsetCandidates(srcsetVal: string): SrcsetCandidate[] {
+  const candidates: SrcsetCandidate[] = [];
+  const len = srcsetVal.length;
+  let i = 0;
+
+  while (i < len) {
+    while (i < len && (isAsciiWhitespace(srcsetVal[i]!) || srcsetVal[i] === ",")) {
+      i++;
+    }
+    if (i >= len) break;
+
+    const urlStart = i;
+    while (i < len && !isAsciiWhitespace(srcsetVal[i]!)) {
+      i++;
+    }
+    let urlEnd = i;
+
+    let hadTrailingComma = false;
+    while (urlEnd > urlStart && srcsetVal[urlEnd - 1] === ",") {
+      urlEnd--;
+      hadTrailingComma = true;
+    }
+
+    const url = srcsetVal.slice(urlStart, urlEnd);
+    let descriptors = "";
+    if (!hadTrailingComma) {
+      while (i < len && isAsciiWhitespace(srcsetVal[i]!)) {
+        i++;
+      }
+      const descStart = i;
+      let parenDepth = 0;
+      while (i < len) {
+        const ch = srcsetVal[i]!;
+        if (ch === "(") {
+          parenDepth++;
+        } else if (ch === ")" && parenDepth > 0) {
+          parenDepth--;
+        } else if (ch === "," && parenDepth === 0) {
+          break;
+        }
+        i++;
+      }
+      descriptors = srcsetVal.slice(descStart, i).trim();
+      if (i < len && srcsetVal[i] === ",") {
+        i++;
+      }
+    }
+
+    if (url) {
+      candidates.push({ url, urlStart, urlEnd, descriptors });
+    }
+  }
+
+  return candidates;
+}
+
 function emitSrcsetCandidates(
   srcsetVal: string,
   valStart: number,
@@ -904,19 +980,13 @@ function emitSrcsetCandidates(
     spanEnd: number,
   ) => void,
 ): void {
-  let cursor = 0;
-  for (const candidate of srcsetVal.split(",")) {
-    const leadingWs = candidate.length - candidate.trimStart().length;
-    const trimmed = candidate.trim();
-    if (trimmed) {
-      const wsIdx = trimmed.search(/\s/);
-      const firstToken = wsIdx === -1 ? trimmed : trimmed.slice(0, wsIdx);
-      if (firstToken) {
-        const absStart = valStart + cursor + leadingWs;
-        pushCandidate(firstToken, hint, absStart, absStart + firstToken.length);
-      }
-    }
-    cursor += candidate.length + 1;
+  for (const candidate of parseSrcsetCandidates(srcsetVal)) {
+    pushCandidate(
+      candidate.url,
+      hint,
+      valStart + candidate.urlStart,
+      valStart + candidate.urlEnd,
+    );
   }
 }
 
@@ -1160,12 +1230,19 @@ const NATIVE_IMG_TAGS = new Set(["img"]);
 const NATIVE_BARE_URL_RE = /\bhttps?:\/\/[^\s<>"']+/gi;
 const NATIVE_IMAGE_PATH_RE =
   /\.(?:apng|avif|bmp|gif|heic|heif|ico|jpe?g|jfif|pjp|pjpeg|png|svg|webp)$/i;
-const NATIVE_TRAILING_PUNCTUATION_CHARS = "),.;!?'\"`]}";
+const NATIVE_TRAILING_PUNCTUATION_CHARS = "),.;!?'\"`]}\\";
 
 function normalizeNativeExtractedCandidateUrl(raw: string): string | null {
+  let candidate = raw.trim();
+  if (candidate.startsWith('\\"') || candidate.startsWith("\\'")) {
+    candidate = candidate.slice(2);
+  }
+  if (candidate.endsWith('\\"') || candidate.endsWith("\\'")) {
+    candidate = candidate.slice(0, -2);
+  }
   const cleaned = stripTrailingChars(
     stripWrappingAngleBrackets(
-      stripTrailingChars(raw.trim(), NATIVE_TRAILING_PUNCTUATION_CHARS),
+      stripTrailingChars(candidate, NATIVE_TRAILING_PUNCTUATION_CHARS),
     ),
     NATIVE_TRAILING_PUNCTUATION_CHARS,
   );
@@ -1251,11 +1328,27 @@ export function extractNativeGalleryUrlsFromCharacter(
   ];
 
   if (character.extensions && Object.keys(character.extensions).length > 0) {
-    try {
-      fieldsToScan.push(JSON.stringify(character.extensions));
-    } catch {
-      // ignore
-    }
+    const visited = new Set<object>();
+    const collectExtStrings = (val: unknown, depth: number): void => {
+      if (depth > 32 || val == null) return;
+      if (typeof val === "string") {
+        if (val) fieldsToScan.push(val);
+        return;
+      }
+      if (typeof val !== "object") return;
+      if (visited.has(val)) return;
+      visited.add(val);
+      if (Array.isArray(val)) {
+        for (const item of val) {
+          collectExtStrings(item, depth + 1);
+        }
+        return;
+      }
+      for (const v of Object.values(val as Record<string, unknown>)) {
+        collectExtStrings(v, depth + 1);
+      }
+    };
+    collectExtStrings(character.extensions, 0);
   }
 
   const allUrls = new Set<string>();
@@ -1581,7 +1674,8 @@ export function scanCharacterMedia(
     const walkExtValue = (val: unknown, label: string, depth: number): void => {
       if (depth > 5 || val == null) return;
       if (typeof val === "string") {
-        if (val.includes("http://") || val.includes("https://")) {
+        const lowerVal = val.toLowerCase();
+        if (lowerVal.includes("http://") || lowerVal.includes("https://")) {
           recordText(val, {
             section: "core_fields",
             label,

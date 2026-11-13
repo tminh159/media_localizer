@@ -1,6 +1,6 @@
 import type { SpindleFrontendContext } from "lumiverse-spindle-types";
 import type { ActiveDisplayUrlMapPayload } from "../shared/types.ts";
-import { decodeHtmlEntities } from "../shared/url-scanner.ts";
+import { decodeHtmlEntities, parseSrcsetCandidates } from "../shared/url-scanner.ts";
 import { sanitizeSafeMediaUrl } from "./ui-helpers.ts";
 
 const CSS_URL_RE = /\burl\(\s*(?:"([^"]+)"|'([^']+)'|([^)"'\s]+))\s*\)/gi;
@@ -48,6 +48,7 @@ export class NonDestructiveDisplaySwapper {
         if (
           target instanceof HTMLImageElement ||
           target instanceof HTMLVideoElement ||
+          (typeof HTMLAudioElement !== "undefined" && target instanceof HTMLAudioElement) ||
           target instanceof HTMLSourceElement ||
           (typeof SVGImageElement !== "undefined" && target instanceof SVGImageElement)
         ) {
@@ -70,7 +71,8 @@ export class NonDestructiveDisplaySwapper {
       if (name === "style") {
         const style = target.getAttribute("style") ?? "";
         return (
-          style.includes("url(") || target.hasAttribute("data-ml-original-style")
+          style.toLowerCase().includes("url(") ||
+          target.hasAttribute("data-ml-original-style")
         );
       }
       if (
@@ -129,7 +131,19 @@ export class NonDestructiveDisplaySwapper {
   }
 
   updateMap(next: ActiveDisplayUrlMapPayload): void {
-    this.payload = next;
+    if (!next || typeof next !== "object") return;
+    const nextUpdatedAt =
+      typeof next.updatedAt === "number" && Number.isFinite(next.updatedAt)
+        ? next.updatedAt
+        : 0;
+    if (nextUpdatedAt < this.payload.updatedAt) {
+      return;
+    }
+    this.payload = {
+      characterUrlMaps: next.characterUrlMaps ?? {},
+      allUrlsMap: next.allUrlsMap ?? {},
+      updatedAt: nextUpdatedAt,
+    };
     if (this.stopped) return;
     this.runPassNow();
   }
@@ -322,18 +336,22 @@ export class NonDestructiveDisplaySwapper {
     srcsetText: string,
     activeCharIds: string[],
   ): { replaced: string; changed: boolean } {
+    const candidates = parseSrcsetCandidates(srcsetText);
+    if (candidates.length === 0) {
+      return { replaced: srcsetText, changed: false };
+    }
     let changed = false;
-    const parts = srcsetText.split(",").map((segment) => {
-      const trimmed = segment.trim();
-      if (!trimmed) return segment;
-      const tokens = trimmed.split(/\s+/);
-      const rawUrl = tokens[0] ?? "";
-      const localUrl = this.resolveLocalUrl(rawUrl, activeCharIds);
-      if (!localUrl) return segment;
-      changed = true;
-      return [localUrl, ...tokens.slice(1)].join(" ");
+    const parts = candidates.map((candidate) => {
+      const localUrl = this.resolveLocalUrl(candidate.url, activeCharIds);
+      const effectiveUrl = localUrl ?? candidate.url;
+      if (localUrl && localUrl !== candidate.url) {
+        changed = true;
+      }
+      return candidate.descriptors
+        ? `${effectiveUrl} ${candidate.descriptors}`
+        : effectiveUrl;
     });
-    return { replaced: parts.join(", "), changed };
+    return { replaced: changed ? parts.join(", ") : srcsetText, changed };
   }
 
   private decorateMediaElement(
@@ -346,8 +364,10 @@ export class NonDestructiveDisplaySwapper {
       srcChanged &&
       typeof HTMLSourceElement !== "undefined" &&
       el instanceof HTMLSourceElement &&
-      typeof HTMLVideoElement !== "undefined" &&
-      el.parentElement instanceof HTMLVideoElement
+      ((typeof HTMLVideoElement !== "undefined" &&
+        el.parentElement instanceof HTMLVideoElement) ||
+        (typeof HTMLAudioElement !== "undefined" &&
+          el.parentElement instanceof HTMLAudioElement))
     ) {
       try {
         el.parentElement.load();
@@ -403,7 +423,9 @@ export class NonDestructiveDisplaySwapper {
         const raw = dQuoted ?? sQuoted ?? unquoted ?? "";
         if (!raw) return fullMatch;
         const localUrl = this.resolveLocalUrl(raw, activeCharIds);
-        if (!localUrl) return fullMatch;
+        if (!localUrl || /[\s"'\\<>()\u0000-\u001f\u007f]/.test(localUrl)) {
+          return fullMatch;
+        }
         changed = true;
         return `url("${localUrl}")`;
       },
@@ -412,22 +434,28 @@ export class NonDestructiveDisplaySwapper {
   }
 
   decorateContainer(root: ParentNode, activeCharIds: string[]): void {
-    // 1. Media elements: <img>, <image>, <video>, <source>
+    // 1. Media elements: <img>, <image>, <video>, <audio>, <source>
     const mediaEls = root.querySelectorAll<Element>(
-      "img[src], img[data-src], img[srcset], image[href], image[*|href], video[src], video[poster], source[src], source[srcset], [data-ml-original-src], [data-ml-original-data-src], [data-ml-original-srcset], [data-ml-original-href], [data-ml-original-xlink-href], [data-ml-original-poster]",
+      "img[src], img[data-src], img[srcset], image[href], image[*|href], video[src], video[data-src], video[poster], audio[src], audio[data-src], source[src], source[data-src], source[srcset], [data-ml-original-src], [data-ml-original-data-src], [data-ml-original-srcset], [data-ml-original-href], [data-ml-original-xlink-href], [data-ml-original-poster]",
     );
     for (const el of Array.from(mediaEls)) {
       if (el.closest(".ml-gallery-host, .ml-drawer-root")) continue;
       this.decorateMediaElement(el, activeCharIds);
     }
 
-    // 2. Inline style="...url(...)..."
+    // 2. Inline style="...url(...)..." (case-insensitive `URL(`)
     const styledEls = root.querySelectorAll<HTMLElement>(
-      '[style*="url("], [data-ml-original-style]',
+      "[style], [data-ml-original-style]",
     );
     for (const el of Array.from(styledEls)) {
       if (el.closest(".ml-gallery-host, .ml-drawer-root")) continue;
       const currentStyle = el.getAttribute("style") ?? "";
+      if (
+        !currentStyle.toLowerCase().includes("url(") &&
+        !el.hasAttribute("data-ml-original-style")
+      ) {
+        continue;
+      }
       const baseStyle = this.resolveBase(el, "style", currentStyle);
       if (!baseStyle) continue;
 
@@ -447,9 +475,10 @@ export class NonDestructiveDisplaySwapper {
     // 3. Scoped <style> tags inside messages / creator notes
     const styleTags = root.querySelectorAll<HTMLStyleElement>("style");
     for (const styleEl of Array.from(styleTags)) {
+      if (styleEl.closest(".ml-gallery-host, .ml-drawer-root")) continue;
       const currentCss = styleEl.textContent ?? "";
       const baseCss = this.resolveBase(styleEl, "css", currentCss);
-      if (!baseCss || !baseCss.includes("url(")) continue;
+      if (!baseCss || !baseCss.toLowerCase().includes("url(")) continue;
 
       const { replaced, changed } = this.rewriteCssUrls(baseCss, activeCharIds);
       if (changed) {

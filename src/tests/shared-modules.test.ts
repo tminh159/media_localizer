@@ -20,9 +20,23 @@ import {
 import { buildLibraryMedia } from "../shared/library-media";
 import {
     DEFAULT_SETTINGS,
+    type CharacterMediaScanResult,
     type FailedUrlRecord,
     type LocalizedAssetEntry,
+    type QueueJobProgress,
+    type SectionCountSummary,
 } from "../shared/types";
+import { installMockDom, MockEvent } from "./helpers/mock-dom";
+import {
+    cleanupUiHelpers,
+    createLazyMediaElement,
+    openMediaLightbox,
+    sanitizeSafeMediaUrl,
+} from "../ui/ui-helpers";
+import { NonDestructiveDisplaySwapper } from "../ui/display-swapper";
+import { NativeGalleryTabIntegrator } from "../ui/gallery-integrator";
+import { PortraitPanelLocalizeController } from "../ui/portrait-button";
+import { setup } from "../frontend";
 
 describe("shared/url-scanner SSRF & URL safety", () => {
     test("isBlockedRemoteHostname blocks loopback, private, link-local, CGNAT, special IPv4 and alternate encodings", () => {
@@ -459,5 +473,936 @@ describe("shared/download-config & shared/library-media", () => {
         expect(entry.localizedAssets.length).toBe(1);
         expect(entry.totalSizeBytes).toBe(1024);
         expect(entry.lastLocalizedAt).toBe(500);
+    });
+
+    test("handles missing filename and non-finite sizeBytes/localizedAt gracefully", () => {
+        const assets: Record<string, LocalizedAssetEntry> = {
+            "https://example.com/b.png": {
+                normalizedUrl: "https://example.com/b.png",
+                rawUrls: ["https://example.com/b.png"],
+                imageId: "img-2",
+                localUrl: "/api/v1/images/img-2",
+                filename: undefined as unknown as string,
+                mimeType: "image/png",
+                sizeBytes: Number.NaN,
+                localizedAt: -5,
+                characterIds: ["char-1"],
+            },
+            "https://example.com/a.png": {
+                normalizedUrl: "https://example.com/a.png",
+                rawUrls: ["https://example.com/a.png"],
+                imageId: "img-1",
+                localUrl: "/api/v1/images/img-1",
+                filename: "a.png",
+                mimeType: "image/png",
+                sizeBytes: 256,
+                localizedAt: 900,
+                characterIds: ["char-1"],
+            },
+        };
+
+        const library = buildLibraryMedia([{ id: "char-1", name: "Alice" }], assets);
+        expect(library.length).toBe(1);
+        const entry = library[0]!;
+        expect(entry.totalSizeBytes).toBe(256);
+        expect(entry.lastLocalizedAt).toBe(900);
+        expect(entry.localizedAssets.map((a) => a.imageId)).toEqual(["img-1", "img-2"]);
+    });
+});
+
+function makeEmptySectionCounts(): Record<
+    "creator_notes" | "first_mes" | "core_fields" | "alternate_greetings" | "world_books" | "regex_scripts",
+    SectionCountSummary
+> {
+    return {
+        creator_notes: { totalUnique: 0, remoteCount: 0, localizedCount: 0, failedCount: 0 },
+        first_mes: { totalUnique: 0, remoteCount: 0, localizedCount: 0, failedCount: 0 },
+        core_fields: { totalUnique: 0, remoteCount: 0, localizedCount: 0, failedCount: 0 },
+        alternate_greetings: { totalUnique: 0, remoteCount: 0, localizedCount: 0, failedCount: 0 },
+        world_books: { totalUnique: 0, remoteCount: 0, localizedCount: 0, failedCount: 0 },
+        regex_scripts: { totalUnique: 0, remoteCount: 0, localizedCount: 0, failedCount: 0 },
+    };
+}
+
+function makeIdleQueueProgress(): QueueJobProgress {
+    return {
+        status: "idle",
+        jobId: null,
+        totalQueued: 0,
+        completedCount: 0,
+        succeededCount: 0,
+        skippedCount: 0,
+        failedCount: 0,
+        activeUrls: [],
+        recentErrors: [],
+        cappedByLimit: false,
+        skippedByCapCount: 0,
+    };
+}
+
+function makeScanResult(
+    characterId: string,
+    totalOccurrences = 0,
+): CharacterMediaScanResult {
+    const counts = makeEmptySectionCounts();
+    counts.creator_notes.totalUnique = totalOccurrences;
+    counts.creator_notes.remoteCount = totalOccurrences;
+    const items = Array.from({ length: totalOccurrences }, (_, i) => ({
+        normalizedUrl: `https://cdn.example.com/${characterId}/pic-${i}.png`,
+        rawUrls: [`https://cdn.example.com/${characterId}/pic-${i}.png`],
+        domain: "cdn.example.com",
+        mediaKind: "image" as const,
+        sources: [{ section: "creator_notes" as const, label: "Creator Notes" }],
+        occurrenceCount: 1,
+        status: "remote" as const,
+    }));
+    return {
+        characterId,
+        characterName: `Char ${characterId}`,
+        scannedAt: 1,
+        totalOccurrences,
+        sectionCounts: counts,
+        greetingBreakdown: [],
+        worldBookBreakdown: [],
+        domainBreakdown: [],
+        override: null,
+        items,
+    };
+}
+
+describe("shared/download-config sanitization & bounds", () => {
+    test("isOverrideEmpty sanitizes invalid entries and sanitizeOverride/buildEffectiveFilter bound maxItems", () => {
+        expect(
+            isOverrideEmpty({
+                sections: ["not_a_real_section" as any],
+                mediaKinds: [],
+                domains: ["   ", ""],
+                excludedUrls: ["  "],
+            }),
+        ).toBe(true);
+
+        const sanitized = sanitizeOverride({ maxItems: 999_999 });
+        expect(sanitized.maxItems).toBe(2000);
+
+        const effective = buildEffectiveFilter(
+            { ...DEFAULT_SETTINGS, defaultBatchCap: 50_000 },
+            makeScanResult("c1", 0),
+            null,
+        );
+        expect(effective.maxItems).toBe(2000);
+    });
+});
+
+describe("ui/ui-helpers safety, lightbox async remove & thumb observer pruning", () => {
+    test("sanitizeSafeMediaUrl blocks CSS breakouts while allowing safe http(s) parentheses", () => {
+        expect(sanitizeSafeMediaUrl('/api/v1/images/a"b.png')).toBeNull();
+        expect(sanitizeSafeMediaUrl("/api/v1/images/a)b.png")).toBeNull();
+        expect(sanitizeSafeMediaUrl("/api/v1/images/a\\b.png")).toBeNull();
+        expect(sanitizeSafeMediaUrl('https://example.com/a"b.png')).toBeNull();
+        expect(sanitizeSafeMediaUrl("https://example.com/a'b.png")).toBeNull();
+        expect(sanitizeSafeMediaUrl("https://example.com/a`b.png")).toBeNull();
+        expect(sanitizeSafeMediaUrl("https://example.com/char_(v2).webp")).toBe(
+            "https://example.com/char_(v2).webp",
+        );
+    });
+
+    test("openMediaLightbox tracks item identity across async onRemove and handles rejection & missing body", async () => {
+        const domEnv = installMockDom();
+        try {
+            const origBody = domEnv.document.body;
+            (domEnv.document as any).body = null;
+            // Should not throw if document.body is missing
+            openMediaLightbox(
+                [{ id: "x", localUrl: "/api/v1/images/x", mediaKind: "image", title: "X" }],
+                0,
+            );
+            (domEnv.document as any).body = origBody;
+
+            let resolveRemove!: () => void;
+            const removedIds: string[] = [];
+            let afterRemoveCalls = 0;
+
+            openMediaLightbox(
+                [
+                    {
+                        id: "item-1",
+                        localUrl: "/api/v1/images/1",
+                        mediaKind: "image",
+                        title: "One",
+                        onRemove: async () => {
+                            removedIds.push("item-1");
+                            await new Promise<void>((r) => {
+                                resolveRemove = r;
+                            });
+                        },
+                    },
+                    {
+                        id: "item-2",
+                        localUrl: "/api/v1/images/2",
+                        mediaKind: "image",
+                        title: "Two",
+                        onRemove: async () => {
+                            throw new Error("boom");
+                        },
+                    },
+                ],
+                0,
+                () => {
+                    afterRemoveCalls++;
+                },
+            );
+
+            const removeBtn = domEnv.document.querySelector(
+                'button[title*="Remove this localized asset"]',
+            ) as any;
+            const nextBtn = domEnv.document.querySelector('button[title="Next (Right Arrow)"]') as any;
+            expect(removeBtn).not.toBeNull();
+            expect(nextBtn).not.toBeNull();
+
+            // Click remove on item-1, then step to item-2 while async remove is pending
+            removeBtn.click();
+            expect(removedIds).toEqual(["item-1"]);
+            nextBtn.click();
+            expect(domEnv.document.body.textContent).toContain("Two");
+
+            resolveRemove();
+            await new Promise((r) => setTimeout(r, 15));
+
+            // item-1 was removed by identity, item-2 remains active, onAfterRemove fired once
+            expect(afterRemoveCalls).toBe(1);
+            expect(domEnv.document.body.textContent).toContain("Two");
+            expect(domEnv.document.body.textContent).toContain("1 / 1");
+
+            // Clicking remove on item-2 when onRemove rejects leaves item-2 intact cleanly
+            const removeBtn2 = domEnv.document.querySelector(
+                'button[title*="Remove this localized asset"]',
+            ) as any;
+            removeBtn2.click();
+            await new Promise((r) => setTimeout(r, 15));
+            expect(domEnv.document.body.textContent).toContain("Two");
+        } finally {
+            cleanupUiHelpers();
+            domEnv.restore();
+        }
+    });
+
+    test("sharedThumbObserver unobserves detached thumbnail elements", async () => {
+        const domEnv = installMockDom();
+        try {
+            const attached = createLazyMediaElement({
+                src: "/api/v1/images/a.png",
+                alt: "A",
+                mediaKind: "image",
+                className: "ml-thumb",
+            });
+            const detached = createLazyMediaElement({
+                src: "/api/v1/images/b.png",
+                alt: "B",
+                mediaKind: "image",
+                className: "ml-thumb",
+            });
+            domEnv.document.body.appendChild(attached as any);
+            domEnv.document.body.appendChild(detached as any);
+
+            const observers = (globalThis as any).IntersectionObserver.instances as Array<{
+                observedTargets: Set<any>;
+                trigger: (entries: Array<{ target: any; isIntersecting: boolean }>) => void;
+            }>;
+            expect(observers.length).toBe(1);
+            const obs = observers[0]!;
+            expect(obs.observedTargets.has(detached)).toBe(true);
+
+            detached.remove();
+            // Triggering callback or waiting for scheduled prune cleans detached target
+            obs.trigger([{ target: detached, isIntersecting: false }]);
+            expect(obs.observedTargets.has(detached)).toBe(false);
+            expect(obs.observedTargets.has(attached)).toBe(true);
+        } finally {
+            cleanupUiHelpers();
+            domEnv.restore();
+        }
+    });
+});
+
+describe("ui/display-swapper CSS escaping, monotonic map & element selectors", () => {
+    test("enforces monotonic updatedAt, hardens CSS urls, handles audio/video/source, skips ML styles, and rewrites CDN srcset", () => {
+        const domEnv = installMockDom();
+        try {
+            const ctx = { getActiveChat: () => ({ characterId: "char-1" }) } as any;
+            const swapper = new NonDestructiveDisplaySwapper(ctx);
+            swapper.start();
+
+            swapper.updateMap({
+                characterUrlMaps: {
+                    "char-1": {
+                        "https://cdn.example.com/bg.png": "/api/v1/images/bg",
+                        "https://cdn.example.com/unsafe.png": '/api/v1/images/bad"quote',
+                        "https://cdn.example.com/song.mp3": "/api/v1/audio/song",
+                        "https://cdn.example.com/vid.mp4": "/api/v1/video/vid",
+                        "https://cdn.example.com/src.webm": "/api/v1/video/src",
+                        "https://cdn.example.com/cdn-cgi/image/w_800,f_auto/pic.png":
+                            "/api/v1/images/pic-800",
+                    },
+                },
+                allUrlsMap: {},
+                updatedAt: 100,
+            });
+
+            // Stale updateMap (lower updatedAt) must be ignored
+            swapper.updateMap({
+                characterUrlMaps: { "char-1": {} },
+                allUrlsMap: {},
+                updatedAt: 50,
+            });
+
+            const divUpper = domEnv.document.createElement("div");
+            divUpper.setAttribute("style", 'background-image: URL("https://cdn.example.com/bg.png")');
+            const divUnsafe = domEnv.document.createElement("div");
+            divUnsafe.setAttribute("style", 'background-image: url("https://cdn.example.com/unsafe.png")');
+
+            const audio = domEnv.document.createElement("audio");
+            audio.setAttribute("src", "https://cdn.example.com/song.mp3");
+            const video = domEnv.document.createElement("video");
+            video.setAttribute("data-src", "https://cdn.example.com/vid.mp4");
+            const source = domEnv.document.createElement("source");
+            source.setAttribute("data-src", "https://cdn.example.com/src.webm");
+            video.appendChild(source);
+
+            const imgSrcset = domEnv.document.createElement("img");
+            imgSrcset.setAttribute(
+                "srcset",
+                "https://cdn.example.com/cdn-cgi/image/w_800,f_auto/pic.png 800w",
+            );
+
+            const mlHost = domEnv.document.createElement("div");
+            mlHost.className = "ml-drawer-root";
+            const mlStyle = domEnv.document.createElement("style");
+            mlStyle.textContent = `.x { background: url("https://cdn.example.com/bg.png"); }`;
+            mlHost.appendChild(mlStyle);
+
+            const extStyle = domEnv.document.createElement("style");
+            extStyle.textContent = `.y { background: URL("https://cdn.example.com/bg.png"); }`;
+
+            domEnv.document.body.append(
+                divUpper,
+                divUnsafe,
+                audio,
+                video,
+                imgSrcset,
+                mlHost,
+                extStyle,
+            );
+
+            // Trigger pass via updateMap with newer updatedAt
+            swapper.updateMap({
+                characterUrlMaps: {
+                    "char-1": {
+                        "https://cdn.example.com/bg.png": "/api/v1/images/bg",
+                        "https://cdn.example.com/unsafe.png": '/api/v1/images/bad"quote',
+                        "https://cdn.example.com/song.mp3": "/api/v1/audio/song",
+                        "https://cdn.example.com/vid.mp4": "/api/v1/video/vid",
+                        "https://cdn.example.com/src.webm": "/api/v1/video/src",
+                        "https://cdn.example.com/cdn-cgi/image/w_800,f_auto/pic.png":
+                            "/api/v1/images/pic-800",
+                    },
+                },
+                allUrlsMap: {},
+                updatedAt: 101,
+            });
+
+            expect(divUpper.getAttribute("style")).toContain('url("/api/v1/images/bg")');
+            expect(divUnsafe.getAttribute("style")).toContain("https://cdn.example.com/unsafe.png");
+            expect(audio.getAttribute("src")).toBe("/api/v1/audio/song");
+            expect(video.getAttribute("data-src")).toBe("/api/v1/video/vid");
+            expect(source.getAttribute("data-src")).toBe("/api/v1/video/src");
+            expect(imgSrcset.getAttribute("srcset")).toBe("/api/v1/images/pic-800 800w");
+            expect(mlStyle.textContent).toContain("https://cdn.example.com/bg.png");
+            expect(extStyle.textContent).toContain('url("/api/v1/images/bg")');
+
+            swapper.stop();
+        } finally {
+            cleanupUiHelpers();
+            domEnv.restore();
+        }
+    });
+});
+
+describe("ui/gallery-integrator & portrait-button lifecycle guards", () => {
+    test("gallery-integrator flushes pending override save before destroy on stop and respects stopped guard", async () => {
+        const domEnv = installMockDom();
+        try {
+            let editorListener: ((state: any) => void) | null = null;
+            let savedCalls = 0;
+
+            const tabPanel = domEnv.document.createElement("div");
+            tabPanel.className = "galleryTab";
+            const grid = domEnv.document.createElement("div");
+            grid.className = "gallery-grid";
+            tabPanel.appendChild(grid);
+            domEnv.document.body.appendChild(tabPanel);
+
+            const ctx = {
+                ui: {
+                    characterEditor: {
+                        getState: () => ({
+                            open: true,
+                            characterId: "char-1",
+                            activeTabId: "gallery",
+                            extensions: {},
+                        }),
+                        onChange: (fn: (s: any) => void) => {
+                            editorListener = fn;
+                            return () => {};
+                        },
+                    },
+                },
+            } as any;
+
+            const queueProgress = makeIdleQueueProgress();
+
+            const integrator = new NativeGalleryTabIntegrator(ctx, DEFAULT_SETTINGS, queueProgress, {
+                onScanCharacter: async () => makeScanResult("char-1", 1),
+                onSaveCharacterOverride: async (_charId, override) => {
+                    savedCalls++;
+                    return override;
+                },
+                onStartDownload: async () => {},
+                onPurgeCharacterCache: async () => {},
+                onClearFailedUrls: async () => {},
+                onQueueControl: async () => {},
+            });
+
+            integrator.start();
+            await new Promise((r) => setTimeout(r, 10));
+
+            const host = domEnv.document.querySelector(".ml-gallery-host");
+            expect(host).not.toBeNull();
+            const gearBtn = host!.querySelector('button[title*="Customize per-card"]') as any;
+            gearBtn?.click();
+            const firstCb = host!.querySelector('.ml-options-panel input[type="checkbox"]') as any;
+            expect(firstCb).not.toBeNull();
+            firstCb.checked = false;
+            firstCb.dispatchEvent(new MockEvent("change", { bubbles: true }));
+
+            integrator.stop();
+            await new Promise((r) => setTimeout(r, 10));
+            expect(savedCalls).toBe(1);
+            expect(domEnv.document.querySelector(".ml-gallery-host")).toBeNull();
+
+            // Stopped guard prevents re-mounting on late editor state events
+            (editorListener as ((s: any) => void) | null)?.({
+                open: true,
+                characterId: "char-1",
+                activeTabId: "gallery",
+                extensions: {},
+            });
+            expect(domEnv.document.querySelector(".ml-gallery-host")).toBeNull();
+        } finally {
+            cleanupUiHelpers();
+            domEnv.restore();
+        }
+    });
+
+    test("portrait-button ignores unrelated DOM mutations when closed and resets longPressTriggered on pointerleave", async () => {
+        const domEnv = installMockDom();
+        try {
+            let openTabCalls = 0;
+            let localizeCalls = 0;
+
+            const outer = domEnv.document.createElement("div");
+            outer.className = "panelOuter";
+            const panel = domEnv.document.createElement("div");
+            panel.className = "panel";
+            const header = domEnv.document.createElement("div");
+            header.className = "header";
+            const nameWrap = domEnv.document.createElement("div");
+            const nameEl = domEnv.document.createElement("div");
+            nameEl.className = "charName";
+            nameEl.textContent = "Alice";
+            nameWrap.appendChild(nameEl);
+            header.appendChild(nameWrap);
+            panel.appendChild(header);
+            outer.appendChild(panel);
+            domEnv.document.body.appendChild(outer);
+
+            const controller = new PortraitPanelLocalizeController({
+                getActiveCharacterId: () => "char-1",
+                getPendingCount: () => 2,
+                getQueueProgress: () => makeIdleQueueProgress(),
+                onLocalizeActiveCharacter: async () => {
+                    localizeCalls++;
+                },
+                onOpenCharacterTab: () => {
+                    openTabCalls++;
+                },
+            });
+
+            controller.start();
+            const btn = domEnv.document.querySelector(".ml-portrait-localize-btn") as any;
+            expect(btn).not.toBeNull();
+
+            // Simulate long-press timeout firing, then pointerleave canceling without click
+            btn.dispatchEvent(new MockEvent("pointerdown", { bubbles: true }));
+            await new Promise((r) => setTimeout(r, 560));
+            expect(openTabCalls).toBe(1);
+            btn.dispatchEvent(new MockEvent("pointerleave", { bubbles: true }));
+
+            // Subsequent normal click must NOT be swallowed by sticky longPressTriggered
+            btn.click();
+            await new Promise((r) => setTimeout(r, 10));
+            expect(localizeCalls).toBe(1);
+
+            // When panel is removed/closed, unrelated mutations elsewhere in body must return false
+            outer.remove();
+            const unrelated = domEnv.document.createElement("div");
+            const relevant = (controller as any).isRelevantMutation({
+                type: "childList",
+                target: domEnv.document.body,
+                addedNodes: [unrelated],
+                removedNodes: [],
+                attributeName: null,
+            });
+            expect(relevant).toBe(false);
+
+            controller.stop();
+        } finally {
+            cleanupUiHelpers();
+            domEnv.restore();
+        }
+    });
+});
+
+describe("frontend lifecycle, ordering, bulk purge & permission retries", () => {
+    function buildFrontendTestEnv() {
+        const domEnv = installMockDom();
+        const sentMessages: Array<any> = [];
+        const backendListeners = new Set<(msg: unknown) => void>();
+        const stateListeners = new Map<string, Set<() => void>>();
+        const eventListeners = new Map<string, Set<(ev?: any) => void>>();
+        const drawerChangeListeners = new Set<() => void>();
+        const drawerTabs: Array<any> = [];
+        let granted = new Set<string>(["ui", "characters", "events", "state", "chat"]);
+        let registerTabAllowed = true;
+        let stateSubscribeAllowed = true;
+        let onDrawerAllowed = true;
+        let eventsOnAllowed = true;
+        let requestCalls = 0;
+
+        const ctx: any = {
+            dom: { addStyle: () => () => {}, cleanup: () => {} },
+            sendToBackend: (msg: unknown) => sentMessages.push(msg),
+            onBackendMessage: (fn: (msg: unknown) => void) => {
+                backendListeners.add(fn);
+                return () => backendListeners.delete(fn);
+            },
+            getActiveChat: () => ({ id: "chat-1", characterId: "char-1" }),
+            state: {
+                get: (key: string) => (key === "chat.active" ? { characterId: "char-1" } : null),
+                subscribe: (key: string, fn: () => void) => {
+                    if (!stateSubscribeAllowed) throw new Error("missing state permission");
+                    let set = stateListeners.get(key);
+                    if (!set) {
+                        set = new Set();
+                        stateListeners.set(key, set);
+                    }
+                    set.add(fn);
+                    return () => set!.delete(fn);
+                },
+            },
+            ui: {
+                registerDrawerTab: (def: any) => {
+                    if (!registerTabAllowed) throw new Error("missing ui permission");
+                    const root = domEnv.document.createElement("div");
+                    domEnv.document.body.appendChild(root);
+                    const badgeCalls: Array<unknown> = [];
+                    const handle = {
+                        ...def,
+                        root,
+                        activate: () => {},
+                        badgeCalls,
+                        setBadge: (v: unknown) => badgeCalls.push(v),
+                    };
+                    drawerTabs.push(handle);
+                    return handle;
+                },
+                showConfirm: async () => ({ confirmed: true }),
+                events: {
+                    onDrawerChange: (fn: () => void) => {
+                        if (!onDrawerAllowed) throw new Error("missing ui.events permission");
+                        drawerChangeListeners.add(fn);
+                        return () => drawerChangeListeners.delete(fn);
+                    },
+                },
+                characterEditor: {
+                    getState: () => null,
+                    onChange: () => () => {},
+                },
+            },
+            characters: {
+                get: async (id: string) => ({ id, name: `Char ${id}` }),
+            },
+            events: {
+                on: (name: string, fn: (ev?: any) => void) => {
+                    if (!eventsOnAllowed) throw new Error("missing events permission");
+                    let set = eventListeners.get(name);
+                    if (!set) {
+                        set = new Set();
+                        eventListeners.set(name, set);
+                    }
+                    set.add(fn);
+                    return () => set!.delete(fn);
+                },
+            },
+            permissions: {
+                getGranted: async () => Array.from(granted),
+                request: async () => {
+                    requestCalls++;
+                    return Array.from(granted);
+                },
+            },
+            ready: () => {},
+        };
+
+        return {
+            domEnv,
+            ctx,
+            sentMessages,
+            drawerTabs,
+            emitBackend: (msg: unknown) => {
+                for (const fn of backendListeners) fn(msg);
+            },
+            setPermissionGates: (gates: Partial<{
+                registerTabAllowed: boolean;
+                stateSubscribeAllowed: boolean;
+                onDrawerAllowed: boolean;
+                eventsOnAllowed: boolean;
+            }>) => {
+                if (gates.registerTabAllowed !== undefined) registerTabAllowed = gates.registerTabAllowed;
+                if (gates.stateSubscribeAllowed !== undefined) stateSubscribeAllowed = gates.stateSubscribeAllowed;
+                if (gates.onDrawerAllowed !== undefined) onDrawerAllowed = gates.onDrawerAllowed;
+                if (gates.eventsOnAllowed !== undefined) eventsOnAllowed = gates.eventsOnAllowed;
+            },
+            getRequestCalls: () => requestCalls,
+            getEventListenerCount: (name: string) => eventListeners.get(name)?.size ?? 0,
+            getStateListenerCount: (key: string) => stateListeners.get(key)?.size ?? 0,
+        };
+    }
+
+    test("guards stale get_init_state, stale non-forced scans, and unloaded callBackend", async () => {
+        const env = buildFrontendTestEnv();
+        try {
+            const unload = setup(env.ctx);
+            await new Promise((r) => setTimeout(r, 15));
+
+            const initReq = env.sentMessages.find(
+                (m) => m.type === "RPC_REQUEST" && m.action === "get_init_state",
+            );
+            expect(initReq).toBeDefined();
+
+            // Newer live queue progress arrives BEFORE stale get_init_state responds
+            env.emitBackend({
+                type: "QUEUE_PROGRESS",
+                progress: {
+                    ...makeIdleQueueProgress(),
+                    status: "running",
+                    jobId: "job-live",
+                    totalQueued: 5,
+                    completedCount: 2,
+                    succeededCount: 2,
+                },
+            });
+
+            // Stale get_init_state arrives with old idle progress
+            env.emitBackend({
+                type: "RPC_RESPONSE",
+                requestId: initReq.requestId,
+                result: {
+                    settings: DEFAULT_SETTINGS,
+                    stats: {
+                        totalAssets: 0,
+                        totalBytes: 0,
+                        totalCharacters: 0,
+                        totalFailedUrls: 0,
+                        settings: DEFAULT_SETTINGS,
+                    },
+                    queueProgress: makeIdleQueueProgress(),
+                    urlMapPayload: { characterUrlMaps: {}, allUrlsMap: {}, updatedAt: 1 },
+                },
+            });
+            await new Promise((r) => setTimeout(r, 15));
+
+            // Drawer panel is already mounted on tab.root: sticky running queue banner must remain visible
+            const tab = env.drawerTabs[0];
+            expect(tab.root.querySelector(".ml-queue-banner")).not.toBeNull();
+
+            // Trigger overlapping non-forced + forced scan (via GALLERY_SYNC_CHANGED)
+            const scanMsgs = env.sentMessages.filter(
+                (m) => m.type === "RPC_REQUEST" && m.action === "scan_character",
+            );
+            expect(scanMsgs.length).toBeGreaterThanOrEqual(1);
+            const firstScanReq = scanMsgs[0];
+
+            env.emitBackend({ type: "GALLERY_SYNC_CHANGED", characterId: "char-1" });
+            await new Promise((r) => setTimeout(r, 5));
+
+            const allScans = env.sentMessages.filter(
+                (m) => m.type === "RPC_REQUEST" && m.action === "scan_character",
+            );
+            const forcedScanReq = allScans[allScans.length - 1];
+            expect(forcedScanReq.requestId).not.toBe(firstScanReq.requestId);
+            expect(forcedScanReq.payload.forceRefresh).toBe(true);
+
+            // Forced scan finishes FIRST with 9 occurrences
+            env.emitBackend({
+                type: "RPC_RESPONSE",
+                requestId: forcedScanReq.requestId,
+                result: {
+                    scan: makeScanResult("char-1", 9),
+                    urlMapPayload: { characterUrlMaps: {}, allUrlsMap: {}, updatedAt: 2 },
+                },
+            });
+            await new Promise((r) => setTimeout(r, 15));
+
+            // Stale non-forced scan finishes AFTER with 1 occurrence — must NOT overwrite forced scan!
+            env.emitBackend({
+                type: "RPC_RESPONSE",
+                requestId: firstScanReq.requestId,
+                result: {
+                    scan: makeScanResult("char-1", 1),
+                    urlMapPayload: { characterUrlMaps: {}, allUrlsMap: {}, updatedAt: 3 },
+                },
+            });
+            await new Promise((r) => setTimeout(r, 15));
+            expect(tab.root.textContent).toContain("9");
+
+            // End running queue so badge switches from queue progress to lastActiveCharacterRemoteCount
+            env.emitBackend({
+                type: "QUEUE_PROGRESS",
+                progress: { ...makeIdleQueueProgress(), status: "completed" },
+            });
+            expect(tab.badgeCalls[tab.badgeCalls.length - 1]).toBe("9");
+
+            // Unload must fail-fast in callBackend without sending extra RPCs
+            const msgCountBeforeUnload = env.sentMessages.length;
+            unload();
+            expect(env.sentMessages.length).toBe(msgCountBeforeUnload);
+        } finally {
+            cleanupUiHelpers();
+            env.domEnv.restore();
+        }
+    });
+
+    test("bulk purge fetches each character native gallery once and only deletes owned gallery items", async () => {
+        const env = buildFrontendTestEnv();
+        const origFetch = globalThis.fetch;
+        const fetchCalls: Array<{ url: string; method: string }> = [];
+        (globalThis as any).fetch = async (url: string, init?: RequestInit) => {
+            const method = (init?.method ?? "GET").toUpperCase();
+            fetchCalls.push({ url, method });
+            if (method === "GET" && url === "/api/v1/characters/char-1/gallery") {
+                return {
+                    ok: true,
+                    json: async () => [{ id: "g-owned-1", image_id: "img-1" }],
+                } as any;
+            }
+            if (method === "GET" && url === "/api/v1/characters/char-2/gallery") {
+                return {
+                    ok: true,
+                    json: async () => [{ id: "g-owned-2", image_id: "img-2" }],
+                } as any;
+            }
+            return { ok: true, json: async () => ({}) } as any;
+        };
+
+        try {
+            const unload = setup(env.ctx);
+            await new Promise((r) => setTimeout(r, 15));
+
+            const initReq = env.sentMessages.find(
+                (m) => m.type === "RPC_REQUEST" && m.action === "get_init_state",
+            );
+            env.emitBackend({
+                type: "RPC_RESPONSE",
+                requestId: initReq.requestId,
+                result: {
+                    settings: DEFAULT_SETTINGS,
+                    stats: {
+                        totalAssets: 2,
+                        totalBytes: 200,
+                        totalCharacters: 2,
+                        totalFailedUrls: 0,
+                        settings: DEFAULT_SETTINGS,
+                    },
+                    queueProgress: makeIdleQueueProgress(),
+                    urlMapPayload: { characterUrlMaps: {}, allUrlsMap: {}, updatedAt: 1 },
+                },
+            });
+
+            const tab = env.drawerTabs[0];
+            await new Promise((r) => setTimeout(r, 15));
+
+            const libBtn = Array.from(tab.root.querySelectorAll("button") as unknown as Iterable<any>).find((b) =>
+                (b.textContent ?? "").includes("Library"),
+            );
+            libBtn.click();
+            await new Promise((r) => setTimeout(r, 15));
+
+            const scanBtn = Array.from(tab.root.querySelectorAll("button") as unknown as Iterable<any>).find((b) =>
+                (b.textContent ?? "").includes("Scan Library"),
+            );
+            scanBtn.click();
+            await new Promise((r) => setTimeout(r, 15));
+
+            const scanLibReq = env.sentMessages.find(
+                (m) => m.type === "RPC_REQUEST" && m.action === "scan_library",
+            );
+            expect(scanLibReq).toBeDefined();
+            const secCounts = {
+                creator_notes: 1,
+                first_mes: 0,
+                core_fields: 0,
+                alternate_greetings: 0,
+                world_books: 0,
+                regex_scripts: 0,
+            };
+            env.emitBackend({
+                type: "RPC_RESPONSE",
+                requestId: scanLibReq.requestId,
+                result: {
+                    characters: [
+                        {
+                            characterId: "char-1",
+                            characterName: "Char 1",
+                            totalUniqueRemote: 1,
+                            remoteCount: 1,
+                            localizedCount: 1,
+                            failedCount: 0,
+                            sectionRemoteCounts: secCounts,
+                        },
+                        {
+                            characterId: "char-2",
+                            characterName: "Char 2",
+                            totalUniqueRemote: 1,
+                            remoteCount: 1,
+                            localizedCount: 1,
+                            failedCount: 0,
+                            sectionRemoteCounts: secCounts,
+                        },
+                    ],
+                    totalUniqueRemote: 2,
+                },
+            });
+            await new Promise((r) => setTimeout(r, 15));
+
+            const removeSelectedBtn = tab.root.querySelector(
+                'button[title*="Remove all localized cache assets"]',
+            ) as any;
+            expect(removeSelectedBtn).not.toBeNull();
+            removeSelectedBtn.click();
+            await new Promise((r) => setTimeout(r, 15));
+
+            const bulkReq = env.sentMessages.find(
+                (m) => m.type === "RPC_REQUEST" && m.action === "purge_characters",
+            );
+            expect(bulkReq).toBeDefined();
+            // Backend returns both owned ids PLUS an extra unowned id "g-foreign-99"
+            env.emitBackend({
+                type: "RPC_RESPONSE",
+                requestId: bulkReq.requestId,
+                result: {
+                    removedGalleryItemIds: ["g-owned-1", "g-owned-2", "g-foreign-99"],
+                    removedImageIds: ["img-1", "img-2"],
+                    stats: {
+                        totalAssets: 0,
+                        totalBytes: 0,
+                        totalCharacters: 0,
+                        totalFailedUrls: 0,
+                        settings: DEFAULT_SETTINGS,
+                    },
+                    urlMapPayload: { characterUrlMaps: {}, allUrlsMap: {}, updatedAt: 2 },
+                },
+            });
+            await new Promise((r) => setTimeout(r, 30));
+
+            const getCalls = fetchCalls.filter((c) => c.method === "GET");
+            const deleteCalls = fetchCalls.filter((c) => c.method === "DELETE");
+            expect(getCalls.map((c) => c.url).sort()).toEqual([
+                "/api/v1/characters/char-1/gallery",
+                "/api/v1/characters/char-2/gallery",
+            ]);
+            // Must NOT delete g-foreign-99 and must only delete owned items for their owning character
+            expect(deleteCalls.map((c) => c.url).sort()).toEqual([
+                "/api/v1/characters/char-1/gallery/g-owned-1",
+                "/api/v1/characters/char-2/gallery/g-owned-2",
+            ]);
+
+            unload();
+        } finally {
+            (globalThis as any).fetch = origFetch;
+            cleanupUiHelpers();
+            env.domEnv.restore();
+        }
+    });
+
+    test("retries permission-gated registrations idempotently and handles denied permissions gracefully", async () => {
+        const env = buildFrontendTestEnv();
+        try {
+            // Part A: Initially denied, then permissions.request() grants missing permissions
+            env.setPermissionGates({
+                registerTabAllowed: false,
+                stateSubscribeAllowed: false,
+                onDrawerAllowed: false,
+                eventsOnAllowed: false,
+            });
+            env.ctx.permissions.getGranted = async () => [];
+            env.ctx.permissions.request = async () => {
+                env.setPermissionGates({
+                    registerTabAllowed: true,
+                    stateSubscribeAllowed: true,
+                    onDrawerAllowed: true,
+                    eventsOnAllowed: true,
+                });
+                return ["ui", "characters", "events", "state", "chat"];
+            };
+
+            const unloadA = setup(env.ctx);
+            // Before async permission grant resolves, deferred bindings are absent
+            expect(env.drawerTabs.length).toBe(0);
+            expect(env.getStateListenerCount("chat.active")).toBe(0);
+
+            await new Promise((r) => setTimeout(r, 25));
+
+            // After permissions.request() resolves, deferred registrations succeed cleanly
+            expect(env.drawerTabs.length).toBe(1);
+            expect(env.getStateListenerCount("chat.active")).toBe(1);
+            expect(env.getEventListenerCount("CHAT_SWITCHED")).toBe(1);
+            unloadA();
+        } finally {
+            cleanupUiHelpers();
+            env.domEnv.restore();
+        }
+
+        // Part B: permissions.request() throws/denies -> does not throw unhandled rejection and unloads cleanly
+        const envDenied = buildFrontendTestEnv();
+        try {
+            envDenied.setPermissionGates({
+                registerTabAllowed: false,
+                stateSubscribeAllowed: false,
+                onDrawerAllowed: false,
+                eventsOnAllowed: false,
+            });
+            envDenied.ctx.permissions.getGranted = async () => [];
+            envDenied.ctx.permissions.request = async () => {
+                throw new Error("Permission request denied");
+            };
+
+            const unloadB = setup(envDenied.ctx);
+            await new Promise((r) => setTimeout(r, 25));
+            expect(envDenied.drawerTabs.length).toBe(0);
+            unloadB();
+        } finally {
+            cleanupUiHelpers();
+            envDenied.domEnv.restore();
+        }
     });
 });

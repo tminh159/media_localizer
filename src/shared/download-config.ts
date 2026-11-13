@@ -38,6 +38,8 @@ function uniqueNumbers(values: unknown): number[] | undefined {
   return out;
 }
 
+const MAX_BATCH_ITEMS = 2000;
+
 function clampBoundedInt(
   value: unknown,
   min: number,
@@ -122,7 +124,7 @@ export function sanitizeOverride(raw: unknown): CharacterDownloadOverride {
   const maxItems = sanitizeNonNegativeInt(obj.maxItems);
   if (maxItems !== undefined) {
     // 0 explicitly represents "unlimited" in both overrides and queue batch caps.
-    out.maxItems = maxItems;
+    out.maxItems = Math.min(MAX_BATCH_ITEMS, maxItems);
   }
 
   const excludedUrls = uniqueStrings(obj.excludedUrls);
@@ -137,16 +139,8 @@ export function isOverrideEmpty(
   override: CharacterDownloadOverride | null | undefined,
 ): boolean {
   if (!override) return true;
-  return (
-    (!override.sections || override.sections.length === 0) &&
-    (!override.greetingIndices || override.greetingIndices.length === 0) &&
-    (!override.worldBookIds || override.worldBookIds.length === 0) &&
-    (!override.domains || override.domains.length === 0) &&
-    (!override.mediaKinds || override.mediaKinds.length === 0) &&
-    typeof override.includeFailed !== "boolean" &&
-    sanitizeNonNegativeInt(override.maxItems) === undefined &&
-    (!override.excludedUrls || override.excludedUrls.length === 0)
-  );
+  const clean = sanitizeOverride(override);
+  return Object.keys(clean).length === 0;
 }
 
 /**
@@ -200,9 +194,11 @@ export function buildEffectiveFilter(
         ? settings.defaultIncludeFailed
         : DEFAULT_SETTINGS.defaultIncludeFailed;
 
-  const defaultBatchCap =
+  const defaultBatchCap = Math.min(
+    MAX_BATCH_ITEMS,
     sanitizeNonNegativeInt(settings.defaultBatchCap) ??
-    DEFAULT_SETTINGS.defaultBatchCap;
+      DEFAULT_SETTINGS.defaultBatchCap,
+  );
   const maxItems =
     effOverride?.maxItems !== undefined ? effOverride.maxItems : defaultBatchCap;
 

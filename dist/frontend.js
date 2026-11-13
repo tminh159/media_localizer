@@ -79,6 +79,7 @@ function uniqueNumbers(values) {
   }
   return out;
 }
+var MAX_BATCH_ITEMS = 2000;
 function clampBoundedInt(value, min, max, fallback) {
   if (typeof value !== "number" || !Number.isFinite(value))
     return fallback;
@@ -128,7 +129,7 @@ function sanitizeOverride(raw) {
   }
   const maxItems = sanitizeNonNegativeInt(obj.maxItems);
   if (maxItems !== undefined) {
-    out.maxItems = maxItems;
+    out.maxItems = Math.min(MAX_BATCH_ITEMS, maxItems);
   }
   const excludedUrls = uniqueStrings(obj.excludedUrls);
   if (excludedUrls && excludedUrls.length > 0) {
@@ -139,7 +140,8 @@ function sanitizeOverride(raw) {
 function isOverrideEmpty(override) {
   if (!override)
     return true;
-  return (!override.sections || override.sections.length === 0) && (!override.greetingIndices || override.greetingIndices.length === 0) && (!override.worldBookIds || override.worldBookIds.length === 0) && (!override.domains || override.domains.length === 0) && (!override.mediaKinds || override.mediaKinds.length === 0) && typeof override.includeFailed !== "boolean" && sanitizeNonNegativeInt(override.maxItems) === undefined && (!override.excludedUrls || override.excludedUrls.length === 0);
+  const clean = sanitizeOverride(override);
+  return Object.keys(clean).length === 0;
 }
 function buildEffectiveFilter(settings, scan, override) {
   const rawOverride = override !== undefined ? override : scan?.override ?? null;
@@ -149,7 +151,7 @@ function buildEffectiveFilter(settings, scan, override) {
   const settingsKinds = Array.isArray(settings.defaultMediaKinds) ? Array.from(new Set(settings.defaultMediaKinds.filter((k) => ALL_MEDIA_KINDS.includes(k)))) : [];
   const mediaKinds = effOverride?.mediaKinds && effOverride.mediaKinds.length > 0 ? [...effOverride.mediaKinds] : settingsKinds.length > 0 ? settingsKinds : [...ALL_MEDIA_KINDS];
   const includeFailed = typeof effOverride?.includeFailed === "boolean" ? effOverride.includeFailed : typeof settings.defaultIncludeFailed === "boolean" ? settings.defaultIncludeFailed : DEFAULT_SETTINGS.defaultIncludeFailed;
-  const defaultBatchCap = sanitizeNonNegativeInt(settings.defaultBatchCap) ?? DEFAULT_SETTINGS.defaultBatchCap;
+  const defaultBatchCap = Math.min(MAX_BATCH_ITEMS, sanitizeNonNegativeInt(settings.defaultBatchCap) ?? DEFAULT_SETTINGS.defaultBatchCap);
   const maxItems = effOverride?.maxItems !== undefined ? effOverride.maxItems : defaultBatchCap;
   const maxFileSizeMb = clampBoundedInt(settings.maxFileSizeMb, 1, 200, DEFAULT_SETTINGS.maxFileSizeMb);
   const timeoutSeconds = clampBoundedInt(settings.timeoutSeconds, 5, 120, DEFAULT_SETTINGS.timeoutSeconds);
@@ -453,7 +455,61 @@ function normalizeRemoteMediaUrl(rawInput, contextHint) {
     mediaKind
   };
 }
+function isAsciiWhitespace(ch) {
+  return ch === " " || ch === "\t" || ch === `
+` || ch === "\r" || ch === "\f";
+}
 var HTML_MEDIA_TAGS = new Set(["img", "image", "video", "source"]);
+function parseSrcsetCandidates(srcsetVal) {
+  const candidates = [];
+  const len = srcsetVal.length;
+  let i = 0;
+  while (i < len) {
+    while (i < len && (isAsciiWhitespace(srcsetVal[i]) || srcsetVal[i] === ",")) {
+      i++;
+    }
+    if (i >= len)
+      break;
+    const urlStart = i;
+    while (i < len && !isAsciiWhitespace(srcsetVal[i])) {
+      i++;
+    }
+    let urlEnd = i;
+    let hadTrailingComma = false;
+    while (urlEnd > urlStart && srcsetVal[urlEnd - 1] === ",") {
+      urlEnd--;
+      hadTrailingComma = true;
+    }
+    const url = srcsetVal.slice(urlStart, urlEnd);
+    let descriptors = "";
+    if (!hadTrailingComma) {
+      while (i < len && isAsciiWhitespace(srcsetVal[i])) {
+        i++;
+      }
+      const descStart = i;
+      let parenDepth = 0;
+      while (i < len) {
+        const ch = srcsetVal[i];
+        if (ch === "(") {
+          parenDepth++;
+        } else if (ch === ")" && parenDepth > 0) {
+          parenDepth--;
+        } else if (ch === "," && parenDepth === 0) {
+          break;
+        }
+        i++;
+      }
+      descriptors = srcsetVal.slice(descStart, i).trim();
+      if (i < len && srcsetVal[i] === ",") {
+        i++;
+      }
+    }
+    if (url) {
+      candidates.push({ url, urlStart, urlEnd, descriptors });
+    }
+  }
+  return candidates;
+}
 var NATIVE_IMG_TAGS = new Set(["img"]);
 function normalizeUrlFilterSet(urls) {
   if (!urls || urls.length === 0)
@@ -516,8 +572,12 @@ function sanitizeSafeMediaUrl(rawUrl) {
   if (!trimmed || /[\u0000-\u001f\u007f]/.test(trimmed))
     return null;
   if (trimmed.startsWith("/") && !trimmed.startsWith("//") && !trimmed.startsWith("/\\")) {
+    if (/[\s"'\\<>()`]/.test(trimmed))
+      return null;
     return trimmed;
   }
+  if (/[\s"'\\<>`]/.test(trimmed))
+    return null;
   try {
     const parsed = new URL(trimmed);
     if (parsed.protocol === "http:" || parsed.protocol === "https:") {
@@ -939,10 +999,12 @@ ${entry.error}`;
 }
 var activeLightboxCloseFn = null;
 function openMediaLightbox(items, startIndex, onAfterRemove) {
-  if (items.length === 0)
+  if (items.length === 0 || typeof document === "undefined" || !document.body) {
     return;
+  }
   activeLightboxCloseFn?.();
   const workingItems = [...items];
+  const removingItems = new WeakSet;
   let idx = Math.max(0, Math.min(workingItems.length - 1, startIndex));
   let closed = false;
   const backdrop = document.createElement("div");
@@ -1119,22 +1181,40 @@ function openMediaLightbox(items, startIndex, onAfterRemove) {
         title: "Remove this localized asset from cache & Character Gallery",
         className: "ml-btn is-danger is-sm",
         size: 13,
+        disabled: removingItems.has(item),
         onClick: async () => {
+          if (closed || removingItems.has(item))
+            return;
+          removingItems.add(item);
           removeBtn.disabled = true;
           try {
             await item.onRemove();
-            workingItems.splice(idx, 1);
+            let removeAt = workingItems.indexOf(item);
+            if (removeAt === -1) {
+              removeAt = workingItems.findIndex((entry) => entry.id === item.id);
+            }
+            if (removeAt !== -1) {
+              workingItems.splice(removeAt, 1);
+              if (removeAt < idx) {
+                idx = Math.max(0, idx - 1);
+              } else if (removeAt === idx) {
+                idx = Math.min(idx, Math.max(0, workingItems.length - 1));
+              }
+            }
             onAfterRemove?.();
             if (closed)
               return;
             if (workingItems.length === 0) {
               close();
             } else {
-              idx = Math.min(idx, workingItems.length - 1);
+              idx = Math.max(0, Math.min(idx, workingItems.length - 1));
               renderCurrent();
             }
+          } catch (err) {
+            console.warn("[media_localizer] Failed removing lightbox item:", err);
           } finally {
-            if (!closed) {
+            removingItems.delete(item);
+            if (!closed && removeBtn.isConnected !== false) {
               removeBtn.disabled = false;
             }
           }
@@ -1148,19 +1228,60 @@ function openMediaLightbox(items, startIndex, onAfterRemove) {
 }
 var sharedThumbObserver = null;
 var thumbCallbacks = new WeakMap;
+var observedThumbElements = new Set;
+var thumbPruneTimer = null;
+function pruneDetachedThumbTargets() {
+  if (!sharedThumbObserver) {
+    observedThumbElements.clear();
+    return;
+  }
+  for (const el of observedThumbElements) {
+    if (el.isConnected === false) {
+      sharedThumbObserver.unobserve(el);
+      thumbCallbacks.delete(el);
+      observedThumbElements.delete(el);
+    }
+  }
+}
+function scheduleThumbPrune(delayMs = 50) {
+  if (thumbPruneTimer !== null || observedThumbElements.size === 0)
+    return;
+  thumbPruneTimer = setTimeout(() => {
+    thumbPruneTimer = null;
+    pruneDetachedThumbTargets();
+    if (observedThumbElements.size > 0 && sharedThumbObserver) {
+      scheduleThumbPrune(2000);
+    }
+  }, delayMs);
+  thumbPruneTimer.unref?.();
+}
+function observeThumbElement(observer, el, cb) {
+  thumbCallbacks.set(el, cb);
+  observedThumbElements.add(el);
+  observer.observe(el);
+  scheduleThumbPrune(50);
+}
 function getThumbObserver() {
   if (typeof IntersectionObserver === "undefined")
     return null;
   if (!sharedThumbObserver) {
     sharedThumbObserver = new IntersectionObserver((entries) => {
       for (const entry of entries) {
-        if (!entry.isIntersecting)
+        if (!entry.isIntersecting) {
+          if (entry.target.isConnected === false) {
+            sharedThumbObserver?.unobserve(entry.target);
+            thumbCallbacks.delete(entry.target);
+            observedThumbElements.delete(entry.target);
+          }
           continue;
+        }
         const cb = thumbCallbacks.get(entry.target);
         sharedThumbObserver?.unobserve(entry.target);
         thumbCallbacks.delete(entry.target);
+        observedThumbElements.delete(entry.target);
         cb?.();
       }
+      pruneDetachedThumbTargets();
     }, { rootMargin: "220px" });
   }
   return sharedThumbObserver;
@@ -1171,10 +1292,15 @@ function cleanupUiHelpers() {
   detachTipDocListeners();
   activeLightboxCloseFn?.();
   activeLightboxCloseFn = null;
+  if (thumbPruneTimer !== null) {
+    clearTimeout(thumbPruneTimer);
+    thumbPruneTimer = null;
+  }
   if (sharedThumbObserver) {
     sharedThumbObserver.disconnect();
     sharedThumbObserver = null;
   }
+  observedThumbElements.clear();
   thumbCallbacks = new WeakMap;
 }
 function createLazyMediaElement(options) {
@@ -1190,10 +1316,9 @@ function createLazyMediaElement(options) {
       vid.title = options.title;
     if (safeSrc) {
       if (observer) {
-        thumbCallbacks.set(vid, () => {
+        observeThumbElement(observer, vid, () => {
           vid.src = safeSrc;
         });
-        observer.observe(vid);
       } else {
         vid.src = safeSrc;
       }
@@ -1209,10 +1334,9 @@ function createLazyMediaElement(options) {
     img.title = options.title;
   if (safeSrc) {
     if (observer) {
-      thumbCallbacks.set(img, () => {
+      observeThumbElement(observer, img, () => {
         img.src = safeSrc;
       });
-      observer.observe(img);
     } else {
       img.src = safeSrc;
     }
@@ -1261,7 +1385,7 @@ class NonDestructiveDisplaySwapper {
     if (typeof document !== "undefined") {
       this.errorListener = (event) => {
         const target = event.target;
-        if (target instanceof HTMLImageElement || target instanceof HTMLVideoElement || target instanceof HTMLSourceElement || typeof SVGImageElement !== "undefined" && target instanceof SVGImageElement) {
+        if (target instanceof HTMLImageElement || target instanceof HTMLVideoElement || typeof HTMLAudioElement !== "undefined" && target instanceof HTMLAudioElement || target instanceof HTMLSourceElement || typeof SVGImageElement !== "undefined" && target instanceof SVGImageElement) {
           this.decorateMediaElement(target, this.getActiveCharacterIds());
         }
       };
@@ -1277,7 +1401,7 @@ class NonDestructiveDisplaySwapper {
       const name = r.attributeName ?? "";
       if (name === "style") {
         const style = target.getAttribute("style") ?? "";
-        return style.includes("url(") || target.hasAttribute("data-ml-original-style");
+        return style.toLowerCase().includes("url(") || target.hasAttribute("data-ml-original-style");
       }
       if (name === "src" || name === "data-src" || name === "srcset" || name === "href" || name === "xlink:href" || name === "poster") {
         const safeKey = name.replace(":", "-");
@@ -1324,7 +1448,17 @@ class NonDestructiveDisplaySwapper {
     }
   }
   updateMap(next) {
-    this.payload = next;
+    if (!next || typeof next !== "object")
+      return;
+    const nextUpdatedAt = typeof next.updatedAt === "number" && Number.isFinite(next.updatedAt) ? next.updatedAt : 0;
+    if (nextUpdatedAt < this.payload.updatedAt) {
+      return;
+    }
+    this.payload = {
+      characterUrlMaps: next.characterUrlMaps ?? {},
+      allUrlsMap: next.allUrlsMap ?? {},
+      updatedAt: nextUpdatedAt
+    };
     if (this.stopped)
       return;
     this.runPassNow();
@@ -1488,24 +1622,24 @@ class NonDestructiveDisplaySwapper {
     return false;
   }
   rewriteSrcset(srcsetText, activeCharIds) {
+    const candidates = parseSrcsetCandidates(srcsetText);
+    if (candidates.length === 0) {
+      return { replaced: srcsetText, changed: false };
+    }
     let changed = false;
-    const parts = srcsetText.split(",").map((segment) => {
-      const trimmed = segment.trim();
-      if (!trimmed)
-        return segment;
-      const tokens = trimmed.split(/\s+/);
-      const rawUrl = tokens[0] ?? "";
-      const localUrl = this.resolveLocalUrl(rawUrl, activeCharIds);
-      if (!localUrl)
-        return segment;
-      changed = true;
-      return [localUrl, ...tokens.slice(1)].join(" ");
+    const parts = candidates.map((candidate) => {
+      const localUrl = this.resolveLocalUrl(candidate.url, activeCharIds);
+      const effectiveUrl = localUrl ?? candidate.url;
+      if (localUrl && localUrl !== candidate.url) {
+        changed = true;
+      }
+      return candidate.descriptors ? `${effectiveUrl} ${candidate.descriptors}` : effectiveUrl;
     });
-    return { replaced: parts.join(", "), changed };
+    return { replaced: changed ? parts.join(", ") : srcsetText, changed };
   }
   decorateMediaElement(el, activeCharIds) {
     const srcChanged = this.decorateUrlAttribute(el, "src", activeCharIds);
-    if (srcChanged && typeof HTMLSourceElement !== "undefined" && el instanceof HTMLSourceElement && typeof HTMLVideoElement !== "undefined" && el.parentElement instanceof HTMLVideoElement) {
+    if (srcChanged && typeof HTMLSourceElement !== "undefined" && el instanceof HTMLSourceElement && (typeof HTMLVideoElement !== "undefined" && el.parentElement instanceof HTMLVideoElement || typeof HTMLAudioElement !== "undefined" && el.parentElement instanceof HTMLAudioElement)) {
       try {
         el.parentElement.load();
       } catch {}
@@ -1548,25 +1682,29 @@ class NonDestructiveDisplaySwapper {
       if (!raw)
         return fullMatch;
       const localUrl = this.resolveLocalUrl(raw, activeCharIds);
-      if (!localUrl)
+      if (!localUrl || /[\s"'\\<>()\u0000-\u001f\u007f]/.test(localUrl)) {
         return fullMatch;
+      }
       changed = true;
       return `url("${localUrl}")`;
     });
     return { replaced, changed };
   }
   decorateContainer(root, activeCharIds) {
-    const mediaEls = root.querySelectorAll("img[src], img[data-src], img[srcset], image[href], image[*|href], video[src], video[poster], source[src], source[srcset], [data-ml-original-src], [data-ml-original-data-src], [data-ml-original-srcset], [data-ml-original-href], [data-ml-original-xlink-href], [data-ml-original-poster]");
+    const mediaEls = root.querySelectorAll("img[src], img[data-src], img[srcset], image[href], image[*|href], video[src], video[data-src], video[poster], audio[src], audio[data-src], source[src], source[data-src], source[srcset], [data-ml-original-src], [data-ml-original-data-src], [data-ml-original-srcset], [data-ml-original-href], [data-ml-original-xlink-href], [data-ml-original-poster]");
     for (const el of Array.from(mediaEls)) {
       if (el.closest(".ml-gallery-host, .ml-drawer-root"))
         continue;
       this.decorateMediaElement(el, activeCharIds);
     }
-    const styledEls = root.querySelectorAll('[style*="url("], [data-ml-original-style]');
+    const styledEls = root.querySelectorAll("[style], [data-ml-original-style]");
     for (const el of Array.from(styledEls)) {
       if (el.closest(".ml-gallery-host, .ml-drawer-root"))
         continue;
       const currentStyle = el.getAttribute("style") ?? "";
+      if (!currentStyle.toLowerCase().includes("url(") && !el.hasAttribute("data-ml-original-style")) {
+        continue;
+      }
       const baseStyle = this.resolveBase(el, "style", currentStyle);
       if (!baseStyle)
         continue;
@@ -1583,9 +1721,11 @@ class NonDestructiveDisplaySwapper {
     }
     const styleTags = root.querySelectorAll("style");
     for (const styleEl of Array.from(styleTags)) {
+      if (styleEl.closest(".ml-gallery-host, .ml-drawer-root"))
+        continue;
       const currentCss = styleEl.textContent ?? "";
       const baseCss = this.resolveBase(styleEl, "css", currentCss);
-      if (!baseCss || !baseCss.includes("url("))
+      if (!baseCss || !baseCss.toLowerCase().includes("url("))
         continue;
       const { replaced, changed } = this.rewriteCssUrls(baseCss, activeCharIds);
       if (changed) {
@@ -1632,6 +1772,41 @@ class NonDestructiveDisplaySwapper {
 }
 
 // src/ui/character-media-widget.ts
+var VALID_MEDIA_FILTERS = new Set([
+  "all",
+  "localized",
+  "expressions",
+  "video"
+]);
+function getDefaultCharacterPreferences(defaultExpandDownloadedMedia = true) {
+  return {
+    showDownloadConfig: false,
+    showGreetingSubfilter: false,
+    showWorldBookSubfilter: false,
+    showUrlPicker: false,
+    showRemoteThumbnails: false,
+    mediaViewMode: "grid",
+    mediaFilter: "all",
+    showDownloadedMedia: defaultExpandDownloadedMedia
+  };
+}
+function sanitizeCharacterPreferences(raw, defaultExpandDownloadedMedia = true) {
+  const defaults = getDefaultCharacterPreferences(defaultExpandDownloadedMedia);
+  if (!raw || typeof raw !== "object")
+    return defaults;
+  const obj = raw;
+  const mediaFilter = typeof obj.mediaFilter === "string" && VALID_MEDIA_FILTERS.has(obj.mediaFilter) ? obj.mediaFilter : defaults.mediaFilter;
+  return {
+    showDownloadConfig: typeof obj.showDownloadConfig === "boolean" ? obj.showDownloadConfig : defaults.showDownloadConfig,
+    showGreetingSubfilter: typeof obj.showGreetingSubfilter === "boolean" ? obj.showGreetingSubfilter : defaults.showGreetingSubfilter,
+    showWorldBookSubfilter: typeof obj.showWorldBookSubfilter === "boolean" ? obj.showWorldBookSubfilter : defaults.showWorldBookSubfilter,
+    showUrlPicker: typeof obj.showUrlPicker === "boolean" ? obj.showUrlPicker : defaults.showUrlPicker,
+    showRemoteThumbnails: typeof obj.showRemoteThumbnails === "boolean" ? obj.showRemoteThumbnails : defaults.showRemoteThumbnails,
+    mediaViewMode: obj.mediaViewMode === "list" ? "list" : "grid",
+    mediaFilter,
+    showDownloadedMedia: typeof obj.showDownloadedMedia === "boolean" ? obj.showDownloadedMedia : defaults.showDownloadedMedia
+  };
+}
 function sameSetAsList(set, list) {
   const target = new Set(list);
   if (set.size !== target.size)
@@ -1661,6 +1836,7 @@ class CharacterMediaWidget {
   showRemoteThumbnails = false;
   mediaViewMode = "grid";
   mediaFilter = "all";
+  showDownloadedMedia = true;
   queueBannerEl = null;
   selectedSections = new Set;
   selectedGreetings = null;
@@ -1674,6 +1850,9 @@ class CharacterMediaWidget {
   hasCustomOverride = false;
   filtersInitializedForChar = null;
   overrideSaveTimer = null;
+  pendingOverrideSave = null;
+  inFlightOverrideSaves = new Map;
+  refreshBtnEl = null;
   scanGeneration = 0;
   destroyed = false;
   constructor(root, ctx, characterId, settings, queueProgress, callbacks, options = {}) {
@@ -1685,15 +1864,74 @@ class CharacterMediaWidget {
     this.options = options;
     this.characterId = characterId;
     this.batchCap = settings.defaultBatchCap;
-    this.showDownloadConfig = Boolean(options.defaultExpandConfig);
+    const defaultExpandDownloaded = options.defaultExpandDownloadedMedia ?? options.inDrawer !== false;
+    const prefs = sanitizeCharacterPreferences(options.initialUiState, defaultExpandDownloaded);
+    this.showDownloadConfig = options.defaultExpandConfig === true ? true : prefs.showDownloadConfig;
+    this.showGreetingSubfilter = prefs.showGreetingSubfilter;
+    this.showWorldBookSubfilter = prefs.showWorldBookSubfilter;
+    this.showUrlPicker = prefs.showUrlPicker;
+    this.showRemoteThumbnails = prefs.showRemoteThumbnails;
+    this.mediaViewMode = prefs.mediaViewMode;
+    this.mediaFilter = prefs.mediaFilter;
+    this.showDownloadedMedia = options.initialUiState?.showDownloadedMedia !== undefined ? prefs.showDownloadedMedia : defaultExpandDownloaded;
+    if (Array.isArray(options.initialUiState?.expandedUrls)) {
+      this.expandedUrls = new Set(options.initialUiState.expandedUrls);
+    }
+    if (options.initialScan && options.initialScan.characterId === characterId) {
+      this.scan = options.initialScan;
+      this.initFiltersFromScan(options.initialScan, true);
+    }
   }
-  destroy() {
-    this.destroyed = true;
-    this.scanGeneration++;
+  emitUiStateChange() {
+    this.options.onUiStateChange?.({
+      showDownloadConfig: this.showDownloadConfig,
+      showGreetingSubfilter: this.showGreetingSubfilter,
+      showWorldBookSubfilter: this.showWorldBookSubfilter,
+      showUrlPicker: this.showUrlPicker,
+      showRemoteThumbnails: this.showRemoteThumbnails,
+      mediaViewMode: this.mediaViewMode,
+      mediaFilter: this.mediaFilter,
+      showDownloadedMedia: this.showDownloadedMedia,
+      expandedUrls: Array.from(this.expandedUrls)
+    });
+  }
+  persistOverrideNow(charId, override) {
+    const prev = this.inFlightOverrideSaves.get(charId);
+    const runSave = () => this.callbacks.onSaveCharacterOverride(charId, override);
+    const next = (prev ? prev.catch(() => {
+      return;
+    }).then(runSave) : runSave()).then(() => {
+      return;
+    }).catch((err) => {
+      console.warn("[media_localizer] Failed saving character override:", err);
+    }).finally(() => {
+      if (this.inFlightOverrideSaves.get(charId) === next) {
+        this.inFlightOverrideSaves.delete(charId);
+      }
+    });
+    this.inFlightOverrideSaves.set(charId, next);
+    return next;
+  }
+  hasPendingOverrideFor(charId) {
+    return this.pendingOverrideSave !== null && this.pendingOverrideSave.charId === charId || this.inFlightOverrideSaves.has(charId);
+  }
+  flushPendingOverrideSave() {
     if (this.overrideSaveTimer !== null) {
       clearTimeout(this.overrideSaveTimer);
       this.overrideSaveTimer = null;
     }
+    const pending = this.pendingOverrideSave;
+    this.pendingOverrideSave = null;
+    if (!pending) {
+      return this.inFlightOverrideSaves.get(this.characterId) ?? Promise.resolve();
+    }
+    return this.persistOverrideNow(pending.charId, pending.override);
+  }
+  destroy() {
+    this.destroyed = true;
+    this.scanGeneration++;
+    this.refreshBtnEl = null;
+    this.flushPendingOverrideSave();
   }
   getCharacterId() {
     return this.characterId;
@@ -1712,6 +1950,13 @@ class CharacterMediaWidget {
       return;
     if (this.characterId === nextId && (this.scan || this.loading))
       return;
+    if (this.characterId !== nextId) {
+      this.flushPendingOverrideSave();
+      if (this.expandedUrls.size > 0) {
+        this.expandedUrls.clear();
+        this.emitUiStateChange();
+      }
+    }
     this.characterId = nextId;
     this.scan = null;
     this.error = null;
@@ -1721,18 +1966,20 @@ class CharacterMediaWidget {
   updateExternalState(settings, queueProgress) {
     if (this.destroyed)
       return;
+    const prevSettings = this.settings;
     const prevStatus = this.queueProgress.status;
     const settingsChanged = JSON.stringify(settings) !== JSON.stringify(this.settings);
+    const scanSettingsChanged = settings.scanBareUrls !== prevSettings.scanBareUrls || settings.adoptNativeGalleryImages !== prevSettings.adoptNativeGalleryImages;
     this.settings = settings;
     this.queueProgress = queueProgress;
-    if (settingsChanged && this.scan && !this.hasCustomOverride) {
+    if (settingsChanged && this.scan && !this.hasCustomOverride && !this.hasPendingOverrideFor(this.scan.characterId)) {
       this.filtersInitializedForChar = null;
       this.initFiltersFromScan(this.scan);
     }
     const wasActive = isQueueActiveStatus(prevStatus);
     const nowActive = isQueueActiveStatus(queueProgress.status);
-    if (wasActive && !nowActive) {
-      this.refreshScan(false);
+    if (wasActive && !nowActive || scanSettingsChanged && this.scan) {
+      this.refreshScan(scanSettingsChanged);
       return;
     }
     if (!this.options.inDrawer && this.queueBannerEl && nowActive) {
@@ -1761,14 +2008,32 @@ class CharacterMediaWidget {
     this.error = null;
     if (!this.scan) {
       this.render();
+    } else if (this.refreshBtnEl) {
+      this.refreshBtnEl.disabled = true;
+      this.refreshBtnEl.classList.add("is-busy");
     }
     try {
+      if (this.hasPendingOverrideFor(targetId)) {
+        await this.flushPendingOverrideSave();
+        await this.inFlightOverrideSaves.get(targetId);
+        if (this.destroyed || gen !== this.scanGeneration || this.characterId !== targetId) {
+          return;
+        }
+      }
       const result = await this.callbacks.onScanCharacter(targetId, forceRefresh);
       if (this.destroyed || gen !== this.scanGeneration || this.characterId !== targetId) {
         return;
       }
-      this.scan = result;
-      this.initFiltersFromScan(result, forceRefresh);
+      if (this.hasPendingOverrideFor(result.characterId)) {
+        const localOverride = this.buildOverrideFromState();
+        result.override = localOverride;
+        this.hasCustomOverride = localOverride !== null;
+        this.scan = result;
+      } else {
+        this.scan = result;
+        this.initFiltersFromScan(result, forceRefresh);
+      }
+      this.options.onScanChange?.(result);
     } catch (err) {
       if (this.destroyed || gen !== this.scanGeneration || this.characterId !== targetId) {
         return;
@@ -1792,8 +2057,8 @@ class CharacterMediaWidget {
       this.render();
     }
   }
-  initFiltersFromScan(scan, preserveEdits = false) {
-    if (!preserveEdits && this.filtersInitializedForChar === scan.characterId) {
+  initFiltersFromScan(scan, reinitExisting = false) {
+    if (!reinitExisting && this.filtersInitializedForChar === scan.characterId) {
       this.hasCustomOverride = Boolean(scan.override && !isOverrideEmpty(scan.override));
       return;
     }
@@ -1851,28 +2116,36 @@ class CharacterMediaWidget {
     this.hasCustomOverride = nextOverride !== null;
     if (this.scan && this.scan.characterId === targetCharId) {
       this.scan.override = nextOverride;
+      this.options.onScanChange?.(this.scan);
     }
     if (this.overrideSaveTimer)
       clearTimeout(this.overrideSaveTimer);
+    this.pendingOverrideSave = { charId: targetCharId, override: nextOverride };
     this.overrideSaveTimer = setTimeout(() => {
       this.overrideSaveTimer = null;
+      this.pendingOverrideSave = null;
       if (this.destroyed)
         return;
-      this.callbacks.onSaveCharacterOverride(targetCharId, nextOverride).catch((err) => console.warn("[media_localizer] Failed saving character override:", err));
+      this.persistOverrideNow(targetCharId, nextOverride);
     }, 150);
   }
   async resetToGlobalDefaults() {
     if (!this.scan)
       return;
+    const targetCharId = this.scan.characterId;
     if (this.overrideSaveTimer) {
       clearTimeout(this.overrideSaveTimer);
       this.overrideSaveTimer = null;
     }
+    this.pendingOverrideSave = null;
     this.scan.override = null;
     this.hasCustomOverride = false;
     this.filtersInitializedForChar = null;
     this.initFiltersFromScan(this.scan);
-    await this.callbacks.onSaveCharacterOverride(this.scan.characterId, null);
+    this.options.onScanChange?.(this.scan);
+    await this.persistOverrideNow(targetCharId, null);
+    if (this.destroyed || this.characterId !== targetCharId)
+      return;
     this.render();
   }
   captureScrollState() {
@@ -1916,9 +2189,12 @@ class CharacterMediaWidget {
     };
   }
   async triggerOneClickLocalize() {
+    if (this.destroyed)
+      return;
     const scan = this.scan;
     if (!scan)
       return;
+    const targetCharId = scan.characterId;
     const filter = this.buildCurrentFilter(true);
     const matched = filterScanItemsForDownload(scan, filter);
     const effectiveCount = this.batchCap > 0 ? Math.min(matched.length, this.batchCap) : matched.length;
@@ -1931,11 +2207,12 @@ class CharacterMediaWidget {
         confirmLabel: `Localize ${effectiveCount}`,
         cancelLabel: "Cancel"
       });
-      if (!res?.confirmed)
+      if (this.destroyed || this.characterId !== targetCharId || !res?.confirmed) {
         return;
+      }
     }
     await this.runAction(() => this.callbacks.onStartDownload({
-      characterIds: [scan.characterId],
+      characterIds: [targetCharId],
       ...filter
     }));
   }
@@ -1945,6 +2222,7 @@ class CharacterMediaWidget {
     const scrollState = this.captureScrollState();
     this.root.innerHTML = "";
     this.queueBannerEl = null;
+    this.refreshBtnEl = null;
     const wrap = document.createElement("div");
     wrap.className = "ml-widget";
     if (!this.characterId) {
@@ -2012,6 +2290,7 @@ class CharacterMediaWidget {
           this.excludedUrls.add(u);
         this.scheduleSaveOverride();
         this.runAction(async () => {
+          await this.flushPendingOverrideSave();
           await this.callbacks.onClearFailedUrls(urls);
           await this.refreshScan(false);
         });
@@ -2077,6 +2356,7 @@ class CharacterMediaWidget {
       size: 14,
       onClick: () => {
         this.showDownloadConfig = !this.showDownloadConfig;
+        this.emitUiStateChange();
         this.render();
       }
     });
@@ -2086,8 +2366,13 @@ class CharacterMediaWidget {
       className: `ml-btn ml-icon-btn ${this.loading ? "is-busy" : ""}`,
       size: 14,
       disabled: this.loading,
-      onClick: () => void this.refreshScan(true)
+      onClick: () => {
+        if (this.loading)
+          return;
+        this.refreshScan(true);
+      }
     });
+    this.refreshBtnEl = refreshBtn;
     actions.append(localizeBtn, gearBtn, refreshBtn);
     titleLine.append(titleGroup, actions);
     const statusLine = document.createElement("div");
@@ -2156,6 +2441,7 @@ class CharacterMediaWidget {
       subBtn.textContent = this.showGreetingSubfilter ? "Hide Greeting Picker" : `Filter Greetings (${scan.greetingBreakdown.length})...`;
       subBtn.addEventListener("click", () => {
         this.showGreetingSubfilter = !this.showGreetingSubfilter;
+        this.emitUiStateChange();
         this.render();
       });
       subBar.appendChild(subBtn);
@@ -2176,11 +2462,17 @@ class CharacterMediaWidget {
             if (this.selectedGreetings === null) {
               this.selectedGreetings = new Set(scan.greetingBreakdown.map((item) => item.greetingIndex));
             }
-            if (gCb.checked)
+            if (gCb.checked) {
               this.selectedGreetings.add(g.greetingIndex);
-            else
+            } else {
+              const remaining = scan.greetingBreakdown.filter((item) => item.greetingIndex !== g.greetingIndex && this.selectedGreetings.has(item.greetingIndex));
+              if (remaining.length === 0) {
+                gCb.checked = true;
+                return;
+              }
               this.selectedGreetings.delete(g.greetingIndex);
-            if (this.selectedGreetings.size === scan.greetingBreakdown.length) {
+            }
+            if (scan.greetingBreakdown.every((item) => this.selectedGreetings.has(item.greetingIndex))) {
               this.selectedGreetings = null;
             }
             this.scheduleSaveOverride();
@@ -2204,6 +2496,7 @@ class CharacterMediaWidget {
       wbBtn.textContent = this.showWorldBookSubfilter ? "Hide World Book Picker" : `Filter World Books (${scan.worldBookBreakdown.length})...`;
       wbBtn.addEventListener("click", () => {
         this.showWorldBookSubfilter = !this.showWorldBookSubfilter;
+        this.emitUiStateChange();
         this.render();
       });
       wbRow.appendChild(wbBtn);
@@ -2222,11 +2515,17 @@ class CharacterMediaWidget {
             if (this.selectedWorldBooks === null) {
               this.selectedWorldBooks = new Set(scan.worldBookBreakdown.map((item) => item.worldBookId));
             }
-            if (wbCb.checked)
+            if (wbCb.checked) {
               this.selectedWorldBooks.add(wb.worldBookId);
-            else
+            } else {
+              const remaining = scan.worldBookBreakdown.filter((item) => item.worldBookId !== wb.worldBookId && this.selectedWorldBooks.has(item.worldBookId));
+              if (remaining.length === 0) {
+                wbCb.checked = true;
+                return;
+              }
               this.selectedWorldBooks.delete(wb.worldBookId);
-            if (this.selectedWorldBooks.size === scan.worldBookBreakdown.length) {
+            }
+            if (scan.worldBookBreakdown.every((item) => this.selectedWorldBooks.has(item.worldBookId))) {
               this.selectedWorldBooks = null;
             }
             this.scheduleSaveOverride();
@@ -2263,11 +2562,15 @@ class CharacterMediaWidget {
             this.selectedDomains = new Set(remoteDomains.map((d) => d.domain));
           }
           if (this.selectedDomains.has(dom.domain)) {
+            const remaining = remoteDomains.filter((d) => d.domain !== dom.domain && this.selectedDomains.has(d.domain));
+            if (remaining.length === 0) {
+              return;
+            }
             this.selectedDomains.delete(dom.domain);
           } else {
             this.selectedDomains.add(dom.domain);
           }
-          if (this.selectedDomains.size === remoteDomains.length) {
+          if (remoteDomains.every((d) => this.selectedDomains.has(d.domain))) {
             this.selectedDomains = null;
           }
           this.scheduleSaveOverride();
@@ -2285,6 +2588,7 @@ class CharacterMediaWidget {
     togglePickerBtn.textContent = this.showUrlPicker ? `Hide URL List (${selectedPending.length}/${candidateItems.length})` : `Inspect & Pick URLs (${selectedPending.length}/${candidateItems.length})...`;
     togglePickerBtn.addEventListener("click", () => {
       this.showUrlPicker = !this.showUrlPicker;
+      this.emitUiStateChange();
       this.render();
     });
     pickerBar.appendChild(togglePickerBtn);
@@ -2296,6 +2600,7 @@ class CharacterMediaWidget {
       thumbCb.checked = this.showRemoteThumbnails;
       thumbCb.addEventListener("change", () => {
         this.showRemoteThumbnails = thumbCb.checked;
+        this.emitUiStateChange();
         this.render();
       });
       thumbToggle.append(thumbCb, document.createTextNode("Remote Previews"));
@@ -2358,6 +2663,7 @@ class CharacterMediaWidget {
       collapseAllBtn.textContent = `Collapse (${this.expandedUrls.size})`;
       collapseAllBtn.addEventListener("click", () => {
         this.expandedUrls.clear();
+        this.emitUiStateChange();
         this.render();
       });
       urlTopBtns.appendChild(collapseAllBtn);
@@ -2429,6 +2735,7 @@ class CharacterMediaWidget {
         } else {
           this.expandedUrls.add(item.normalizedUrl);
         }
+        this.emitUiStateChange();
         this.render();
       });
       card.appendChild(row);
@@ -2641,9 +2948,27 @@ class CharacterMediaWidget {
     topBar.className = "ml-section-title";
     const titleWrap = document.createElement("div");
     titleWrap.className = "ml-inline-title";
+    const collapseBtn = createIconButton({
+      icon: this.showDownloadedMedia ? "chevron-down" : "chevron-right",
+      title: this.showDownloadedMedia ? "Collapse Downloaded Media" : "Expand Downloaded Media",
+      className: "ml-btn ml-icon-btn is-sm ml-collapse-btn",
+      size: 13,
+      onClick: () => {
+        this.showDownloadedMedia = !this.showDownloadedMedia;
+        this.emitUiStateChange();
+        this.render();
+      }
+    });
+    collapseBtn.setAttribute("aria-expanded", String(this.showDownloadedMedia));
+    collapseBtn.setAttribute("aria-label", this.showDownloadedMedia ? "Collapse Downloaded Media" : "Expand Downloaded Media");
     const titleSpan = document.createElement("span");
     titleSpan.textContent = `Downloaded Media (${localizedItems.length}${expressions.length > 0 ? ` + ${expressions.length} expr` : ""})`;
-    titleWrap.append(titleSpan, createInfoTip("Click any tile to open the lightbox. Character Avatar and native Expressions are read-only; localized assets can be removed individually or in bulk."));
+    titleWrap.append(collapseBtn, titleSpan, createInfoTip("Click any tile to open the lightbox. Character Avatar and native Expressions are read-only; localized assets can be removed individually or in bulk."));
+    if (!this.showDownloadedMedia) {
+      topBar.appendChild(titleWrap);
+      box.appendChild(topBar);
+      return box;
+    }
     const toolbar = document.createElement("div");
     toolbar.className = "ml-header-actions";
     const filterSelect = document.createElement("select");
@@ -2663,8 +2988,10 @@ class CharacterMediaWidget {
         opt.selected = true;
       filterSelect.appendChild(opt);
     }
+    filterSelect.value = this.mediaFilter;
     filterSelect.addEventListener("change", () => {
       this.mediaFilter = filterSelect.value;
+      this.emitUiStateChange();
       this.render();
     });
     toolbar.appendChild(filterSelect);
@@ -2675,6 +3002,7 @@ class CharacterMediaWidget {
       size: 13,
       onClick: () => {
         this.mediaViewMode = "grid";
+        this.emitUiStateChange();
         this.render();
       }
     }));
@@ -2685,6 +3013,7 @@ class CharacterMediaWidget {
       size: 13,
       onClick: () => {
         this.mediaViewMode = "list";
+        this.emitUiStateChange();
         this.render();
       }
     }));
@@ -2695,6 +3024,7 @@ class CharacterMediaWidget {
         className: "ml-btn ml-icon-btn is-danger is-sm",
         size: 13,
         onClick: async () => {
+          const targetCharId = scan.characterId;
           const msg = this.settings.deleteImagesOnPurge ? `Remove all ${localizedItems.length} localized media assets for "${scan.characterName}" from the Gallery & local cache? Original card URLs and native expressions remain untouched.` : `Remove all ${localizedItems.length} localized index entries for "${scan.characterName}"? Stored Gallery images will be kept.`;
           const res = await this.ctx.ui.showConfirm({
             title: "Remove Localized Media",
@@ -2703,10 +3033,13 @@ class CharacterMediaWidget {
             cancelLabel: "Cancel",
             variant: "danger"
           });
-          if (!res?.confirmed)
+          if (this.destroyed || this.characterId !== targetCharId || !res?.confirmed) {
             return;
+          }
           await this.runAction(async () => {
-            await this.callbacks.onPurgeCharacterCache(scan.characterId);
+            await this.callbacks.onPurgeCharacterCache(targetCharId);
+            if (this.destroyed || this.characterId !== targetCharId)
+              return;
             await this.refreshScan(false);
           });
         }
@@ -2838,6 +3171,121 @@ var ALL_GALLERY_MEDIA_TYPES = [
   "expression",
   "avatar"
 ];
+var GALLERY_PAGE_SIZE_OPTIONS = [24, 48, 96, 192, 0];
+var DEFAULT_GALLERY_PAGE_SIZE = 48;
+var VALID_SORT_MODES = new Set([
+  "recent",
+  "name",
+  "count",
+  "size",
+  "random"
+]);
+function getDefaultGalleryPreferences() {
+  return {
+    grouped: true,
+    viewMode: "grid",
+    sortMode: "name",
+    sortDirection: "asc",
+    selectedMediaTypes: [...ALL_GALLERY_MEDIA_TYPES],
+    includeEmptyCharacters: false,
+    pageSize: DEFAULT_GALLERY_PAGE_SIZE
+  };
+}
+function sanitizeGalleryPreferences(raw) {
+  const defaults = getDefaultGalleryPreferences();
+  if (!raw || typeof raw !== "object")
+    return defaults;
+  const obj = raw;
+  const grouped = typeof obj.grouped === "boolean" ? obj.grouped : defaults.grouped;
+  const viewMode = obj.viewMode === "grid" || obj.viewMode === "list" ? obj.viewMode : defaults.viewMode;
+  let sortMode = typeof obj.sortMode === "string" && VALID_SORT_MODES.has(obj.sortMode) ? obj.sortMode : defaults.sortMode;
+  if (!grouped && sortMode === "count") {
+    sortMode = "recent";
+  }
+  const sortDirection = obj.sortDirection === "asc" || obj.sortDirection === "desc" ? obj.sortDirection : defaults.sortDirection;
+  const selectedMediaTypes = Array.isArray(obj.selectedMediaTypes) ? Array.from(new Set(obj.selectedMediaTypes.filter((t) => ALL_GALLERY_MEDIA_TYPES.includes(String(t))))) : [...defaults.selectedMediaTypes];
+  const includeEmptyCharacters = typeof obj.includeEmptyCharacters === "boolean" ? obj.includeEmptyCharacters : defaults.includeEmptyCharacters;
+  const rawPageSize = Number(obj.pageSize);
+  const pageSize = GALLERY_PAGE_SIZE_OPTIONS.includes(rawPageSize) ? rawPageSize : defaults.pageSize;
+  return {
+    grouped,
+    viewMode,
+    sortMode,
+    sortDirection,
+    selectedMediaTypes,
+    includeEmptyCharacters,
+    pageSize
+  };
+}
+function parseGallerySearchQuery(raw) {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return {
+      hasQuery: false,
+      tagFilters: [],
+      hashOrTextFilters: [],
+      textTerms: []
+    };
+  }
+  const tagFilters = [];
+  const hashOrTextFilters = [];
+  const textTerms = [];
+  const tokenRe = /(?:tag:|#)("[^"]*"|\S+)|"([^"]*)"|(\S+)/gi;
+  let match;
+  while ((match = tokenRe.exec(trimmed)) !== null) {
+    const full = match[0];
+    if (match[1] !== undefined) {
+      const rawInner = match[1];
+      const inner = (rawInner.startsWith('"') ? rawInner.slice(1, rawInner.endsWith('"') && rawInner.length > 1 ? -1 : undefined) : rawInner).trim().toLowerCase();
+      if (!inner)
+        continue;
+      if (full.toLowerCase().startsWith("tag:")) {
+        tagFilters.push(inner);
+      } else {
+        hashOrTextFilters.push(inner);
+      }
+      continue;
+    }
+    const plain = (match[2] ?? match[3] ?? "").trim().toLowerCase();
+    if (!plain || plain === "tag:" || plain === "#")
+      continue;
+    textTerms.push(plain);
+  }
+  return {
+    hasQuery: tagFilters.length > 0 || hashOrTextFilters.length > 0 || textTerms.length > 0,
+    tagFilters,
+    hashOrTextFilters,
+    textTerms
+  };
+}
+function matchesTagFilters(lowerTags, parsed) {
+  for (const tagFilter of parsed.tagFilters) {
+    if (!lowerTags.some((t) => t.includes(tagFilter))) {
+      return false;
+    }
+  }
+  return true;
+}
+function matchesSearchText(haystacks, lowerTags, parsed) {
+  if (!parsed.hasQuery)
+    return true;
+  if (!matchesTagFilters(lowerTags, parsed))
+    return false;
+  for (const hashTerm of parsed.hashOrTextFilters) {
+    const tagHit = lowerTags.some((t) => t.includes(hashTerm));
+    const literalHit = haystacks.some((h) => h.includes(`#${hashTerm}`));
+    if (!tagHit && !literalHit)
+      return false;
+  }
+  for (const term of parsed.textTerms) {
+    const tagHit = lowerTags.some((t) => t.includes(term));
+    const textHit = haystacks.some((h) => h.includes(term));
+    if (!tagHit && !textHit)
+      return false;
+  }
+  return true;
+}
+var GALLERY_COLLATOR = new Intl.Collator;
 function inferKind(mimeType, filename) {
   if (mimeType.startsWith("video/") || /\.(mp4|webm|mov|m4v|ogv)(?:$|[?#])/i.test(filename)) {
     return "video";
@@ -2868,8 +3316,10 @@ class LibraryGalleryView {
   root;
   callbacks;
   characters = null;
+  precomputedCharCache = new WeakMap;
   loading = false;
   error = null;
+  destroyed = false;
   activeRefreshPromise = null;
   pendingRefresh = null;
   grouped = true;
@@ -2879,54 +3329,141 @@ class LibraryGalleryView {
   selectedMediaTypes = new Set(ALL_GALLERY_MEDIA_TYPES);
   includeEmptyCharacters = false;
   loadedIncludeEmpty = false;
+  pageSize = DEFAULT_GALLERY_PAGE_SIZE;
+  currentPage = 1;
   randomWeights = new Map;
+  randomWeightsDirty = false;
   searchQuery = "";
   activeCharacterId = null;
-  constructor(root, callbacks) {
+  constructor(root, callbacks, initial) {
     this.root = root;
     this.callbacks = callbacks;
+    if (initial?.state) {
+      const prefs = sanitizeGalleryPreferences(initial.state);
+      this.grouped = prefs.grouped;
+      this.viewMode = prefs.viewMode;
+      this.sortMode = prefs.sortMode;
+      this.sortDirection = prefs.sortDirection;
+      this.selectedMediaTypes = new Set(prefs.selectedMediaTypes);
+      this.includeEmptyCharacters = prefs.includeEmptyCharacters;
+      this.pageSize = prefs.pageSize;
+      if (typeof initial.state.searchQuery === "string") {
+        this.searchQuery = initial.state.searchQuery;
+      }
+      if (typeof initial.state.currentPage === "number" && Number.isFinite(initial.state.currentPage) && initial.state.currentPage >= 1) {
+        this.currentPage = Math.floor(initial.state.currentPage);
+      }
+      if (typeof initial.state.activeCharacterId === "string" || initial.state.activeCharacterId === null) {
+        this.activeCharacterId = initial.state.activeCharacterId;
+      }
+    }
+    if (initial?.cache) {
+      this.characters = initial.cache.characters;
+      this.loadedIncludeEmpty = Boolean(initial.cache.loadedIncludeEmpty);
+      if (initial.cache.randomWeights) {
+        this.randomWeights = new Map(initial.cache.randomWeights);
+      }
+    }
   }
-  async refresh(preserveActive = true) {
+  getState() {
+    return {
+      grouped: this.grouped,
+      viewMode: this.viewMode,
+      sortMode: this.sortMode,
+      sortDirection: this.sortDirection,
+      selectedMediaTypes: Array.from(this.selectedMediaTypes),
+      includeEmptyCharacters: this.includeEmptyCharacters,
+      pageSize: this.pageSize,
+      searchQuery: this.searchQuery,
+      currentPage: this.currentPage,
+      activeCharacterId: this.activeCharacterId
+    };
+  }
+  destroy() {
+    this.destroyed = true;
+    this.pendingRefresh = null;
+  }
+  emitStateChange() {
+    if (this.destroyed)
+      return;
+    this.callbacks.onStateChange?.(this.getState());
+  }
+  emitCacheChange() {
+    if (this.destroyed)
+      return;
+    this.callbacks.onCacheChange?.({
+      characters: this.characters,
+      loadedIncludeEmpty: this.loadedIncludeEmpty,
+      randomWeights: new Map(this.randomWeights)
+    });
+  }
+  flushRandomWeightsCache() {
+    if (!this.randomWeightsDirty)
+      return;
+    this.randomWeightsDirty = false;
+    this.emitCacheChange();
+  }
+  async refresh(options = true) {
+    if (this.destroyed)
+      return;
+    const preserveActive = typeof options === "boolean" ? options : options.preserveActive ?? true;
+    const reshuffleRandom = typeof options === "boolean" ? true : options.reshuffleRandom ?? true;
     if (this.activeRefreshPromise) {
       this.pendingRefresh = {
-        preserveActive: this.pendingRefresh ? this.pendingRefresh.preserveActive && preserveActive : preserveActive
+        preserveActive: this.pendingRefresh ? this.pendingRefresh.preserveActive && preserveActive : preserveActive,
+        reshuffleRandom: this.pendingRefresh ? this.pendingRefresh.reshuffleRandom || reshuffleRandom : reshuffleRandom
       };
       return this.activeRefreshPromise;
     }
     const run = (async () => {
-      let nextPreserveActive = preserveActive;
-      while (nextPreserveActive !== null) {
-        const currentPreserve = nextPreserveActive;
-        nextPreserveActive = null;
+      let nextRefresh = {
+        preserveActive,
+        reshuffleRandom
+      };
+      while (nextRefresh !== null && !this.destroyed) {
+        const current = nextRefresh;
+        nextRefresh = null;
         this.loading = true;
         this.error = null;
         const requestedIncludeEmpty = this.includeEmptyCharacters;
-        if (this.sortMode === "random") {
+        if (this.sortMode === "random" && current.reshuffleRandom) {
           this.reshuffleRandomOrder();
         }
         if (!this.characters)
           this.render();
         try {
-          this.characters = await this.callbacks.onLoadLibraryMedia({
+          const loaded = await this.callbacks.onLoadLibraryMedia({
             includeEmpty: requestedIncludeEmpty
           });
+          if (this.destroyed)
+            return;
+          this.characters = loaded;
+          this.precomputedCharCache = new WeakMap;
           this.loadedIncludeEmpty = requestedIncludeEmpty;
-          if (!currentPreserve || this.activeCharacterId && !this.characters.some((c) => c.characterId === this.activeCharacterId)) {
+          if (!current.preserveActive || this.activeCharacterId && !this.characters.some((c) => c.characterId === this.activeCharacterId)) {
             this.activeCharacterId = null;
           }
+          this.emitCacheChange();
+          this.emitStateChange();
         } catch (err) {
+          if (this.destroyed)
+            return;
           this.error = err instanceof Error ? err.message : String(err);
         } finally {
           this.loading = false;
         }
+        if (this.destroyed)
+          return;
         if (this.pendingRefresh !== null) {
-          nextPreserveActive = this.pendingRefresh.preserveActive;
+          nextRefresh = this.pendingRefresh;
           this.pendingRefresh = null;
         } else if (!this.error && this.includeEmptyCharacters && !this.loadedIncludeEmpty) {
-          nextPreserveActive = currentPreserve;
+          nextRefresh = current;
         }
       }
-      this.render();
+      if (!this.destroyed) {
+        this.render();
+      }
     })().finally(() => {
       this.activeRefreshPromise = null;
     });
@@ -2934,6 +3471,8 @@ class LibraryGalleryView {
     return run;
   }
   async ensureLoaded() {
+    if (this.destroyed)
+      return;
     if (this.activeRefreshPromise) {
       await this.activeRefreshPromise;
       return;
@@ -2943,21 +3482,32 @@ class LibraryGalleryView {
     }
   }
   invalidateCache() {
+    if (this.destroyed)
+      return;
     this.characters = null;
+    this.precomputedCharCache = new WeakMap;
     this.loadedIncludeEmpty = false;
+    this.emitCacheChange();
   }
   reshuffleRandomOrder() {
+    if (this.destroyed)
+      return;
     this.randomWeights.clear();
+    this.randomWeightsDirty = false;
+    this.emitCacheChange();
   }
   getRandomWeight(key) {
     let w = this.randomWeights.get(key);
     if (w === undefined) {
       w = Math.random();
       this.randomWeights.set(key, w);
+      this.randomWeightsDirty = true;
     }
     return w;
   }
   render() {
+    if (this.destroyed)
+      return;
     this.root.innerHTML = "";
     const wrap = document.createElement("div");
     wrap.className = "ml-widget";
@@ -2969,7 +3519,7 @@ class LibraryGalleryView {
     }
     const toolbar = this.renderToolbar();
     wrap.appendChild(toolbar);
-    if (this.loading && !this.characters) {
+    if (!this.characters && (this.loading || !this.error)) {
       const msg = document.createElement("div");
       msg.className = "ml-section ml-empty";
       msg.textContent = "Loading library media gallery...";
@@ -3012,7 +3562,7 @@ class LibraryGalleryView {
     const title = document.createElement("span");
     title.className = "ml-title";
     title.textContent = "Library Gallery";
-    titleWrap.append(title, createInfoTip("Browse localized media and character expressions across your entire library. Toggle Group to inspect cards by character (avatar first) or view all sorted media flat."));
+    titleWrap.append(title, createInfoTip("Browse localized media and character expressions across your entire library. Search by character name, tag (e.g. tag:fantasy or #fantasy), filename, or expression."));
     const rightBtns = document.createElement("div");
     rightBtns.className = "ml-header-actions";
     const groupBtn = createIconButton({
@@ -3023,6 +3573,7 @@ class LibraryGalleryView {
       size: 13,
       onClick: () => {
         this.grouped = !this.grouped;
+        this.currentPage = 1;
         if (!this.grouped) {
           this.activeCharacterId = null;
           if (this.sortMode === "count") {
@@ -3032,6 +3583,7 @@ class LibraryGalleryView {
         }
         if (this.sortMode === "random")
           this.reshuffleRandomOrder();
+        this.emitStateChange();
         this.render();
       }
     });
@@ -3043,8 +3595,10 @@ class LibraryGalleryView {
       size: 13,
       onClick: () => {
         this.includeEmptyCharacters = !this.includeEmptyCharacters;
+        this.currentPage = 1;
         if (this.sortMode === "random")
           this.reshuffleRandomOrder();
+        this.emitStateChange();
         if (this.includeEmptyCharacters && !this.loadedIncludeEmpty) {
           this.render();
           this.refresh();
@@ -3060,6 +3614,7 @@ class LibraryGalleryView {
       size: 13,
       onClick: () => {
         this.viewMode = "grid";
+        this.emitStateChange();
         this.render();
       }
     });
@@ -3070,6 +3625,7 @@ class LibraryGalleryView {
       size: 13,
       onClick: () => {
         this.viewMode = "list";
+        this.emitStateChange();
         this.render();
       }
     });
@@ -3088,18 +3644,13 @@ class LibraryGalleryView {
     const searchInput = document.createElement("input");
     searchInput.type = "search";
     searchInput.className = "ml-input-text";
-    searchInput.placeholder = "Search character, filename, expression...";
+    searchInput.placeholder = "Search name, tag, tag:name, filename...";
     searchInput.value = this.searchQuery;
     searchInput.addEventListener("input", () => {
       this.searchQuery = searchInput.value;
-      const bodyOnly = this.root.querySelector(".ml-gallery-content-slot");
-      if (bodyOnly) {
-        const selectedChar = this.activeCharacterId ? this.characters?.find((c) => c.characterId === this.activeCharacterId) : undefined;
-        const nextContent = this.grouped ? selectedChar ? this.renderCharacterDrilldown(selectedChar) : this.renderGroupedCharacters(this.characters ?? []) : this.renderFlatMedia(this.characters ?? []);
-        bodyOnly.replaceWith(nextContent);
-      } else {
-        this.render();
-      }
+      this.currentPage = 1;
+      this.emitStateChange();
+      this.rerenderContentSlot();
     });
     const sortGroup = document.createElement("div");
     sortGroup.className = "ml-sort-group";
@@ -3128,13 +3679,16 @@ class LibraryGalleryView {
         opt.selected = true;
       sortSelect.appendChild(opt);
     }
+    sortSelect.value = sortOpts.some((o) => o.value === this.sortMode) ? this.sortMode : sortOpts[0]?.value ?? "name";
     sortSelect.addEventListener("change", () => {
       this.sortMode = sortSelect.value;
+      this.currentPage = 1;
       if (this.sortMode === "random") {
         this.reshuffleRandomOrder();
       } else {
         this.sortDirection = defaultDirectionForSort(this.sortMode);
       }
+      this.emitStateChange();
       this.render();
     });
     const sortDirBtn = this.sortMode === "random" ? createIconButton({
@@ -3144,6 +3698,8 @@ class LibraryGalleryView {
       size: 13,
       onClick: () => {
         this.reshuffleRandomOrder();
+        this.currentPage = 1;
+        this.emitStateChange();
         this.render();
       }
     }) : createIconButton({
@@ -3153,6 +3709,8 @@ class LibraryGalleryView {
       size: 13,
       onClick: () => {
         this.sortDirection = this.sortDirection === "asc" ? "desc" : "asc";
+        this.currentPage = 1;
+        this.emitStateChange();
         this.render();
       }
     });
@@ -3168,6 +3726,8 @@ class LibraryGalleryView {
     allPill.title = "Turn on all media types";
     allPill.addEventListener("click", () => {
       this.selectedMediaTypes = new Set(ALL_GALLERY_MEDIA_TYPES);
+      this.currentPage = 1;
+      this.emitStateChange();
       this.render();
     });
     row3.appendChild(allPill);
@@ -3190,6 +3750,8 @@ class LibraryGalleryView {
         } else {
           this.selectedMediaTypes.add(def.type);
         }
+        this.currentPage = 1;
+        this.emitStateChange();
         this.render();
       });
       row3.appendChild(pill);
@@ -3197,60 +3759,105 @@ class LibraryGalleryView {
     box.append(row1, row2, row3);
     return box;
   }
-  getCharEntries(char, includeAvatar) {
-    const out = [];
-    if (includeAvatar && char.avatarUrl && this.selectedMediaTypes.has("avatar")) {
-      out.push({
-        characterId: char.characterId,
-        characterName: char.characterName,
-        title: `${char.characterName} — Avatar`,
-        subtitle: "Character card avatar",
-        localUrl: char.avatarUrl,
-        mediaKind: "image",
-        sizeBytes: 0,
-        localizedAt: char.lastLocalizedAt,
-        isExpression: false,
-        isAvatar: true,
-        badgeText: "Avatar",
-        searchBlob: `${char.characterName} avatar`.toLowerCase()
-      });
+  rerenderContentSlot() {
+    if (this.destroyed)
+      return;
+    if (!this.characters) {
+      this.render();
+      return;
     }
-    for (const asset of char.localizedAssets) {
+    const bodyOnly = this.root.querySelector(".ml-gallery-content-slot");
+    if (bodyOnly) {
+      const selectedChar = this.activeCharacterId ? this.characters.find((c) => c.characterId === this.activeCharacterId) : undefined;
+      const nextContent = this.grouped ? selectedChar ? this.renderCharacterDrilldown(selectedChar) : this.renderGroupedCharacters(this.characters) : this.renderFlatMedia(this.characters);
+      bodyOnly.replaceWith(nextContent);
+    } else {
+      this.render();
+    }
+  }
+  getPrecomputedChar(char) {
+    let cached = this.precomputedCharCache.get(char);
+    if (cached)
+      return cached;
+    const lowerTags = Array.isArray(char.tags) ? char.tags.map((t) => t.toLowerCase()).filter(Boolean) : [];
+    const lowerName = char.characterName.toLowerCase();
+    const avatarEntry = char.avatarUrl ? {
+      characterId: char.characterId,
+      characterName: char.characterName,
+      lowerTags,
+      title: `${char.characterName} — Avatar`,
+      subtitle: "Character card avatar",
+      localUrl: char.avatarUrl,
+      mediaKind: "image",
+      sizeBytes: 0,
+      localizedAt: char.lastLocalizedAt,
+      isExpression: false,
+      isAvatar: true,
+      badgeText: "Avatar",
+      searchBlob: `${lowerName} avatar`
+    } : null;
+    const localizedEntries = char.localizedAssets.map((asset) => {
       const kind = inferKind(asset.mimeType, asset.filename);
-      if (!this.selectedMediaTypes.has(kind))
-        continue;
-      out.push({
-        characterId: char.characterId,
-        characterName: char.characterName,
-        title: asset.filename,
-        subtitle: `${char.characterName} · ${formatBytes(asset.sizeBytes)}`,
-        localUrl: asset.localUrl,
-        mediaKind: kind,
-        sizeBytes: asset.sizeBytes,
-        localizedAt: asset.localizedAt,
-        isExpression: false,
-        isAvatar: false,
-        badgeText: kind === "video" ? "Video" : "Localized",
-        originalUrl: asset.normalizedUrl,
-        searchBlob: `${char.characterName} ${asset.filename} ${asset.normalizedUrl}`.toLowerCase()
-      });
-    }
-    if (this.selectedMediaTypes.has("expression")) {
-      for (const expr of char.expressions) {
-        out.push({
+      return {
+        kind,
+        entry: {
           characterId: char.characterId,
           characterName: char.characterName,
-          title: expr.label,
-          subtitle: `${char.characterName} · Expression${expr.groupName ? ` (${expr.groupName})` : ""}`,
-          localUrl: expr.localUrl,
-          mediaKind: "image",
-          sizeBytes: 0,
-          localizedAt: char.lastLocalizedAt,
-          isExpression: true,
+          lowerTags,
+          title: asset.filename,
+          subtitle: `${char.characterName} · ${formatBytes(asset.sizeBytes)}`,
+          localUrl: asset.localUrl,
+          mediaKind: kind,
+          sizeBytes: asset.sizeBytes,
+          localizedAt: asset.localizedAt,
+          isExpression: false,
           isAvatar: false,
-          badgeText: "Expr",
-          searchBlob: `${char.characterName} ${expr.label} ${expr.groupName ?? ""} expression`.toLowerCase()
-        });
+          badgeText: kind === "video" ? "Video" : "Localized",
+          originalUrl: asset.normalizedUrl,
+          searchBlob: `${lowerName} ${asset.filename} ${asset.normalizedUrl}`.toLowerCase()
+        }
+      };
+    });
+    const expressionEntries = char.expressions.map((expr) => ({
+      characterId: char.characterId,
+      characterName: char.characterName,
+      lowerTags,
+      title: expr.label,
+      subtitle: `${char.characterName} · Expression${expr.groupName ? ` (${expr.groupName})` : ""}`,
+      localUrl: expr.localUrl,
+      mediaKind: "image",
+      sizeBytes: 0,
+      localizedAt: char.lastLocalizedAt,
+      isExpression: true,
+      isAvatar: false,
+      badgeText: "Expr",
+      searchBlob: `${lowerName} ${expr.label} ${expr.groupName ?? ""} expression`.toLowerCase()
+    }));
+    cached = {
+      lowerName,
+      lowerTags,
+      hasMedia: hasCharacterMedia(char),
+      avatarEntry,
+      localizedEntries,
+      expressionEntries
+    };
+    this.precomputedCharCache.set(char, cached);
+    return cached;
+  }
+  getCharEntries(char, includeAvatar) {
+    const pre = this.getPrecomputedChar(char);
+    const out = [];
+    if (includeAvatar && pre.avatarEntry && this.selectedMediaTypes.has("avatar")) {
+      out.push(pre.avatarEntry);
+    }
+    for (const item of pre.localizedEntries) {
+      if (this.selectedMediaTypes.has(item.kind)) {
+        out.push(item.entry);
+      }
+    }
+    if (this.selectedMediaTypes.has("expression")) {
+      for (const exprEntry of pre.expressionEntries) {
+        out.push(exprEntry);
       }
     }
     return out;
@@ -3258,7 +3865,9 @@ class LibraryGalleryView {
   sortFlatEntries(entries, options) {
     const entryKey = (e) => `item:${e.characterId}:${e.badgeText}:${e.localUrl}:${e.title}`;
     if (this.sortMode === "random") {
-      return entries.sort((a, b) => this.getRandomWeight(entryKey(a)) - this.getRandomWeight(entryKey(b)));
+      entries.sort((a, b) => this.getRandomWeight(entryKey(a)) - this.getRandomWeight(entryKey(b)));
+      this.flushRandomWeightsCache();
+      return entries;
     }
     const dir = this.sortDirection === "asc" ? 1 : -1;
     const pinAvatar = Boolean(options?.pinAvatarFirst);
@@ -3267,49 +3876,149 @@ class LibraryGalleryView {
         return a.isAvatar ? -1 : 1;
       }
       if (this.sortMode === "name") {
-        return (a.characterName.localeCompare(b.characterName) || a.title.localeCompare(b.title)) * dir;
+        return (GALLERY_COLLATOR.compare(a.characterName, b.characterName) || GALLERY_COLLATOR.compare(a.title, b.title)) * dir;
       }
       if (this.sortMode === "size") {
-        return (a.sizeBytes - b.sizeBytes) * dir || (a.localizedAt - b.localizedAt) * dir || a.title.localeCompare(b.title);
+        return (a.sizeBytes - b.sizeBytes) * dir || (a.localizedAt - b.localizedAt) * dir || GALLERY_COLLATOR.compare(a.title, b.title);
       }
-      return (a.localizedAt - b.localizedAt) * dir || a.characterName.localeCompare(b.characterName) || a.title.localeCompare(b.title);
+      return (a.localizedAt - b.localizedAt) * dir || GALLERY_COLLATOR.compare(a.characterName, b.characterName) || GALLERY_COLLATOR.compare(a.title, b.title);
     });
+  }
+  buildPaginationBar(options) {
+    const bar = document.createElement("div");
+    bar.className = "ml-gallery-pagination";
+    const info = document.createElement("div");
+    info.className = "ml-gallery-pagination-info";
+    const summary = document.createElement("span");
+    summary.textContent = options.totalPages > 1 ? `Showing ${options.startIndex + 1}–${options.endIndex} of ${options.totalItems} ${options.unitLabel}` : `${options.totalItems} ${options.unitLabel}`;
+    info.appendChild(summary);
+    if (options.includePageSizeSelect) {
+      const sizeSelect = document.createElement("select");
+      sizeSelect.className = "ml-select is-sm";
+      sizeSelect.title = "Items per page";
+      for (const size of GALLERY_PAGE_SIZE_OPTIONS) {
+        const opt = document.createElement("option");
+        opt.value = String(size);
+        opt.textContent = size === 0 ? "Show: All" : `${size} / page`;
+        if (size === this.pageSize)
+          opt.selected = true;
+        sizeSelect.appendChild(opt);
+      }
+      sizeSelect.value = String(this.pageSize);
+      sizeSelect.addEventListener("change", () => {
+        this.pageSize = Number(sizeSelect.value);
+        this.currentPage = 1;
+        this.emitStateChange();
+        this.rerenderContentSlot();
+      });
+      info.appendChild(sizeSelect);
+    }
+    bar.appendChild(info);
+    if (options.totalPages > 1) {
+      const actions = document.createElement("div");
+      actions.className = "ml-gallery-pagination-actions";
+      const goToPage = (nextPage) => {
+        this.currentPage = Math.max(1, Math.min(options.totalPages, nextPage));
+        this.emitStateChange();
+        this.rerenderContentSlot();
+        if (options.scrollToTopOnFlip) {
+          this.callbacks.onScrollToTop?.();
+        }
+      };
+      const prevBtn = createIconButton({
+        icon: "chevron-left",
+        label: "Prev",
+        title: "Previous page",
+        className: "ml-btn is-sm",
+        size: 12,
+        disabled: options.page <= 1,
+        onClick: () => goToPage(options.page - 1)
+      });
+      const pageLabel = document.createElement("span");
+      pageLabel.className = "ml-url-sources";
+      pageLabel.textContent = `Page ${options.page} / ${options.totalPages}`;
+      const nextBtn = createIconButton({
+        icon: "chevron-right",
+        label: "Next",
+        title: "Next page",
+        className: "ml-btn is-sm",
+        size: 12,
+        disabled: options.page >= options.totalPages,
+        onClick: () => goToPage(options.page + 1)
+      });
+      actions.append(prevBtn, pageLabel, nextBtn);
+      bar.appendChild(actions);
+    }
+    return bar;
+  }
+  appendPaginatedContent(slot, items, unitLabel, renderPageItems) {
+    const totalItems = items.length;
+    const effectiveSize = this.pageSize > 0 ? this.pageSize : totalItems;
+    const totalPages = Math.max(1, Math.ceil(totalItems / Math.max(1, effectiveSize)));
+    const page = Math.max(1, Math.min(totalPages, this.currentPage));
+    this.currentPage = page;
+    const startIndex = (page - 1) * effectiveSize;
+    const endIndex = Math.min(totalItems, startIndex + effectiveSize);
+    const pageItems = this.pageSize > 0 ? items.slice(startIndex, endIndex) : items;
+    slot.appendChild(this.buildPaginationBar({
+      totalItems,
+      startIndex,
+      endIndex,
+      page,
+      totalPages,
+      unitLabel,
+      includePageSizeSelect: true
+    }));
+    slot.appendChild(renderPageItems(pageItems));
+    if (totalPages > 1 && pageItems.length >= 12) {
+      slot.appendChild(this.buildPaginationBar({
+        totalItems,
+        startIndex,
+        endIndex,
+        page,
+        totalPages,
+        unitLabel,
+        includePageSizeSelect: false,
+        scrollToTopOnFlip: true
+      }));
+    }
   }
   renderGroupedCharacters(chars) {
     const slot = document.createElement("div");
     slot.className = "ml-section ml-gallery-content-slot";
-    const q = this.searchQuery.trim().toLowerCase();
+    const parsedQuery = parseGallerySearchQuery(this.searchQuery);
     const filtered = chars.filter((char) => {
-      if (!this.includeEmptyCharacters && !hasCharacterMedia(char)) {
+      const pre = this.getPrecomputedChar(char);
+      if (!this.includeEmptyCharacters && !pre.hasMedia) {
         return false;
       }
       const entries = this.getCharEntries(char, true);
       if (!this.includeEmptyCharacters && entries.length === 0) {
         return false;
       }
-      if (!q)
+      if (!parsedQuery.hasQuery)
         return true;
-      if (char.characterName.toLowerCase().includes(q))
-        return true;
-      return entries.some((e) => e.searchBlob.includes(q));
+      const haystacks = [pre.lowerName, ...entries.map((e) => e.searchBlob)];
+      return matchesSearchText(haystacks, pre.lowerTags, parsedQuery);
     });
     if (this.sortMode === "random") {
       filtered.sort((a, b) => this.getRandomWeight(`char:${a.characterId}`) - this.getRandomWeight(`char:${b.characterId}`));
+      this.flushRandomWeightsCache();
     } else {
       const dir = this.sortDirection === "asc" ? 1 : -1;
       filtered.sort((a, b) => {
         const countA = a.localizedAssets.length + a.expressions.length;
         const countB = b.localizedAssets.length + b.expressions.length;
         if (this.sortMode === "count") {
-          return (countA - countB) * dir || a.characterName.localeCompare(b.characterName);
+          return (countA - countB) * dir || GALLERY_COLLATOR.compare(a.characterName, b.characterName);
         }
         if (this.sortMode === "size") {
-          return (a.totalSizeBytes - b.totalSizeBytes) * dir || a.characterName.localeCompare(b.characterName);
+          return (a.totalSizeBytes - b.totalSizeBytes) * dir || GALLERY_COLLATOR.compare(a.characterName, b.characterName);
         }
         if (this.sortMode === "recent") {
-          return (a.lastLocalizedAt - b.lastLocalizedAt) * dir || a.characterName.localeCompare(b.characterName);
+          return (a.lastLocalizedAt - b.lastLocalizedAt) * dir || GALLERY_COLLATOR.compare(a.characterName, b.characterName);
         }
-        return a.characterName.localeCompare(b.characterName) * dir;
+        return GALLERY_COLLATOR.compare(a.characterName, b.characterName) * dir;
       });
     }
     if (filtered.length === 0) {
@@ -3321,84 +4030,94 @@ class LibraryGalleryView {
     }
     const openDrilldown = (characterId) => {
       this.activeCharacterId = characterId;
+      this.currentPage = 1;
       if (this.sortMode === "random")
         this.reshuffleRandomOrder();
+      this.emitStateChange();
       this.render();
     };
-    if (this.viewMode === "list") {
-      const list = document.createElement("div");
-      list.className = "ml-media-list";
-      for (const char of filtered) {
-        const row = document.createElement("div");
-        row.className = "ml-media-list-row";
-        row.addEventListener("click", () => openDrilldown(char.characterId));
+    this.appendPaginatedContent(slot, filtered, "cards", (pageChars) => {
+      if (this.viewMode === "list") {
+        const list = document.createElement("div");
+        list.className = "ml-media-list";
+        for (const char of pageChars) {
+          const row = document.createElement("div");
+          row.className = "ml-media-list-row";
+          row.addEventListener("click", () => openDrilldown(char.characterId));
+          const thumbUrl = char.avatarUrl ?? char.localizedAssets[0]?.localUrl ?? char.expressions[0]?.localUrl;
+          if (thumbUrl) {
+            row.appendChild(createLazyMediaElement({
+              src: thumbUrl,
+              mediaKind: "image",
+              alt: char.characterName,
+              className: "ml-media-list-thumb"
+            }));
+          }
+          const meta = document.createElement("div");
+          meta.className = "ml-url-meta";
+          const name = document.createElement("div");
+          name.className = "ml-url-text";
+          name.textContent = char.characterName;
+          const sub = document.createElement("div");
+          sub.className = "ml-url-sources";
+          sub.textContent = formatCharacterSummary(char);
+          if (char.tags && char.tags.length > 0) {
+            row.title = `Tags: ${char.tags.join(", ")}`;
+          }
+          meta.append(name, sub);
+          const chevron = createIcon("chevron-right", 14);
+          row.append(meta, chevron);
+          list.appendChild(row);
+        }
+        return list;
+      }
+      const grid = document.createElement("div");
+      grid.className = "ml-char-card-grid";
+      for (const char of pageChars) {
+        const card = document.createElement("button");
+        card.type = "button";
+        card.className = "ml-char-card";
+        card.addEventListener("click", () => openDrilldown(char.characterId));
+        if (char.tags && char.tags.length > 0) {
+          card.title = `${char.characterName}
+Tags: ${char.tags.join(", ")}`;
+        }
         const thumbUrl = char.avatarUrl ?? char.localizedAssets[0]?.localUrl ?? char.expressions[0]?.localUrl;
+        const mediaWrap = document.createElement("div");
+        mediaWrap.className = "ml-char-card-thumb-wrap";
         if (thumbUrl) {
-          row.appendChild(createLazyMediaElement({
+          mediaWrap.appendChild(createLazyMediaElement({
             src: thumbUrl,
             mediaKind: "image",
             alt: char.characterName,
-            className: "ml-media-list-thumb"
+            className: "ml-char-card-thumb"
           }));
+        } else {
+          const placeholder = document.createElement("div");
+          placeholder.className = "ml-char-card-placeholder";
+          placeholder.appendChild(createIcon("image", 24));
+          mediaWrap.appendChild(placeholder);
         }
-        const meta = document.createElement("div");
-        meta.className = "ml-url-meta";
-        const name = document.createElement("div");
-        name.className = "ml-url-text";
-        name.textContent = char.characterName;
-        const sub = document.createElement("div");
-        sub.className = "ml-url-sources";
-        sub.textContent = formatCharacterSummary(char);
-        meta.append(name, sub);
-        const chevron = createIcon("chevron-right", 14);
-        row.append(meta, chevron);
-        list.appendChild(row);
+        const countPill = document.createElement("span");
+        countPill.className = "ml-tile-badge";
+        const total = char.localizedAssets.length + char.expressions.length;
+        countPill.textContent = `${total}`;
+        mediaWrap.appendChild(countPill);
+        const footer = document.createElement("div");
+        footer.className = "ml-char-card-footer";
+        const nameEl = document.createElement("div");
+        nameEl.className = "ml-char-card-name";
+        nameEl.textContent = char.characterName;
+        nameEl.title = char.characterName;
+        const statLine = document.createElement("div");
+        statLine.className = "ml-url-sources";
+        statLine.textContent = formatCharacterSummary(char);
+        footer.append(nameEl, statLine);
+        card.append(mediaWrap, footer);
+        grid.appendChild(card);
       }
-      slot.appendChild(list);
-      return slot;
-    }
-    const grid = document.createElement("div");
-    grid.className = "ml-char-card-grid";
-    for (const char of filtered) {
-      const card = document.createElement("button");
-      card.type = "button";
-      card.className = "ml-char-card";
-      card.addEventListener("click", () => openDrilldown(char.characterId));
-      const thumbUrl = char.avatarUrl ?? char.localizedAssets[0]?.localUrl ?? char.expressions[0]?.localUrl;
-      const mediaWrap = document.createElement("div");
-      mediaWrap.className = "ml-char-card-thumb-wrap";
-      if (thumbUrl) {
-        mediaWrap.appendChild(createLazyMediaElement({
-          src: thumbUrl,
-          mediaKind: "image",
-          alt: char.characterName,
-          className: "ml-char-card-thumb"
-        }));
-      } else {
-        const placeholder = document.createElement("div");
-        placeholder.className = "ml-char-card-placeholder";
-        placeholder.appendChild(createIcon("image", 24));
-        mediaWrap.appendChild(placeholder);
-      }
-      const countPill = document.createElement("span");
-      countPill.className = "ml-tile-badge";
-      const total = char.localizedAssets.length + char.expressions.length;
-      countPill.textContent = `${total}`;
-      mediaWrap.appendChild(countPill);
-      const footer = document.createElement("div");
-      footer.className = "ml-char-card-footer";
-      const nameEl = document.createElement("div");
-      nameEl.className = "ml-char-card-name";
-      nameEl.textContent = char.characterName;
-      nameEl.title = char.characterName;
-      const statLine = document.createElement("div");
-      statLine.className = "ml-url-sources";
-      statLine.textContent = formatCharacterSummary(char);
-      footer.append(nameEl, statLine);
-      card.append(mediaWrap, footer);
-      grid.appendChild(card);
-    }
-    slot.appendChild(grid);
+      return grid;
+    });
     return slot;
   }
   renderCharacterDrilldown(char) {
@@ -3414,8 +4133,10 @@ class LibraryGalleryView {
       size: 13,
       onClick: () => {
         this.activeCharacterId = null;
+        this.currentPage = 1;
         if (this.sortMode === "random")
           this.reshuffleRandomOrder();
+        this.emitStateChange();
         this.render();
       }
     });
@@ -3446,29 +4167,29 @@ class LibraryGalleryView {
     }
     top.append(backBtn, charLabel, actions);
     slot.appendChild(top);
-    const q = this.searchQuery.trim().toLowerCase();
-    const entries = this.sortFlatEntries(this.getCharEntries(char, true).filter((e) => !q || e.searchBlob.includes(q)), { pinAvatarFirst: this.sortMode !== "random" });
+    const parsedQuery = parseGallerySearchQuery(this.searchQuery);
+    const entries = this.sortFlatEntries(this.getCharEntries(char, true).filter((e) => matchesSearchText([e.searchBlob], e.lowerTags, parsedQuery)), { pinAvatarFirst: this.sortMode !== "random" });
     if (entries.length === 0) {
       const empty = document.createElement("div");
       empty.className = "ml-empty";
-      empty.textContent = this.selectedMediaTypes.size === 0 ? "No media types selected. Click All Media or enable a media type." : !hasCharacterMedia(char) && !q ? "No localized media yet. Click Manage to scan and localize this character." : "No items match the current filter.";
+      empty.textContent = this.selectedMediaTypes.size === 0 ? "No media types selected. Click All Media or enable a media type." : !hasCharacterMedia(char) && !parsedQuery.hasQuery ? "No localized media yet. Click Manage to scan and localize this character." : "No items match the current filter.";
       slot.appendChild(empty);
       return slot;
     }
-    slot.appendChild(this.renderMediaEntries(entries));
+    this.appendPaginatedContent(slot, entries, "items", (pageEntries) => this.renderMediaEntries(pageEntries));
     return slot;
   }
   renderFlatMedia(chars) {
     const slot = document.createElement("div");
     slot.className = "ml-section ml-gallery-content-slot";
-    const q = this.searchQuery.trim().toLowerCase();
+    const parsedQuery = parseGallerySearchQuery(this.searchQuery);
     const entries = [];
     for (const char of chars) {
       if (!this.includeEmptyCharacters && !hasCharacterMedia(char)) {
         continue;
       }
       for (const entry of this.getCharEntries(char, true)) {
-        if (!q || entry.searchBlob.includes(q)) {
+        if (matchesSearchText([entry.searchBlob], entry.lowerTags, parsedQuery)) {
           entries.push(entry);
         }
       }
@@ -3481,7 +4202,7 @@ class LibraryGalleryView {
       slot.appendChild(empty);
       return slot;
     }
-    slot.appendChild(this.renderMediaEntries(entries));
+    this.appendPaginatedContent(slot, entries, "items", (pageEntries) => this.renderMediaEntries(pageEntries));
     return slot;
   }
   renderMediaEntries(entries) {
@@ -3502,10 +4223,9 @@ class LibraryGalleryView {
       badgeText: e.badgeText,
       onRemove: !e.isAvatar && !e.isExpression && e.originalUrl ? async () => {
         await this.callbacks.onPurgeAsset(e.characterId, e.originalUrl);
-        await this.refresh();
       } : undefined
     }));
-    const onAfterRemove = () => void this.refresh();
+    const onAfterRemove = () => void this.refresh({ reshuffleRandom: false });
     if (this.viewMode === "list") {
       const list = document.createElement("div");
       list.className = "ml-media-list";
@@ -3572,6 +4292,25 @@ ${entry.subtitle}`;
 }
 
 // src/ui/drawer-panel.ts
+var GALLERY_PREFS_STORAGE_KEY = "lumiverse.media_localizer.gallery_prefs.v1";
+var CHARACTER_PREFS_STORAGE_KEY = "lumiverse.media_localizer.character_prefs.v1";
+var LIBRARY_BATCH_PAGE_SIZE = 50;
+function loadPrefsFromStorage(key, sanitize, fallback) {
+  try {
+    const raw = globalThis.localStorage?.getItem?.(key);
+    if (!raw)
+      return fallback();
+    return sanitize(JSON.parse(raw));
+  } catch {
+    return fallback();
+  }
+}
+function savePrefsToStorage(key, prefs) {
+  try {
+    globalThis.localStorage?.setItem?.(key, JSON.stringify(prefs));
+  } catch {}
+}
+
 class MediaLocalizerDrawerPanel {
   ctx;
   settings;
@@ -3583,11 +4322,29 @@ class MediaLocalizerDrawerPanel {
   stickyBannerHost = null;
   navButtons = new Map;
   characterWidget = null;
+  characterUiState = {
+    ...loadPrefsFromStorage(CHARACTER_PREFS_STORAGE_KEY, sanitizeCharacterPreferences, () => getDefaultCharacterPreferences(true)),
+    expandedUrls: []
+  };
+  characterScanCache = new Map;
   galleryView = null;
+  galleryState = {
+    ...loadPrefsFromStorage(GALLERY_PREFS_STORAGE_KEY, sanitizeGalleryPreferences, getDefaultGalleryPreferences),
+    searchQuery: "",
+    currentPage: 1,
+    activeCharacterId: null
+  };
+  galleryCache = {
+    characters: null,
+    loadedIncludeEmpty: false
+  };
   actionError = null;
+  mountGen = 0;
   libraryScanning = false;
   librarySummaries = null;
+  librarySummariesStale = false;
   libraryTotalRemote = 0;
+  libraryPage = 1;
   librarySelectedCharIds = new Set;
   libraryExpandedCharIds = new Set;
   librarySelectedSections = new Set;
@@ -3605,6 +4362,7 @@ class MediaLocalizerDrawerPanel {
     this.libraryBatchCap = settings.defaultBatchCap;
   }
   mount(container) {
+    const mountGen = ++this.mountGen;
     container.innerHTML = "";
     const root = document.createElement("div");
     root.className = "ml-drawer-root";
@@ -3639,16 +4397,22 @@ class MediaLocalizerDrawerPanel {
     this.renderStickyQueueBanner();
     this.renderBody();
     return () => {
+      if (this.mountGen === mountGen) {
+        this.mountGen++;
+      }
+      this.characterWidget?.flushPendingOverrideSave();
       this.characterWidget?.destroy();
       this.characterWidget = null;
       this.bodyEl = null;
       this.stickyBannerHost = null;
+      this.galleryView?.destroy();
       this.galleryView = null;
       this.navButtons.clear();
     };
   }
   setActiveTab(tab, characterId, options) {
     this.activeTab = tab;
+    this.actionError = null;
     if (characterId !== undefined) {
       this.inspectedCharacterId = characterId;
     }
@@ -3667,15 +4431,25 @@ class MediaLocalizerDrawerPanel {
     this.stickyBannerHost.appendChild(renderQueueBanner(this.queueProgress, this.callbacks.onQueueControl));
   }
   updateExternalState(settings, stats, queueProgress) {
+    const prevSettings = this.settings;
     const prevStatus = this.queueProgress.status;
     const prevStatsAssets = this.stats.totalAssets;
+    const prevStatsFailed = this.stats.totalFailedUrls;
+    const scanSettingsChanged = settings.scanBareUrls !== prevSettings.scanBareUrls || settings.adoptNativeGalleryImages !== prevSettings.adoptNativeGalleryImages;
     const dataChanged = JSON.stringify(settings) !== JSON.stringify(this.settings) || JSON.stringify(stats) !== JSON.stringify(this.stats);
     this.settings = settings;
     this.stats = stats;
     this.queueProgress = queueProgress;
     this.renderStickyQueueBanner();
-    if (stats.totalAssets !== prevStatsAssets) {
-      this.galleryView?.invalidateCache();
+    const wasActive = isQueueActiveStatus(prevStatus);
+    const nowActive = isQueueActiveStatus(queueProgress.status);
+    const galleryInvalidated = stats.totalAssets !== prevStatsAssets;
+    if (galleryInvalidated) {
+      this.invalidateGalleryCache();
+    }
+    if (galleryInvalidated || stats.totalFailedUrls !== prevStatsFailed || wasActive && !nowActive || scanSettingsChanged) {
+      this.invalidateCharacterCache();
+      this.invalidateLibrarySummaries();
     }
     if (this.activeTab === "character") {
       const nextId = this.resolveCurrentCharacterId();
@@ -3692,11 +4466,9 @@ class MediaLocalizerDrawerPanel {
     }
     if (!this.bodyEl)
       return;
-    const wasActive = isQueueActiveStatus(prevStatus);
-    const nowActive = isQueueActiveStatus(queueProgress.status);
     if (this.activeTab === "gallery") {
-      if (wasActive && !nowActive) {
-        this.galleryView?.refresh();
+      if (wasActive && !nowActive || galleryInvalidated) {
+        this.galleryView?.refresh({ reshuffleRandom: false });
       }
       return;
     }
@@ -3709,13 +4481,19 @@ class MediaLocalizerDrawerPanel {
       return;
     this.renderBody();
   }
-  async guard(fn) {
+  async guard(fn, expectedTab = this.activeTab) {
+    const mountGen = this.mountGen;
     try {
       this.actionError = null;
       await fn();
+      return true;
     } catch (err) {
+      if (!this.bodyEl || this.mountGen !== mountGen || this.activeTab !== expectedTab) {
+        return false;
+      }
       this.actionError = err instanceof Error ? err.message : String(err);
       this.renderBody();
+      return false;
     }
   }
   notifyActiveChatChanged() {
@@ -3733,8 +4511,35 @@ class MediaLocalizerDrawerPanel {
       this.renderBody();
     }
   }
-  refreshActiveScan(characterId) {
+  invalidateCharacterCache(characterId) {
+    if (characterId) {
+      this.characterScanCache.delete(characterId);
+    } else {
+      this.characterScanCache.clear();
+    }
+  }
+  invalidateGalleryCache() {
+    this.galleryCache = {
+      characters: null,
+      loadedIncludeEmpty: false,
+      randomWeights: this.galleryCache.randomWeights
+    };
     this.galleryView?.invalidateCache();
+  }
+  invalidateLibrarySummaries() {
+    this.librarySummaries = null;
+    this.librarySummariesStale = false;
+    this.librarySelectedCharIds.clear();
+    this.libraryExpandedCharIds.clear();
+    this.libraryPage = 1;
+  }
+  refreshActiveScan(characterId) {
+    this.invalidateGalleryCache();
+    this.invalidateCharacterCache(characterId);
+    this.invalidateLibrarySummaries();
+    if (this.activeTab === "gallery" && this.bodyEl && this.galleryView) {
+      this.galleryView.refresh({ reshuffleRandom: false });
+    }
     if (!this.characterWidget) {
       if (this.activeTab === "character" && this.bodyEl && this.resolveCurrentCharacterId()) {
         this.renderBody();
@@ -3785,12 +4590,12 @@ class MediaLocalizerDrawerPanel {
         savedInnerScrolls.set(id, el.scrollTop);
       }
     }
+    this.characterWidget?.flushPendingOverrideSave();
     this.characterWidget?.destroy();
     this.characterWidget = null;
+    this.galleryView?.destroy();
+    this.galleryView = null;
     body.innerHTML = "";
-    if (this.activeTab !== "gallery") {
-      this.galleryView = null;
-    }
     if (this.actionError) {
       const errBox = document.createElement("div");
       errBox.className = "ml-error-banner";
@@ -3822,25 +4627,85 @@ class MediaLocalizerDrawerPanel {
       body.appendChild(empty);
       return;
     }
-    const defaultExpandConfig = this.expandNextCharacterConfig;
+    const forceExpandConfig = this.expandNextCharacterConfig;
     this.expandNextCharacterConfig = false;
+    if (forceExpandConfig && !this.characterUiState.showDownloadConfig) {
+      this.characterUiState = {
+        ...this.characterUiState,
+        showDownloadConfig: true
+      };
+      savePrefsToStorage(CHARACTER_PREFS_STORAGE_KEY, sanitizeCharacterPreferences(this.characterUiState, true));
+    }
+    const cachedScan = this.characterScanCache.get(charId) ?? null;
     const host = document.createElement("div");
     host.className = "ml-gallery-host";
     host.style.marginTop = "0";
     body.appendChild(host);
-    const widget = new CharacterMediaWidget(host, this.ctx, charId, this.settings, this.queueProgress, this.callbacks, { inDrawer: true, defaultExpandConfig });
+    const widgetCallbacks = {
+      ...this.callbacks,
+      onPurgeCharacterCache: async (targetCharId, urls) => {
+        await this.callbacks.onPurgeCharacterCache(targetCharId, urls);
+        this.invalidateGalleryCache();
+        this.invalidateLibrarySummaries();
+      }
+    };
+    const widget = new CharacterMediaWidget(host, this.ctx, charId, this.settings, this.queueProgress, widgetCallbacks, {
+      inDrawer: true,
+      defaultExpandConfig: this.characterUiState.showDownloadConfig,
+      defaultExpandDownloadedMedia: this.characterUiState.showDownloadedMedia,
+      initialUiState: this.characterUiState,
+      initialScan: cachedScan,
+      onUiStateChange: (nextState) => {
+        this.characterUiState = {
+          ...nextState,
+          expandedUrls: [...nextState.expandedUrls]
+        };
+        savePrefsToStorage(CHARACTER_PREFS_STORAGE_KEY, sanitizeCharacterPreferences(this.characterUiState, true));
+      },
+      onScanChange: (nextScan) => {
+        if (nextScan) {
+          this.characterScanCache.set(nextScan.characterId, nextScan);
+        }
+      }
+    });
     this.characterWidget = widget;
-    widget.refreshScan(false);
+    if (cachedScan) {
+      widget.render();
+    } else {
+      widget.refreshScan(false);
+    }
   }
   renderGalleryTab(body) {
     const host = document.createElement("div");
     body.appendChild(host);
     const gallery = new LibraryGalleryView(host, {
       onLoadLibraryMedia: this.callbacks.onListLibraryMedia,
-      onPurgeAsset: (characterId, normalizedUrl) => this.callbacks.onPurgeCharacterCache(characterId, [normalizedUrl]),
+      onPurgeAsset: async (characterId, normalizedUrl) => {
+        await this.callbacks.onPurgeCharacterCache(characterId, [normalizedUrl]);
+        this.invalidateCharacterCache(characterId);
+        this.invalidateLibrarySummaries();
+      },
       onOpenCharacterTab: (characterId) => {
         this.setActiveTab("character", characterId);
+      },
+      onStateChange: (nextState) => {
+        this.galleryState = {
+          ...nextState,
+          selectedMediaTypes: [...nextState.selectedMediaTypes]
+        };
+        savePrefsToStorage(GALLERY_PREFS_STORAGE_KEY, sanitizeGalleryPreferences(this.galleryState));
+      },
+      onCacheChange: (nextCache) => {
+        this.galleryCache = nextCache;
+      },
+      onScrollToTop: () => {
+        if (this.bodyEl) {
+          this.bodyEl.scrollTop = 0;
+        }
       }
+    }, {
+      state: this.galleryState,
+      cache: this.galleryCache
     });
     this.galleryView = gallery;
     gallery.render();
@@ -3865,20 +4730,28 @@ class MediaLocalizerDrawerPanel {
       size: 14,
       disabled: this.libraryScanning,
       onClick: async () => {
+        const mountGen = this.mountGen;
+        this.actionError = null;
         this.libraryScanning = true;
         if (this.activeTab === "library" && this.bodyEl) {
           this.renderBody();
         }
         try {
           const res = await this.callbacks.onScanLibrary(Boolean(this.librarySummaries));
+          if (!this.bodyEl || this.mountGen !== mountGen)
+            return;
           this.librarySummaries = res.characters;
+          this.librarySummariesStale = false;
           this.libraryTotalRemote = res.totalUniqueRemote;
+          this.libraryPage = 1;
           this.librarySelectedCharIds = new Set(res.characters.filter((c) => c.remoteCount + c.failedCount > 0).map((c) => c.characterId));
         } catch (err) {
-          this.actionError = err instanceof Error ? err.message : String(err);
+          if (this.bodyEl && this.mountGen === mountGen && this.activeTab === "library") {
+            this.actionError = err instanceof Error ? err.message : String(err);
+          }
         } finally {
           this.libraryScanning = false;
-          if (this.activeTab === "library" && this.bodyEl) {
+          if (this.activeTab === "library" && this.bodyEl && this.mountGen === mountGen) {
             this.renderBody();
           }
         }
@@ -3889,6 +4762,12 @@ class MediaLocalizerDrawerPanel {
     body.appendChild(scanBox);
     if (!this.librarySummaries)
       return;
+    if (this.librarySummariesStale) {
+      const staleNote = document.createElement("div");
+      staleNote.className = "ml-section-box ml-subtitle";
+      staleNote.textContent = "Library media changed since last scan. Click Rescan Library to refresh counts.";
+      body.appendChild(staleNote);
+    }
     const filterBox = document.createElement("div");
     filterBox.className = "ml-section-box";
     const secHeader = document.createElement("div");
@@ -3898,6 +4777,324 @@ class MediaLocalizerDrawerPanel {
     secLeft.append(document.createTextNode("1. Sections to Download"), createInfoTip("Only remote items found inside checked sections are queued across selected characters."));
     secHeader.appendChild(secLeft);
     filterBox.appendChild(secHeader);
+    let charHeaderTitle;
+    let listSlotEl;
+    let footerSlotEl;
+    const cardCheckboxes = new Map;
+    const updateHeaderSummary = () => {
+      charHeaderTitle.textContent = `2. Characters (${this.librarySelectedCharIds.size} selected · ${this.libraryTotalRemote} unique remote)`;
+    };
+    const buildCharDetails = (c) => {
+      const details = document.createElement("div");
+      details.className = "ml-item-details";
+      const statRow = document.createElement("div");
+      statRow.className = "ml-detail-kv-row";
+      const addMiniBadge = (label, variant = "") => {
+        const b = document.createElement("span");
+        b.className = `ml-badge ${variant}`.trim();
+        b.textContent = label;
+        statRow.appendChild(b);
+      };
+      addMiniBadge(`${c.totalUnique} Unique URLs`);
+      addMiniBadge(`${c.localizedCount} Localized`, "is-success");
+      addMiniBadge(`${c.remoteCount} Remote`, c.remoteCount > 0 ? "is-warn" : "");
+      if (c.failedCount > 0)
+        addMiniBadge(`${c.failedCount} Failed`, "is-danger");
+      if (c.localizedBytes > 0)
+        addMiniBadge(`Size: ${formatBytes(c.localizedBytes)}`);
+      details.appendChild(statRow);
+      const secList = document.createElement("div");
+      secList.className = "ml-detail-source-list";
+      for (const sec of ALL_MEDIA_SECTIONS) {
+        const count = c.sectionRemoteCounts[sec] || 0;
+        if (count === 0)
+          continue;
+        const chip = document.createElement("span");
+        chip.className = "ml-detail-source-chip";
+        chip.textContent = `${SECTION_LABELS[sec]}: ${count} remote`;
+        secList.appendChild(chip);
+      }
+      if (secList.childElementCount > 0) {
+        details.appendChild(secList);
+      }
+      const actionsRow = document.createElement("div");
+      actionsRow.className = "ml-detail-kv-row";
+      const inspectBtn = document.createElement("button");
+      inspectBtn.type = "button";
+      inspectBtn.className = "ml-btn is-sm is-primary";
+      inspectBtn.textContent = "Open in Character Tab ↗";
+      inspectBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        this.setActiveTab("character", c.characterId);
+      });
+      actionsRow.appendChild(inspectBtn);
+      details.appendChild(actionsRow);
+      return details;
+    };
+    const buildFooter = () => {
+      let estimatedMatching = 0;
+      let selectedLocalizedChars = 0;
+      for (const c of this.librarySummaries ?? []) {
+        if (!this.librarySelectedCharIds.has(c.characterId))
+          continue;
+        if (c.localizedCount > 0)
+          selectedLocalizedChars++;
+        let charSum = 0;
+        for (const sec of this.librarySelectedSections) {
+          charSum += c.sectionRemoteCounts[sec] || 0;
+        }
+        estimatedMatching += Math.min(c.remoteCount + c.failedCount, charSum);
+      }
+      const footer = document.createElement("div");
+      footer.className = "ml-download-bar";
+      const capLabel = document.createElement("label");
+      capLabel.className = "ml-toggle-label";
+      capLabel.textContent = "Limit:";
+      const capSelect = document.createElement("select");
+      capSelect.className = "ml-select is-sm";
+      for (const v of [10, 25, 50, 100, 250, 0]) {
+        const opt = document.createElement("option");
+        opt.value = String(v);
+        opt.textContent = v === 0 ? "Unlimited" : `Max ${v}`;
+        if (v === this.libraryBatchCap)
+          opt.selected = true;
+        capSelect.appendChild(opt);
+      }
+      capSelect.addEventListener("change", () => {
+        this.libraryBatchCap = Number(capSelect.value);
+        updateSummaryAndFooter();
+      });
+      capLabel.appendChild(capSelect);
+      const footerBtns = document.createElement("div");
+      footerBtns.className = "ml-header-actions";
+      if (selectedLocalizedChars > 0) {
+        footerBtns.appendChild(createIconButton({
+          icon: "trash",
+          label: `Remove (${selectedLocalizedChars})`,
+          title: `Remove all localized cache assets for ${selectedLocalizedChars} selected character(s)`,
+          className: "ml-btn is-danger is-sm",
+          size: 13,
+          onClick: async () => {
+            const mountGen = this.mountGen;
+            const targetIds = Array.from(this.librarySelectedCharIds);
+            if (targetIds.length === 0)
+              return;
+            const res = await this.ctx.ui.showConfirm({
+              title: "Remove Localized Cache for Selected Characters",
+              message: `Remove localized media for ${targetIds.length} selected character(s)? Original card URLs and native expressions are untouched.`,
+              confirmLabel: "Remove Localized",
+              cancelLabel: "Cancel",
+              variant: "danger"
+            });
+            if (!this.bodyEl || this.mountGen !== mountGen || this.activeTab !== "library" || !res?.confirmed) {
+              return;
+            }
+            const purgeSucceeded = await this.guard(async () => {
+              await this.callbacks.onBulkPurgeCharacters(targetIds);
+              if (!this.bodyEl || this.mountGen !== mountGen)
+                return;
+              const rescanned = await this.callbacks.onScanLibrary(false);
+              if (!this.bodyEl || this.mountGen !== mountGen)
+                return;
+              this.librarySummaries = rescanned.characters;
+              this.librarySummariesStale = false;
+              this.libraryTotalRemote = rescanned.totalUniqueRemote;
+              this.libraryPage = 1;
+              this.librarySelectedCharIds = new Set(Array.from(this.librarySelectedCharIds).filter((id) => rescanned.characters.some((c) => c.characterId === id)));
+              for (const id of targetIds) {
+                this.invalidateCharacterCache(id);
+              }
+              this.invalidateGalleryCache();
+            }, "library");
+            if (purgeSucceeded && this.activeTab === "library" && this.bodyEl && this.mountGen === mountGen) {
+              this.renderBody();
+            }
+          }
+        }));
+      }
+      const effectiveBatchCount = this.libraryBatchCap > 0 ? Math.min(estimatedMatching, this.libraryBatchCap) : estimatedMatching;
+      const batchStartBtn = createIconButton({
+        icon: "download",
+        label: `Download (~${effectiveBatchCount})`,
+        title: `Queue up to ${effectiveBatchCount} files across ${this.librarySelectedCharIds.size} selected cards`,
+        className: "ml-btn is-primary is-sm",
+        size: 13,
+        disabled: this.librarySelectedCharIds.size === 0 || this.librarySelectedSections.size === 0 || effectiveBatchCount === 0,
+        onClick: async () => {
+          const mountGen = this.mountGen;
+          const charIds = Array.from(this.librarySelectedCharIds);
+          const sections = Array.from(this.librarySelectedSections);
+          const maxItems = this.libraryBatchCap;
+          if (effectiveBatchCount > this.settings.confirmThreshold) {
+            const res = await this.ctx.ui.showConfirm({
+              title: "Confirm Library Batch Download",
+              message: `Start downloading up to ${effectiveBatchCount} remote media files across ${charIds.length} selected characters?`,
+              confirmLabel: `Start Batch (${effectiveBatchCount})`,
+              cancelLabel: "Cancel"
+            });
+            if (!this.bodyEl || this.mountGen !== mountGen || this.activeTab !== "library" || !res?.confirmed) {
+              return;
+            }
+          }
+          batchStartBtn.disabled = true;
+          try {
+            await this.guard(() => this.callbacks.onStartDownload({
+              characterIds: charIds,
+              sections,
+              mediaKinds: this.settings.defaultMediaKinds,
+              includeFailed: this.settings.defaultIncludeFailed,
+              maxItems
+            }), "library");
+          } finally {
+            batchStartBtn.disabled = this.librarySelectedCharIds.size === 0 || this.librarySelectedSections.size === 0 || effectiveBatchCount === 0;
+          }
+        }
+      });
+      footerBtns.appendChild(batchStartBtn);
+      footer.append(capLabel, footerBtns);
+      return footer;
+    };
+    const updateSummaryAndFooter = () => {
+      updateHeaderSummary();
+      const nextFooter = buildFooter();
+      footerSlotEl.replaceWith(nextFooter);
+      footerSlotEl = nextFooter;
+    };
+    const buildCharListSlot = () => {
+      const slot = document.createElement("div");
+      slot.className = "ml-stack";
+      cardCheckboxes.clear();
+      const visibleChars = (this.librarySummaries ?? []).filter((c) => !this.libraryOnlyWithRemote || c.remoteCount + c.failedCount > 0);
+      const totalItems = visibleChars.length;
+      const totalPages = Math.max(1, Math.ceil(totalItems / LIBRARY_BATCH_PAGE_SIZE));
+      const page = Math.max(1, Math.min(totalPages, this.libraryPage));
+      this.libraryPage = page;
+      const startIndex = (page - 1) * LIBRARY_BATCH_PAGE_SIZE;
+      const endIndex = Math.min(totalItems, startIndex + LIBRARY_BATCH_PAGE_SIZE);
+      const pageChars = visibleChars.slice(startIndex, endIndex);
+      if (totalItems > 0) {
+        const pagBar = document.createElement("div");
+        pagBar.className = "ml-gallery-pagination";
+        const pagInfo = document.createElement("div");
+        pagInfo.className = "ml-gallery-pagination-info";
+        const pagText = document.createElement("span");
+        pagText.textContent = totalPages > 1 ? `Showing ${startIndex + 1}–${endIndex} of ${totalItems} characters` : `${totalItems} character${totalItems === 1 ? "" : "s"}`;
+        pagInfo.appendChild(pagText);
+        pagBar.appendChild(pagInfo);
+        if (totalPages > 1) {
+          const pagActions = document.createElement("div");
+          pagActions.className = "ml-gallery-pagination-actions";
+          const prevBtn = createIconButton({
+            icon: "chevron-left",
+            label: "Prev",
+            title: "Previous page",
+            className: "ml-btn is-sm",
+            size: 12,
+            disabled: page <= 1,
+            onClick: () => {
+              this.libraryPage = Math.max(1, page - 1);
+              rerenderCharList();
+            }
+          });
+          const pageLabel = document.createElement("span");
+          pageLabel.className = "ml-url-sources";
+          pageLabel.textContent = `Page ${page} / ${totalPages}`;
+          const nextBtn = createIconButton({
+            icon: "chevron-right",
+            label: "Next",
+            title: "Next page",
+            className: "ml-btn is-sm",
+            size: 12,
+            disabled: page >= totalPages,
+            onClick: () => {
+              this.libraryPage = Math.min(totalPages, page + 1);
+              rerenderCharList();
+            }
+          });
+          pagActions.append(prevBtn, pageLabel, nextBtn);
+          pagBar.appendChild(pagActions);
+        }
+        slot.appendChild(pagBar);
+      }
+      const charList = document.createElement("div");
+      charList.className = "ml-url-list";
+      charList.dataset.scrollId = "library-char-list";
+      for (const c of pageChars) {
+        const isExpanded = this.libraryExpandedCharIds.has(c.characterId);
+        const card = document.createElement("div");
+        card.className = `ml-lib-item-card ${isExpanded ? "is-expanded" : ""}`;
+        const row = document.createElement("div");
+        row.className = "ml-lib-row";
+        const left = document.createElement("div");
+        left.className = "ml-check-card-left";
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.className = "ml-row-checkbox";
+        cb.checked = this.librarySelectedCharIds.has(c.characterId);
+        cb.addEventListener("click", (e) => e.stopPropagation());
+        cb.addEventListener("change", () => {
+          if (cb.checked)
+            this.librarySelectedCharIds.add(c.characterId);
+          else
+            this.librarySelectedCharIds.delete(c.characterId);
+          updateSummaryAndFooter();
+        });
+        cardCheckboxes.set(c.characterId, cb);
+        const nameSpan = document.createElement("span");
+        nameSpan.style.fontWeight = "500";
+        nameSpan.textContent = c.characterName;
+        left.append(cb, nameSpan);
+        const right = document.createElement("div");
+        right.className = "ml-header-actions";
+        const badge = document.createElement("span");
+        const pending = c.remoteCount + c.failedCount;
+        badge.className = `ml-badge ${pending > 0 ? "is-warn" : "is-success"}`;
+        badge.textContent = pending > 0 ? `${pending} remote (${c.localizedCount}/${c.totalUnique} local)` : `${c.localizedCount}/${c.totalUnique} local`;
+        right.appendChild(badge);
+        if (c.localizedBytes > 0) {
+          const sizeBadge = document.createElement("span");
+          sizeBadge.className = "ml-badge";
+          sizeBadge.textContent = formatBytes(c.localizedBytes);
+          right.appendChild(sizeBadge);
+        }
+        const expandHint = document.createElement("span");
+        expandHint.className = "ml-expand-hint";
+        expandHint.textContent = isExpanded ? "Hide ▴" : "Info ▾";
+        right.appendChild(expandHint);
+        row.append(left, right);
+        let detailsEl = isExpanded ? buildCharDetails(c) : null;
+        row.addEventListener("click", () => {
+          const nowExpanded = !this.libraryExpandedCharIds.has(c.characterId);
+          if (nowExpanded) {
+            this.libraryExpandedCharIds.add(c.characterId);
+            card.classList.add("is-expanded");
+            expandHint.textContent = "Hide ▴";
+            if (!detailsEl) {
+              detailsEl = buildCharDetails(c);
+            }
+            card.appendChild(detailsEl);
+          } else {
+            this.libraryExpandedCharIds.delete(c.characterId);
+            card.classList.remove("is-expanded");
+            expandHint.textContent = "Info ▾";
+            detailsEl?.remove();
+            detailsEl = null;
+          }
+        });
+        card.appendChild(row);
+        if (detailsEl) {
+          card.appendChild(detailsEl);
+        }
+        charList.appendChild(card);
+      }
+      slot.appendChild(charList);
+      return slot;
+    };
+    const rerenderCharList = () => {
+      const nextSlot = buildCharListSlot();
+      listSlotEl.replaceWith(nextSlot);
+      listSlotEl = nextSlot;
+    };
     const secRow = document.createElement("div");
     secRow.className = "ml-pill-row";
     for (const sec of ALL_MEDIA_SECTIONS) {
@@ -3909,18 +5106,20 @@ class MediaLocalizerDrawerPanel {
       pill.addEventListener("click", () => {
         if (this.librarySelectedSections.has(sec)) {
           this.librarySelectedSections.delete(sec);
+          pill.classList.remove("is-selected");
         } else {
           this.librarySelectedSections.add(sec);
+          pill.classList.add("is-selected");
         }
-        this.renderBody();
+        updateSummaryAndFooter();
       });
       secRow.appendChild(pill);
     }
     filterBox.appendChild(secRow);
     const charHeader = document.createElement("div");
     charHeader.className = "ml-section-title";
-    const charHeaderTitle = document.createElement("span");
-    charHeaderTitle.textContent = `2. Characters (${this.librarySelectedCharIds.size} selected · ${this.libraryTotalRemote} unique remote)`;
+    charHeaderTitle = document.createElement("span");
+    updateHeaderSummary();
     const charHeaderBtns = document.createElement("div");
     charHeaderBtns.className = "ml-header-actions";
     const onlyRemoteLabel = document.createElement("label");
@@ -3930,8 +5129,12 @@ class MediaLocalizerDrawerPanel {
     onlyRemoteCb.type = "checkbox";
     onlyRemoteCb.checked = this.libraryOnlyWithRemote;
     onlyRemoteCb.addEventListener("change", () => {
+      if (onlyRemoteCb.checked === this.libraryOnlyWithRemote)
+        return;
       this.libraryOnlyWithRemote = onlyRemoteCb.checked;
-      this.renderBody();
+      this.libraryPage = 1;
+      rerenderCharList();
+      updateSummaryAndFooter();
     });
     onlyRemoteLabel.append(onlyRemoteCb, document.createTextNode("Remote only"));
     const selAllBtn = document.createElement("button");
@@ -3942,9 +5145,12 @@ class MediaLocalizerDrawerPanel {
       for (const c of this.librarySummaries ?? []) {
         if (!this.libraryOnlyWithRemote || c.remoteCount + c.failedCount > 0) {
           this.librarySelectedCharIds.add(c.characterId);
+          const cb = cardCheckboxes.get(c.characterId);
+          if (cb)
+            cb.checked = true;
         }
       }
-      this.renderBody();
+      updateSummaryAndFooter();
     });
     const clearAllBtn = document.createElement("button");
     clearAllBtn.type = "button";
@@ -3952,217 +5158,18 @@ class MediaLocalizerDrawerPanel {
     clearAllBtn.textContent = "Clear";
     clearAllBtn.addEventListener("click", () => {
       this.librarySelectedCharIds.clear();
-      this.renderBody();
+      for (const cb of cardCheckboxes.values()) {
+        cb.checked = false;
+      }
+      updateSummaryAndFooter();
     });
     charHeaderBtns.append(onlyRemoteLabel, selAllBtn, clearAllBtn);
     charHeader.append(charHeaderTitle, charHeaderBtns);
     filterBox.appendChild(charHeader);
-    const visibleChars = this.librarySummaries.filter((c) => !this.libraryOnlyWithRemote || c.remoteCount + c.failedCount > 0);
-    const charList = document.createElement("div");
-    charList.className = "ml-url-list";
-    charList.dataset.scrollId = "library-char-list";
-    for (const c of visibleChars) {
-      const isExpanded = this.libraryExpandedCharIds.has(c.characterId);
-      const card = document.createElement("div");
-      card.className = `ml-lib-item-card ${isExpanded ? "is-expanded" : ""}`;
-      const row = document.createElement("div");
-      row.className = "ml-lib-row";
-      const left = document.createElement("div");
-      left.className = "ml-check-card-left";
-      const cb = document.createElement("input");
-      cb.type = "checkbox";
-      cb.className = "ml-row-checkbox";
-      cb.checked = this.librarySelectedCharIds.has(c.characterId);
-      cb.addEventListener("click", (e) => e.stopPropagation());
-      cb.addEventListener("change", () => {
-        if (cb.checked)
-          this.librarySelectedCharIds.add(c.characterId);
-        else
-          this.librarySelectedCharIds.delete(c.characterId);
-        this.renderBody();
-      });
-      const nameSpan = document.createElement("span");
-      nameSpan.style.fontWeight = "500";
-      nameSpan.textContent = c.characterName;
-      left.append(cb, nameSpan);
-      const right = document.createElement("div");
-      right.className = "ml-header-actions";
-      const badge = document.createElement("span");
-      const pending = c.remoteCount + c.failedCount;
-      badge.className = `ml-badge ${pending > 0 ? "is-warn" : "is-success"}`;
-      badge.textContent = pending > 0 ? `${pending} remote (${c.localizedCount}/${c.totalUnique} local)` : `${c.localizedCount}/${c.totalUnique} local`;
-      right.appendChild(badge);
-      if (c.localizedBytes > 0) {
-        const sizeBadge = document.createElement("span");
-        sizeBadge.className = "ml-badge";
-        sizeBadge.textContent = formatBytes(c.localizedBytes);
-        right.appendChild(sizeBadge);
-      }
-      const expandHint = document.createElement("span");
-      expandHint.className = "ml-expand-hint";
-      expandHint.textContent = isExpanded ? "Hide ▴" : "Info ▾";
-      right.appendChild(expandHint);
-      row.append(left, right);
-      row.addEventListener("click", () => {
-        if (this.libraryExpandedCharIds.has(c.characterId)) {
-          this.libraryExpandedCharIds.delete(c.characterId);
-        } else {
-          this.libraryExpandedCharIds.add(c.characterId);
-        }
-        this.renderBody();
-      });
-      card.appendChild(row);
-      if (isExpanded) {
-        const details = document.createElement("div");
-        details.className = "ml-item-details";
-        const statRow = document.createElement("div");
-        statRow.className = "ml-detail-kv-row";
-        const addMiniBadge = (label, variant = "") => {
-          const b = document.createElement("span");
-          b.className = `ml-badge ${variant}`.trim();
-          b.textContent = label;
-          statRow.appendChild(b);
-        };
-        addMiniBadge(`${c.totalUnique} Unique URLs`);
-        addMiniBadge(`${c.localizedCount} Localized`, "is-success");
-        addMiniBadge(`${c.remoteCount} Remote`, c.remoteCount > 0 ? "is-warn" : "");
-        if (c.failedCount > 0)
-          addMiniBadge(`${c.failedCount} Failed`, "is-danger");
-        if (c.localizedBytes > 0)
-          addMiniBadge(`Size: ${formatBytes(c.localizedBytes)}`);
-        details.appendChild(statRow);
-        const secList = document.createElement("div");
-        secList.className = "ml-detail-source-list";
-        for (const sec of ALL_MEDIA_SECTIONS) {
-          const count = c.sectionRemoteCounts[sec] || 0;
-          if (count === 0)
-            continue;
-          const chip = document.createElement("span");
-          chip.className = "ml-detail-source-chip";
-          chip.textContent = `${SECTION_LABELS[sec]}: ${count} remote`;
-          secList.appendChild(chip);
-        }
-        if (secList.childElementCount > 0) {
-          details.appendChild(secList);
-        }
-        const actionsRow = document.createElement("div");
-        actionsRow.className = "ml-detail-kv-row";
-        const inspectBtn = document.createElement("button");
-        inspectBtn.type = "button";
-        inspectBtn.className = "ml-btn is-sm is-primary";
-        inspectBtn.textContent = "Open in Character Tab ↗";
-        inspectBtn.addEventListener("click", (e) => {
-          e.stopPropagation();
-          this.setActiveTab("character", c.characterId);
-        });
-        actionsRow.appendChild(inspectBtn);
-        details.appendChild(actionsRow);
-        card.appendChild(details);
-      }
-      charList.appendChild(card);
-    }
-    filterBox.appendChild(charList);
-    let estimatedMatching = 0;
-    let selectedLocalizedChars = 0;
-    for (const c of this.librarySummaries) {
-      if (!this.librarySelectedCharIds.has(c.characterId))
-        continue;
-      if (c.localizedCount > 0)
-        selectedLocalizedChars++;
-      let charSum = 0;
-      for (const sec of this.librarySelectedSections) {
-        charSum += c.sectionRemoteCounts[sec] || 0;
-      }
-      estimatedMatching += Math.min(c.remoteCount + c.failedCount, charSum);
-    }
-    const footer = document.createElement("div");
-    footer.className = "ml-download-bar";
-    const capLabel = document.createElement("label");
-    capLabel.className = "ml-toggle-label";
-    capLabel.textContent = "Limit:";
-    const capSelect = document.createElement("select");
-    capSelect.className = "ml-select is-sm";
-    for (const v of [10, 25, 50, 100, 250, 0]) {
-      const opt = document.createElement("option");
-      opt.value = String(v);
-      opt.textContent = v === 0 ? "Unlimited" : `Max ${v}`;
-      if (v === this.libraryBatchCap)
-        opt.selected = true;
-      capSelect.appendChild(opt);
-    }
-    capSelect.addEventListener("change", () => {
-      this.libraryBatchCap = Number(capSelect.value);
-      this.renderBody();
-    });
-    capLabel.appendChild(capSelect);
-    const footerBtns = document.createElement("div");
-    footerBtns.className = "ml-header-actions";
-    if (selectedLocalizedChars > 0) {
-      footerBtns.appendChild(createIconButton({
-        icon: "trash",
-        label: `Remove (${selectedLocalizedChars})`,
-        title: `Remove all localized cache assets for ${selectedLocalizedChars} selected character(s)`,
-        className: "ml-btn is-danger is-sm",
-        size: 13,
-        onClick: async () => {
-          const targetIds = Array.from(this.librarySelectedCharIds);
-          const res = await this.ctx.ui.showConfirm({
-            title: "Remove Localized Cache for Selected Characters",
-            message: `Remove localized media for ${targetIds.length} selected character(s)? Original card URLs and native expressions are untouched.`,
-            confirmLabel: "Remove Localized",
-            cancelLabel: "Cancel",
-            variant: "danger"
-          });
-          if (!res?.confirmed)
-            return;
-          let purgeSucceeded = false;
-          await this.guard(async () => {
-            await this.callbacks.onBulkPurgeCharacters(targetIds);
-            const rescanned = await this.callbacks.onScanLibrary(false);
-            this.librarySummaries = rescanned.characters;
-            this.libraryTotalRemote = rescanned.totalUniqueRemote;
-            this.librarySelectedCharIds = new Set(Array.from(this.librarySelectedCharIds).filter((id) => rescanned.characters.some((c) => c.characterId === id)));
-            this.galleryView?.invalidateCache();
-            purgeSucceeded = true;
-          });
-          if (purgeSucceeded && this.activeTab === "library" && this.bodyEl) {
-            this.renderBody();
-          }
-        }
-      }));
-    }
-    const effectiveBatchCount = this.libraryBatchCap > 0 ? Math.min(estimatedMatching, this.libraryBatchCap) : estimatedMatching;
-    const batchStartBtn = createIconButton({
-      icon: "download",
-      label: `Download (~${effectiveBatchCount})`,
-      title: `Queue up to ${effectiveBatchCount} files across ${this.librarySelectedCharIds.size} selected cards`,
-      className: "ml-btn is-primary is-sm",
-      size: 13,
-      disabled: this.librarySelectedCharIds.size === 0 || this.librarySelectedSections.size === 0 || effectiveBatchCount === 0,
-      onClick: async () => {
-        if (effectiveBatchCount > this.settings.confirmThreshold) {
-          const res = await this.ctx.ui.showConfirm({
-            title: "Confirm Library Batch Download",
-            message: `Start downloading up to ${effectiveBatchCount} remote media files across ${this.librarySelectedCharIds.size} selected characters?`,
-            confirmLabel: `Start Batch (${effectiveBatchCount})`,
-            cancelLabel: "Cancel"
-          });
-          if (!res?.confirmed)
-            return;
-        }
-        batchStartBtn.disabled = true;
-        await this.guard(() => this.callbacks.onStartDownload({
-          characterIds: Array.from(this.librarySelectedCharIds),
-          sections: Array.from(this.librarySelectedSections),
-          mediaKinds: this.settings.defaultMediaKinds,
-          includeFailed: this.settings.defaultIncludeFailed,
-          maxItems: this.libraryBatchCap
-        }));
-      }
-    });
-    footerBtns.appendChild(batchStartBtn);
-    footer.append(capLabel, footerBtns);
-    filterBox.appendChild(footer);
+    listSlotEl = buildCharListSlot();
+    filterBox.appendChild(listSlotEl);
+    footerSlotEl = buildFooter();
+    filterBox.appendChild(footerSlotEl);
     body.appendChild(filterBox);
   }
   renderSettingsTab(body) {
@@ -4181,8 +5188,15 @@ class MediaLocalizerDrawerPanel {
     clearFailedBtn.disabled = this.stats.totalFailedUrls === 0;
     clearFailedBtn.textContent = `Clear Failed (${this.stats.totalFailedUrls})`;
     clearFailedBtn.addEventListener("click", async () => {
-      await this.guard(() => this.callbacks.onClearFailed());
-      if (this.activeTab === "settings" && this.bodyEl) {
+      const mountGen = this.mountGen;
+      await this.guard(async () => {
+        await this.callbacks.onClearFailed();
+        this.invalidateCharacterCache();
+        if (this.librarySummaries !== null) {
+          this.librarySummariesStale = true;
+        }
+      }, "settings");
+      if (this.activeTab === "settings" && this.bodyEl && this.mountGen === mountGen) {
         this.renderBody();
       }
     });
@@ -4213,7 +5227,7 @@ class MediaLocalizerDrawerPanel {
           defaultMediaKinds: Array.from(sharedState.mediaKinds),
           defaultIncludeFailed: sharedState.includeFailed,
           defaultBatchCap: sharedState.batchCap
-        }));
+        }), "settings");
       }
     }));
     body.appendChild(defaultsBox);
@@ -4232,7 +5246,7 @@ class MediaLocalizerDrawerPanel {
       cb.type = "checkbox";
       cb.checked = this.settings[key];
       cb.addEventListener("change", () => {
-        this.guard(() => this.callbacks.onUpdateSettings({ [key]: cb.checked }));
+        this.guard(() => this.callbacks.onUpdateSettings({ [key]: cb.checked }), "settings");
       });
       lbl.append(cb, document.createTextNode(label));
       row.append(lbl, createInfoTip(tip));
@@ -4265,16 +5279,18 @@ class MediaLocalizerDrawerPanel {
       card.append(lbl, input);
       numGrid.appendChild(card);
     };
-    addNumberSetting("Confirm Above Count", this.settings.confirmThreshold, 1, 500, (v) => void this.guard(() => this.callbacks.onUpdateSettings({ confirmThreshold: v })));
-    addNumberSetting("Max File Size (MB)", this.settings.maxFileSizeMb, 1, 200, (v) => void this.guard(() => this.callbacks.onUpdateSettings({ maxFileSizeMb: v })));
-    addNumberSetting("Timeout per File (s)", this.settings.timeoutSeconds, 5, 120, (v) => void this.guard(() => this.callbacks.onUpdateSettings({ timeoutSeconds: v })));
-    addNumberSetting("Concurrent Downloads", this.settings.concurrency, 1, 5, (v) => void this.guard(() => this.callbacks.onUpdateSettings({ concurrency: v })));
+    addNumberSetting("Confirm Above Count", this.settings.confirmThreshold, 1, 500, (v) => void this.guard(() => this.callbacks.onUpdateSettings({ confirmThreshold: v }), "settings"));
+    addNumberSetting("Max File Size (MB)", this.settings.maxFileSizeMb, 1, 200, (v) => void this.guard(() => this.callbacks.onUpdateSettings({ maxFileSizeMb: v }), "settings"));
+    addNumberSetting("Timeout per File (s)", this.settings.timeoutSeconds, 5, 120, (v) => void this.guard(() => this.callbacks.onUpdateSettings({ timeoutSeconds: v }), "settings"));
+    addNumberSetting("Concurrent Downloads", this.settings.concurrency, 1, 5, (v) => void this.guard(() => this.callbacks.onUpdateSettings({ concurrency: v }), "settings"));
     formBox.appendChild(numGrid);
     body.appendChild(formBox);
   }
 }
 
 // src/ui/gallery-integrator.ts
+var DOM_WAIT_TIMEOUT_MS = 1e4;
+
 class NativeGalleryTabIntegrator {
   ctx;
   settings;
@@ -4282,6 +5298,7 @@ class NativeGalleryTabIntegrator {
   callbacks;
   unsubscribeEditor = null;
   domWaitObserver = null;
+  domWaitTimer = null;
   galleryContentObserver = null;
   galleryRefreshTimer = null;
   lastKnownGalleryCardCount = -1;
@@ -4312,6 +5329,8 @@ class NativeGalleryTabIntegrator {
       this.currentState = editorApi.getState();
       this.handleEditorState(this.currentState);
       this.unsubscribeEditor = editorApi.onChange((state) => {
+        if (this.stopped)
+          return;
         this.currentState = state;
         this.handleEditorState(state);
       });
@@ -4330,16 +5349,22 @@ class NativeGalleryTabIntegrator {
   updateExternalState(settings, queueProgress) {
     this.settings = settings;
     this.queueProgress = queueProgress;
+    if (this.stopped)
+      return;
     this.widget?.updateExternalState(settings, queueProgress);
   }
   refreshActiveScan(characterId) {
-    if (!this.widget)
+    if (this.stopped || !this.widget)
       return;
     if (characterId && this.widget.getCharacterId() !== characterId)
       return;
     this.widget.refreshScan(true);
   }
   disconnectDomWaitObserver() {
+    if (this.domWaitTimer !== null) {
+      clearTimeout(this.domWaitTimer);
+      this.domWaitTimer = null;
+    }
     if (this.domWaitObserver) {
       this.domWaitObserver.disconnect();
       this.domWaitObserver = null;
@@ -4358,6 +5383,7 @@ class NativeGalleryTabIntegrator {
   }
   unmountHost() {
     this.disconnectGalleryContentObserver();
+    this.widget?.flushPendingOverrideSave();
     this.widget?.destroy();
     this.widget = null;
     if (this.mountedTabEl) {
@@ -4371,6 +5397,8 @@ class NativeGalleryTabIntegrator {
   }
   handleEditorState(state) {
     this.disconnectDomWaitObserver();
+    if (this.stopped)
+      return;
     if (!state.open || state.activeTabId !== "gallery" || !state.characterId) {
       this.unmountHost();
       return;
@@ -4381,6 +5409,10 @@ class NativeGalleryTabIntegrator {
     }
     if (typeof MutationObserver !== "undefined" && typeof document !== "undefined" && document.body) {
       this.domWaitObserver = new MutationObserver(() => {
+        if (this.stopped) {
+          this.disconnectDomWaitObserver();
+          return;
+        }
         if (this.currentState.open && this.currentState.activeTabId === "gallery" && this.currentState.characterId === characterId) {
           if (this.tryMountIntoGalleryTab(characterId)) {
             this.disconnectDomWaitObserver();
@@ -4393,10 +5425,14 @@ class NativeGalleryTabIntegrator {
         childList: true,
         subtree: true
       });
+      this.domWaitTimer = setTimeout(() => {
+        this.domWaitTimer = null;
+        this.disconnectDomWaitObserver();
+      }, DOM_WAIT_TIMEOUT_MS);
     }
   }
   tryMountIntoGalleryTab(characterId) {
-    if (typeof document === "undefined")
+    if (this.stopped || typeof document === "undefined")
       return false;
     const galleryTab = document.querySelector('[class*="galleryTab"]');
     if (!galleryTab)
@@ -4410,7 +5446,11 @@ class NativeGalleryTabIntegrator {
     host.className = "ml-gallery-host";
     galleryTab.classList.add("ml-gallery-tab-active");
     galleryTab.appendChild(host);
-    const widget = new CharacterMediaWidget(host, this.ctx, characterId, this.settings, this.queueProgress, this.callbacks, { inDrawer: false, defaultExpandConfig: false });
+    const widget = new CharacterMediaWidget(host, this.ctx, characterId, this.settings, this.queueProgress, this.callbacks, {
+      inDrawer: false,
+      defaultExpandConfig: false,
+      defaultExpandDownloadedMedia: false
+    });
     this.mountedTabEl = galleryTab;
     this.hostEl = host;
     this.widget = widget;
@@ -4425,6 +5465,8 @@ class NativeGalleryTabIntegrator {
     const countCards = () => galleryTab.querySelectorAll('[class*="galleryItem"], [class*="galleryCard"]').length;
     this.lastKnownGalleryCardCount = countCards();
     this.galleryContentObserver = new MutationObserver((mutations) => {
+      if (this.stopped)
+        return;
       const hasExternalMutation = mutations.some((m) => !this.hostEl || !this.hostEl.contains(m.target));
       if (!hasExternalMutation)
         return;
@@ -4464,6 +5506,7 @@ class PortraitPanelLocalizeController {
   justCompleted = false;
   completedTimer = null;
   longPressTimer = null;
+  longPressResetTimer = null;
   lastRenderKey = "";
   stopped = false;
   constructor(callbacks) {
@@ -4498,10 +5541,10 @@ class PortraitPanelLocalizeController {
       return false;
     }
     const mountedPanel = this.wrapEl?.parentElement ?? null;
-    if (!mountedPanel || mountedPanel.isConnected === false) {
+    if (mountedPanel && mountedPanel.isConnected !== false && (mountedPanel.contains(target) || target.contains?.(mountedPanel))) {
       return true;
     }
-    if (mountedPanel.contains(target) || target.contains?.(mountedPanel)) {
+    if (targetEl?.closest?.('[class*="panelOuter"] [class*="panel"]')) {
       return true;
     }
     const nodeMayBePanel = (node) => {
@@ -4528,6 +5571,10 @@ class PortraitPanelLocalizeController {
     if (this.longPressTimer !== null) {
       clearTimeout(this.longPressTimer);
       this.longPressTimer = null;
+    }
+    if (this.longPressResetTimer !== null) {
+      clearTimeout(this.longPressResetTimer);
+      this.longPressResetTimer = null;
     }
   }
   stop() {
@@ -4595,13 +5642,13 @@ class PortraitPanelLocalizeController {
     btn.addEventListener("pointerdown", (ev) => {
       if (this.stopped)
         return;
+      this.clearLongPress();
       longPressTriggered = false;
       if (ev.pointerType === "mouse" && ev.button !== 0)
         return;
       const charId = this.callbacks.getActiveCharacterId();
       if (!charId)
         return;
-      this.clearLongPress();
       this.longPressTimer = setTimeout(() => {
         this.longPressTimer = null;
         if (this.stopped)
@@ -4610,10 +5657,28 @@ class PortraitPanelLocalizeController {
         this.callbacks.onOpenCharacterTab(charId);
       }, 520);
     });
-    const onCancelLongPress = () => this.clearLongPress();
-    btn.addEventListener("pointerup", onCancelLongPress);
-    btn.addEventListener("pointercancel", onCancelLongPress);
-    btn.addEventListener("pointerleave", onCancelLongPress);
+    const onPointerUp = () => {
+      if (this.longPressTimer !== null) {
+        clearTimeout(this.longPressTimer);
+        this.longPressTimer = null;
+      }
+      if (longPressTriggered) {
+        if (this.longPressResetTimer !== null) {
+          clearTimeout(this.longPressResetTimer);
+        }
+        this.longPressResetTimer = setTimeout(() => {
+          this.longPressResetTimer = null;
+          longPressTriggered = false;
+        }, 0);
+      }
+    };
+    const onAbortLongPress = () => {
+      this.clearLongPress();
+      longPressTriggered = false;
+    };
+    btn.addEventListener("pointerup", onPointerUp);
+    btn.addEventListener("pointercancel", onAbortLongPress);
+    btn.addEventListener("pointerleave", onAbortLongPress);
     btn.addEventListener("contextmenu", (ev) => {
       ev.preventDefault();
       ev.stopPropagation();
@@ -4628,6 +5693,10 @@ class PortraitPanelLocalizeController {
     btn.addEventListener("click", (ev) => {
       ev.preventDefault();
       ev.stopPropagation();
+      if (this.longPressResetTimer !== null) {
+        clearTimeout(this.longPressResetTimer);
+        this.longPressResetTimer = null;
+      }
       if (longPressTriggered) {
         longPressTriggered = false;
         return;
@@ -4769,6 +5838,11 @@ var MEDIA_LOCALIZER_STYLES = `
   overflow-y: auto;
 }
 
+/* Prevent the native gallery viewport from being squashed to 0px when Downloaded Media expands */
+[class*="galleryTab"].ml-gallery-tab-active > [class*="galleryScrollArea"] {
+  min-height: 180px;
+}
+
 .ml-gallery-host {
   margin-top: 12px;
   border: 1px solid var(--lumiverse-border, rgba(255, 255, 255, 0.12));
@@ -4778,7 +5852,7 @@ var MEDIA_LOCALIZER_STYLES = `
   font-size: 12.5px;
   line-height: 1.45;
   flex-shrink: 0;
-  overflow: hidden;
+  overflow: visible;
 }
 
 .ml-drawer-root {
@@ -4788,12 +5862,14 @@ var MEDIA_LOCALIZER_STYLES = `
   color: var(--lumiverse-text, #f1f5f9);
   font-size: 12.5px;
   line-height: 1.45;
-  overflow: hidden;
+  overflow: visible;
 }
 
 .ml-drawer-nav {
   display: flex;
+  flex-wrap: wrap;
   gap: 4px;
+  min-width: 0;
   padding: 8px 12px;
   border-bottom: 1px solid var(--lumiverse-border, rgba(255, 255, 255, 0.1));
   background: var(--lumiverse-bg-surface, rgba(15, 17, 23, 0.6));
@@ -4801,7 +5877,9 @@ var MEDIA_LOCALIZER_STYLES = `
 }
 
 .ml-drawer-nav-btn {
-  flex: 1;
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: nowrap;
   padding: 6px 8px;
   border-radius: 6px;
   border: 1px solid transparent;
@@ -4826,6 +5904,7 @@ var MEDIA_LOCALIZER_STYLES = `
 
 .ml-drawer-body {
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
   padding: 12px;
   display: flex;
@@ -4953,6 +6032,19 @@ var MEDIA_LOCALIZER_STYLES = `
   font-size: 11px;
 }
 
+.ml-collapse-btn {
+  border-color: transparent;
+  background: transparent;
+  color: var(--lumiverse-text-muted, #94a3b8);
+  padding: 2px 4px;
+}
+
+.ml-collapse-btn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.14);
+  color: var(--lumiverse-text, #f1f5f9);
+}
+
 .ml-toggle-label {
   display: inline-flex;
   align-items: center;
@@ -5011,9 +6103,18 @@ var MEDIA_LOCALIZER_STYLES = `
   display: flex;
   align-items: center;
   gap: 6px;
+  flex: 1;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.ml-check-card-left > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
 }
 
 .ml-subfilter-box {
@@ -5263,6 +6364,8 @@ var MEDIA_LOCALIZER_STYLES = `
   border: 1px solid rgba(239, 68, 68, 0.35);
   color: #fca5a5;
   font-size: 11px;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .ml-download-bar {
@@ -5368,9 +6471,14 @@ var MEDIA_LOCALIZER_STYLES = `
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+  min-width: 0;
   padding: 7px 9px;
   cursor: pointer;
   user-select: none;
+}
+
+.ml-lib-row .ml-header-actions {
+  flex-shrink: 0;
 }
 
 .ml-drawer-sticky-banner {
@@ -5501,6 +6609,8 @@ var MEDIA_LOCALIZER_STYLES = `
   border: 1px solid rgba(239, 68, 68, 0.35);
   color: #fca5a5;
   font-size: 12px;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .ml-empty {
@@ -5542,9 +6652,8 @@ var MEDIA_LOCALIZER_STYLES = `
 .ml-tip-popover {
   display: none;
   position: absolute;
-  left: 50%;
+  left: 0;
   top: calc(100% + 6px);
-  transform: translateX(-50%);
   width: max-content;
   max-width: min(240px, 65vw);
   padding: 6px 8px;
@@ -5570,6 +6679,12 @@ var MEDIA_LOCALIZER_STYLES = `
 
 .ml-tip-wrap.is-open .ml-tip-popover {
   pointer-events: auto;
+}
+
+.ml-setting-toggle-row .ml-tip-popover,
+.ml-header-bar > .ml-tip-wrap:last-child .ml-tip-popover {
+  left: auto;
+  right: 0;
 }
 
 /* Active Character Header */
@@ -5741,8 +6856,10 @@ var MEDIA_LOCALIZER_STYLES = `
 }
 
 .ml-drawer-root .ml-asset-grid,
+.ml-drawer-root .ml-media-list,
 .ml-gallery-grid {
   max-height: none;
+  overflow-y: visible;
 }
 
 .ml-char-card-grid {
@@ -5807,6 +6924,29 @@ var MEDIA_LOCALIZER_STYLES = `
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.ml-gallery-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 2px 0;
+}
+
+.ml-gallery-pagination-info {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11.5px;
+  color: var(--lumiverse-text-muted, #94a3b8);
+}
+
+.ml-gallery-pagination-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 
 /* Shared Lightbox */
@@ -6099,9 +7239,14 @@ function setup(ctx) {
     cappedByLimit: false,
     skippedByCapCount: 0
   };
+  let hasLiveStatsUpdate = false;
+  let hasLiveQueueUpdate = false;
   let reqSeq = 0;
   const pendingRpc = new Map;
   function callBackend(action, payload = {}, timeoutMs = 60000) {
+    if (unloaded) {
+      return Promise.reject(new Error("Media Localizer was unloaded"));
+    }
     const requestId = `ml_rpc_${Date.now()}_${++reqSeq}`;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -6141,11 +7286,47 @@ function setup(ctx) {
   });
   const inFlightGalleryLinks = new Set;
   const characterLinkLocks = new Map;
+  const activeFetchControllers = new Set;
+  const NATIVE_GALLERY_FETCH_TIMEOUT_MS = 15000;
+  async function fetchWithTimeout(input, init, timeoutMs = NATIVE_GALLERY_FETCH_TIMEOUT_MS) {
+    if (unloaded) {
+      throw new Error("Media Localizer was unloaded");
+    }
+    const controller = typeof AbortController !== "undefined" ? new AbortController : null;
+    let timer = null;
+    if (controller) {
+      activeFetchControllers.add(controller);
+      timer = setTimeout(() => {
+        controller.abort();
+      }, timeoutMs);
+    }
+    try {
+      return await fetch(input, {
+        ...init,
+        ...controller ? { signal: controller.signal } : {}
+      });
+    } finally {
+      if (timer !== null) {
+        clearTimeout(timer);
+      }
+      if (controller) {
+        activeFetchControllers.delete(controller);
+      }
+    }
+  }
+  cleanups.push(() => {
+    for (const controller of activeFetchControllers) {
+      try {
+        controller.abort();
+      } catch {}
+    }
+    activeFetchControllers.clear();
+  });
   async function fetchNativeCharacterGallery(characterId) {
     if (typeof fetch !== "function" || !characterId || unloaded)
-      return [];
+      return null;
     try {
-      const response = await fetch(`/api/v1/characters/${encodeURIComponent(characterId)}/gallery`, {
+      const response = await fetchWithTimeout(`/api/v1/characters/${encodeURIComponent(characterId)}/gallery`, {
         method: "GET",
         credentials: "include",
         headers: {
@@ -6154,14 +7335,16 @@ function setup(ctx) {
       });
       if (!response.ok) {
         console.warn(`[media_localizer] Failed fetching native gallery (${response.status} ${response.statusText})`);
-        return [];
+        return null;
       }
       const body = await response.json();
       const list = Array.isArray(body) ? body : Array.isArray(body?.data) ? body.data : [];
       return list.filter((item) => Boolean(item) && typeof item === "object" && typeof item.id === "string" && typeof item.image_id === "string");
     } catch (err) {
-      console.warn("[media_localizer] Failed fetching native gallery:", err);
-      return [];
+      if (!unloaded) {
+        console.warn("[media_localizer] Failed fetching native gallery:", err);
+      }
+      return null;
     }
   }
   async function ensureGalleryLinksForCharacter(characterId, items) {
@@ -6186,7 +7369,7 @@ function setup(ctx) {
       try {
         if (unloaded)
           return;
-        const existingGallery = await fetchNativeCharacterGallery(characterId);
+        const existingGallery = await fetchNativeCharacterGallery(characterId) ?? [];
         const existingByImageId = new Map;
         for (const gItem of existingGallery) {
           existingByImageId.set(gItem.image_id, gItem);
@@ -6205,7 +7388,7 @@ function setup(ctx) {
             continue;
           }
           try {
-            const response = await fetch(`/api/v1/characters/${encodeURIComponent(characterId)}/gallery/link`, {
+            const response = await fetchWithTimeout(`/api/v1/characters/${encodeURIComponent(characterId)}/gallery/link`, {
               method: "POST",
               credentials: "include",
               headers: {
@@ -6234,7 +7417,9 @@ function setup(ctx) {
               addedNewGalleryRow = true;
             }
           } catch (err) {
-            console.warn("[media_localizer] Network error linking gallery image:", err);
+            if (!unloaded) {
+              console.warn("[media_localizer] Network error linking gallery image:", err);
+            }
           }
         }
       } finally {
@@ -6265,19 +7450,28 @@ function setup(ctx) {
       }
     }
   }
-  async function removeItemsFromNativeGallery(characterId, galleryItemIds, imageIds) {
+  async function removeItemsFromNativeGallery(characterId, galleryItemIds, imageIds, options) {
     if (typeof fetch !== "function" || !characterId || unloaded || galleryItemIds.length === 0 && imageIds.length === 0) {
       return;
     }
-    const idsToDelete = new Set(galleryItemIds.filter(Boolean));
-    const targetImages = imageIds.filter(Boolean);
-    if (targetImages.length > 0 && idsToDelete.size < targetImages.length) {
-      const targetImageSet = new Set(targetImages);
-      const existingGallery = await fetchNativeCharacterGallery(characterId);
+    const targetGalleryIds = new Set(galleryItemIds.filter(Boolean));
+    const targetImageIds = new Set(imageIds.filter(Boolean));
+    if (targetGalleryIds.size === 0 && targetImageIds.size === 0) {
+      return;
+    }
+    const idsToDelete = new Set;
+    const existingGallery = await fetchNativeCharacterGallery(characterId);
+    if (existingGallery !== null) {
       for (const gItem of existingGallery) {
-        if (targetImageSet.has(gItem.image_id) && gItem.id) {
+        if (!gItem.id)
+          continue;
+        if (targetGalleryIds.has(gItem.id) || targetImageIds.has(gItem.image_id)) {
           idsToDelete.add(gItem.id);
         }
+      }
+    } else if (options?.trustGalleryItemIdsWithoutLookup) {
+      for (const id of targetGalleryIds) {
+        idsToDelete.add(id);
       }
     }
     if (idsToDelete.size === 0 || unloaded)
@@ -6287,7 +7481,7 @@ function setup(ctx) {
       if (unloaded)
         break;
       try {
-        const res = await fetch(`/api/v1/characters/${encodeURIComponent(characterId)}/gallery/${encodeURIComponent(itemId)}`, {
+        const res = await fetchWithTimeout(`/api/v1/characters/${encodeURIComponent(characterId)}/gallery/${encodeURIComponent(itemId)}`, {
           method: "DELETE",
           credentials: "include",
           headers: {
@@ -6300,7 +7494,9 @@ function setup(ctx) {
           console.warn(`[media_localizer] Failed deleting gallery item (${res.status} ${res.statusText})`);
         }
       } catch (err) {
-        console.warn("[media_localizer] Network error deleting gallery item:", err);
+        if (!unloaded) {
+          console.warn("[media_localizer] Network error deleting gallery item:", err);
+        }
       }
     }
     if (deletedAny && !unloaded) {
@@ -6308,6 +7504,8 @@ function setup(ctx) {
     }
   }
   const inFlightScans = new Map;
+  let scanSeq = 0;
+  const latestScanSeqByChar = new Map;
   const displaySwapper = new NonDestructiveDisplaySwapper(ctx);
   displaySwapper.start();
   cleanups.push(() => displaySwapper.stop());
@@ -6373,17 +7571,23 @@ function setup(ctx) {
   }
   const callbacks = {
     async onScanCharacter(characterId, forceRefresh = false) {
+      const forcedKey = `${characterId}:1`;
       const scanKey = `${characterId}:${forceRefresh ? "1" : "0"}`;
-      const inflight = inFlightScans.get(scanKey);
+      const inflight = (!forceRefresh ? inFlightScans.get(forcedKey) : undefined) ?? inFlightScans.get(scanKey);
       if (inflight)
         return inflight;
+      const mySeq = ++scanSeq;
+      latestScanSeqByChar.set(characterId, mySeq);
       const run = (async () => {
         const res = await callBackend("scan_character", { characterId, forceRefresh });
+        if (unloaded)
+          return res.scan;
         if (res.urlMapPayload) {
           displaySwapper.updateMap(res.urlMapPayload);
         }
+        const isLatestForChar = latestScanSeqByChar.get(characterId) === mySeq;
         const activeCharId = resolveActiveContextCharacterId();
-        if (activeCharId && activeCharId === characterId && res.scan) {
+        if (isLatestForChar && activeCharId && activeCharId === characterId && res.scan) {
           lastActiveCharacterScan = res.scan;
           refreshPendingCountsFromActiveScan();
         }
@@ -6396,7 +7600,9 @@ function setup(ctx) {
       try {
         return await run;
       } finally {
-        inFlightScans.delete(scanKey);
+        if (inFlightScans.get(scanKey) === run) {
+          inFlightScans.delete(scanKey);
+        }
       }
     },
     async onSaveCharacterOverride(characterId, override) {
@@ -6410,6 +7616,7 @@ function setup(ctx) {
     async onClearFailedUrls(urls) {
       const res = await callBackend("clear_failed", { urls });
       if (res.stats) {
+        hasLiveStatsUpdate = true;
         currentStats = res.stats;
         currentSettings = res.stats.settings;
       }
@@ -6418,6 +7625,7 @@ function setup(ctx) {
     async onStartDownload(filter) {
       const res = await callBackend("enqueue_download", { filter });
       if (res.queueProgress) {
+        hasLiveQueueUpdate = true;
         currentQueueProgress = res.queueProgress;
         notifyUiStateChanged();
       }
@@ -6425,20 +7633,23 @@ function setup(ctx) {
     async onQueueControl(control, targetUrl) {
       const res = await callBackend("queue_control", { control, targetUrl });
       if (res.queueProgress) {
+        hasLiveQueueUpdate = true;
         currentQueueProgress = res.queueProgress;
         notifyUiStateChanged();
       }
     },
     async onPurgeCharacterCache(characterId, urls) {
       const res = await callBackend("purge_character_cache", { characterId, urls });
-      await removeItemsFromNativeGallery(characterId, res.removedGalleryItemIds ?? [], res.removedImageIds ?? []);
+      await removeItemsFromNativeGallery(characterId, res.removedGalleryItemIds ?? [], res.removedImageIds ?? [], { trustGalleryItemIdsWithoutLookup: true });
       if (res.stats) {
+        hasLiveStatsUpdate = true;
         currentStats = res.stats;
         currentSettings = res.stats.settings;
       }
       if (res.urlMapPayload) {
         displaySwapper.updateMap(res.urlMapPayload);
       }
+      latestScanSeqByChar.set(characterId, ++scanSeq);
       if (lastActiveCharacterScan?.characterId === characterId) {
         lastActiveCharacterScan = null;
       }
@@ -6452,27 +7663,40 @@ function setup(ctx) {
       }
     },
     async onBulkPurgeCharacters(characterIds) {
-      const res = await callBackend("purge_characters", { characterIds });
-      for (const charId of characterIds) {
-        await removeItemsFromNativeGallery(charId, res.removedGalleryItemIds ?? [], res.removedImageIds ?? []);
+      const uniqueCharIds = Array.from(new Set(characterIds.filter((id) => typeof id === "string").map((id) => id.trim()).filter(Boolean)));
+      if (uniqueCharIds.length === 0)
+        return;
+      const res = await callBackend("purge_characters", { characterIds: uniqueCharIds });
+      const removedGalleryIds = res.removedGalleryItemIds ?? [];
+      const removedImageIds = res.removedImageIds ?? [];
+      if (removedGalleryIds.length > 0 || removedImageIds.length > 0) {
+        for (const charId of uniqueCharIds) {
+          if (unloaded)
+            break;
+          await removeItemsFromNativeGallery(charId, removedGalleryIds, removedImageIds, { trustGalleryItemIdsWithoutLookup: uniqueCharIds.length === 1 });
+        }
       }
       if (res.stats) {
+        hasLiveStatsUpdate = true;
         currentStats = res.stats;
         currentSettings = res.stats.settings;
       }
       if (res.urlMapPayload) {
         displaySwapper.updateMap(res.urlMapPayload);
       }
-      if (lastActiveCharacterScan && characterIds.includes(lastActiveCharacterScan.characterId)) {
+      for (const charId of uniqueCharIds) {
+        latestScanSeqByChar.set(charId, ++scanSeq);
+      }
+      if (lastActiveCharacterScan && uniqueCharIds.includes(lastActiveCharacterScan.characterId)) {
         lastActiveCharacterScan = null;
       }
       notifyUiStateChanged();
       const activeCharId = resolveActiveContextCharacterId() ?? lastObservedContextCharId;
-      if (!unloaded && activeCharId && characterIds.includes(activeCharId)) {
+      if (!unloaded && activeCharId && uniqueCharIds.includes(activeCharId)) {
         callbacks.onScanCharacter(activeCharId, true).catch(() => {});
       }
       if (!unloaded) {
-        for (const charId of characterIds) {
+        for (const charId of uniqueCharIds) {
           galleryIntegrator.refreshActiveScan(charId);
         }
       }
@@ -6493,6 +7717,7 @@ function setup(ctx) {
     },
     async onUpdateSettings(patch) {
       const res = await callBackend("update_settings", { patch });
+      hasLiveStatsUpdate = true;
       currentSettings = res.settings;
       currentStats = res.stats;
       if (res.urlMapPayload) {
@@ -6503,6 +7728,7 @@ function setup(ctx) {
     },
     async onClearFailed() {
       const res = await callBackend("clear_failed", {});
+      hasLiveStatsUpdate = true;
       currentStats = res.stats;
       currentSettings = res.stats.settings;
       notifyUiStateChanged();
@@ -6510,39 +7736,44 @@ function setup(ctx) {
     }
   };
   const galleryIntegrator = new NativeGalleryTabIntegrator(ctx, currentSettings, currentQueueProgress, callbacks);
-  galleryIntegrator.start();
   cleanups.push(() => galleryIntegrator.stop());
   const drawerPanel = new MediaLocalizerDrawerPanel(ctx, currentSettings, currentStats, currentQueueProgress, callbacks);
-  try {
-    const tab = ctx.ui.registerDrawerTab({
-      id: "media_localizer",
-      title: "Media Localizer",
-      shortName: "Media",
-      description: "Non-destructively localizes external media embedded in character cards into the Character Gallery & Portrait Panel with granular filters and display-time swapping.",
-      keywords: ["media", "localize", "images", "gallery", "cache", "offline"],
-      headerTitle: "Media Localizer",
-      iconSvg: `<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>`,
-      guide: {
-        title: "Media Localizer Guide",
-        markdown: [
-          "### Non-Destructive Media Localization",
-          "Media Localizer scans character cards, linked World Books, and Regex Scripts for external image, video, and audio URLs.",
-          "",
-          "- **Zero Card Mutation**: Original character card JSON and text fields are never overwritten.",
-          "- **Live Display Swapping**: Localized URLs are transparently swapped in the DOM at display time (`<img>`, `<video>`, `<audio>`, `<source>`, `srcset`, inline SVG `<image>`, CSS `background-image`, and same-origin iframes).",
-          "- **Native Gallery Sync**: Downloaded images are automatically linked into the character's native Lumiverse Gallery & Portrait Panel, and existing Gallery images are adopted automatically.",
-          "- **Granular Controls**: Filter by card section, individual alternate greetings, domain, or explicit URLs."
-        ].join(`
+  let drawerTabRegistered = false;
+  function tryRegisterDrawerTab() {
+    if (unloaded || drawerTabRegistered || !ctx.ui?.registerDrawerTab)
+      return;
+    try {
+      const tab = ctx.ui.registerDrawerTab({
+        id: "media_localizer",
+        title: "Media Localizer",
+        shortName: "Media",
+        description: "Non-destructively localizes external media embedded in character cards into the Character Gallery & Portrait Panel with granular filters and display-time swapping.",
+        keywords: ["media", "localize", "images", "gallery", "cache", "offline"],
+        headerTitle: "Media Localizer",
+        iconSvg: `<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>`,
+        guide: {
+          title: "Media Localizer Guide",
+          markdown: [
+            "### Non-Destructive Media Localization",
+            "Media Localizer scans character cards, linked World Books, and Regex Scripts for external image, video, and audio URLs.",
+            "",
+            "- **Zero Card Mutation**: Original character card JSON and text fields are never overwritten.",
+            "- **Live Display Swapping**: Localized URLs are transparently swapped in the DOM at display time (`<img>`, `<video>`, `<audio>`, `<source>`, `srcset`, inline SVG `<image>`, CSS `background-image`, and same-origin iframes).",
+            "- **Native Gallery Sync**: Downloaded images are automatically linked into the character's native Lumiverse Gallery & Portrait Panel, and existing Gallery images are adopted automatically.",
+            "- **Granular Controls**: Filter by card section, individual alternate greetings, domain, or explicit URLs."
+          ].join(`
 `)
-      }
-    });
-    drawerTabSetBadge = (text) => tab.setBadge(text);
-    activateDrawerTab = () => tab.activate();
-    updateDrawerTabBadge();
-    const unmountDrawer = drawerPanel.mount(tab.root);
-    cleanups.push(unmountDrawer);
-  } catch (err) {
-    console.warn("[media_localizer] Failed to register drawer tab:", err);
+        }
+      });
+      drawerTabRegistered = true;
+      drawerTabSetBadge = (text) => tab.setBadge(text);
+      activateDrawerTab = () => tab.activate();
+      updateDrawerTabBadge();
+      const unmountDrawer = drawerPanel.mount(tab.root);
+      cleanups.push(unmountDrawer);
+    } catch (err) {
+      console.warn("[media_localizer] Failed to register drawer tab:", err);
+    }
   }
   portraitButton = new PortraitPanelLocalizeController({
     getActiveCharacterId: () => resolveActiveContextCharacterId(),
@@ -6570,6 +7801,7 @@ function setup(ctx) {
         useCharacterOverrides: true
       });
       if (enqueueRes.queueProgress) {
+        hasLiveQueueUpdate = true;
         currentQueueProgress = enqueueRes.queueProgress;
         notifyUiStateChanged();
       }
@@ -6627,6 +7859,7 @@ function setup(ctx) {
     }
     if (msg.type === "QUEUE_PROGRESS" && msg.progress) {
       const wasActive = isQueueActiveStatus(currentQueueProgress.status);
+      hasLiveQueueUpdate = true;
       currentQueueProgress = msg.progress;
       const nowActive = isQueueActiveStatus(currentQueueProgress.status);
       notifyUiStateChanged();
@@ -6675,6 +7908,7 @@ function setup(ctx) {
         if (currentSettings.autoLocalizeOnOpen) {
           callBackend("auto_localize_character", { characterId: nextCharId }).then((res) => {
             if (res?.started && res.queueProgress) {
+              hasLiveQueueUpdate = true;
               currentQueueProgress = res.queueProgress;
               notifyUiStateChanged();
             }
@@ -6688,28 +7922,48 @@ function setup(ctx) {
       portraitButton?.update();
     }
   }
-  try {
-    const offChatActive = ctx.state?.subscribe?.("chat.active", () => {
-      handleActiveCharacterContextChanged();
-    });
-    if (typeof offChatActive === "function")
-      cleanups.push(offChatActive);
-  } catch {}
-  try {
-    const offDrawerChange = ctx.ui?.events?.onDrawerChange?.((state) => {
-      if (state.open && state.tabId === "media_localizer") {
-        handleActiveCharacterContextChanged();
-      }
-    });
-    if (typeof offDrawerChange === "function")
-      cleanups.push(offDrawerChange);
-  } catch {}
+  const refreshEvents = [
+    "CHAT_SWITCHED",
+    "CHARACTER_MESSAGE_RENDERED",
+    "USER_MESSAGE_RENDERED",
+    "MESSAGE_EDITED",
+    "MESSAGE_SWIPED",
+    "CHARACTER_EDITED"
+  ];
+  let hasChatActiveSub = false;
+  let hasDrawerChangeSub = false;
   let hasEditorStateSub = false;
   let hasEditingIdSub = false;
+  const boundRefreshEvents = new Set;
   function bindPermissionGatedSubscriptions() {
     if (unloaded)
       return;
+    tryRegisterDrawerTab();
     galleryIntegrator.start();
+    if (!hasChatActiveSub) {
+      try {
+        const offChatActive = ctx.state?.subscribe?.("chat.active", () => {
+          handleActiveCharacterContextChanged();
+        });
+        if (typeof offChatActive === "function") {
+          hasChatActiveSub = true;
+          cleanups.push(offChatActive);
+        }
+      } catch {}
+    }
+    if (!hasDrawerChangeSub) {
+      try {
+        const offDrawerChange = ctx.ui?.events?.onDrawerChange?.((state) => {
+          if (state.open && state.tabId === "media_localizer") {
+            handleActiveCharacterContextChanged();
+          }
+        });
+        if (typeof offDrawerChange === "function") {
+          hasDrawerChangeSub = true;
+          cleanups.push(offDrawerChange);
+        }
+      } catch {}
+    }
     if (!hasEditorStateSub) {
       try {
         const offEditor = ctx.ui?.characterEditor?.onChange?.(() => {
@@ -6732,53 +7986,67 @@ function setup(ctx) {
         }
       } catch {}
     }
+    for (const evName of refreshEvents) {
+      if (boundRefreshEvents.has(evName))
+        continue;
+      try {
+        const off = ctx.events?.on?.(evName, () => {
+          displaySwapper.schedulePass();
+          if (evName === "CHARACTER_EDITED") {
+            drawerPanel.refreshActiveScan(resolveActiveContextCharacterId() ?? undefined);
+          }
+          if (evName === "CHAT_SWITCHED" || evName === "CHARACTER_EDITED") {
+            handleActiveCharacterContextChanged(true);
+          }
+        });
+        if (typeof off === "function") {
+          boundRefreshEvents.add(evName);
+          cleanups.push(off);
+        }
+      } catch {}
+    }
   }
   bindPermissionGatedSubscriptions();
   try {
     if (ctx.permissions?.getGranted) {
-      ctx.permissions.getGranted().then((granted) => {
-        const grantedSet = new Set(granted);
+      ctx.permissions.getGranted().then(async (granted) => {
+        if (unloaded)
+          return;
+        const grantedSet = new Set(Array.isArray(granted) ? granted : []);
         const missing = REQUIRED_PERMISSIONS.filter((p) => !grantedSet.has(p));
         if (missing.length > 0 && ctx.permissions?.request) {
-          return ctx.permissions.request([...missing]);
+          try {
+            const updated = await ctx.permissions.request([...missing]);
+            const updatedSet = new Set(Array.isArray(updated) ? updated : []);
+            const stillMissing = REQUIRED_PERMISSIONS.filter((p) => !updatedSet.has(p) && !grantedSet.has(p));
+            if (stillMissing.length > 0) {
+              console.warn(`[media_localizer] Some permissions were not granted (${stillMissing.join(", ")}); continuing with available permissions.`);
+            }
+          } catch (err) {
+            console.warn("[media_localizer] Permission request was denied or failed; continuing with available permissions:", err);
+          }
         }
-        return granted;
-      }).then(() => {
         if (unloaded)
           return;
         bindPermissionGatedSubscriptions();
         handleActiveCharacterContextChanged(true);
-      }).catch(() => {});
+      }).catch((err) => {
+        if (unloaded)
+          return;
+        console.warn("[media_localizer] Failed checking granted permissions:", err);
+        bindPermissionGatedSubscriptions();
+        handleActiveCharacterContextChanged(true);
+      });
     }
   } catch {}
-  const refreshEvents = [
-    "CHAT_SWITCHED",
-    "CHARACTER_MESSAGE_RENDERED",
-    "USER_MESSAGE_RENDERED",
-    "MESSAGE_EDITED",
-    "MESSAGE_SWIPED",
-    "CHARACTER_EDITED"
-  ];
-  for (const evName of refreshEvents) {
-    try {
-      const off = ctx.events.on(evName, () => {
-        displaySwapper.schedulePass();
-        if (evName === "CHAT_SWITCHED" || evName === "CHARACTER_EDITED") {
-          handleActiveCharacterContextChanged(true);
-        }
-      });
-      if (typeof off === "function")
-        cleanups.push(off);
-    } catch {}
-  }
   callBackend("get_init_state").then((init) => {
     if (unloaded)
       return;
-    if (init.stats) {
+    if (init.stats && !hasLiveStatsUpdate) {
       currentStats = init.stats;
       currentSettings = init.stats.settings;
     }
-    if (init.queueProgress) {
+    if (init.queueProgress && !hasLiveQueueUpdate) {
       currentQueueProgress = init.queueProgress;
     }
     if (init.urlMapPayload) {

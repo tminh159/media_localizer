@@ -24,8 +24,10 @@ export function sanitizeSafeMediaUrl(
     !trimmed.startsWith("//") &&
     !trimmed.startsWith("/\\")
   ) {
+    if (/[\s"'\\<>()`]/.test(trimmed)) return null;
     return trimmed;
   }
+  if (/[\s"'\\<>`]/.test(trimmed)) return null;
   try {
     const parsed = new URL(trimmed);
     if (parsed.protocol === "http:" || parsed.protocol === "https:") {
@@ -635,9 +637,12 @@ export function openMediaLightbox(
   startIndex: number,
   onAfterRemove?: () => void,
 ): void {
-  if (items.length === 0) return;
+  if (items.length === 0 || typeof document === "undefined" || !document.body) {
+    return;
+  }
   activeLightboxCloseFn?.();
   const workingItems = [...items];
+  const removingItems = new WeakSet<LightboxItem>();
   let idx = Math.max(0, Math.min(workingItems.length - 1, startIndex));
   let closed = false;
 
@@ -832,21 +837,38 @@ export function openMediaLightbox(
         title: "Remove this localized asset from cache & Character Gallery",
         className: "ml-btn is-danger is-sm",
         size: 13,
+        disabled: removingItems.has(item),
         onClick: async () => {
+          if (closed || removingItems.has(item)) return;
+          removingItems.add(item);
           removeBtn.disabled = true;
           try {
             await item.onRemove!();
-            workingItems.splice(idx, 1);
+            let removeAt = workingItems.indexOf(item);
+            if (removeAt === -1) {
+              removeAt = workingItems.findIndex((entry) => entry.id === item.id);
+            }
+            if (removeAt !== -1) {
+              workingItems.splice(removeAt, 1);
+              if (removeAt < idx) {
+                idx = Math.max(0, idx - 1);
+              } else if (removeAt === idx) {
+                idx = Math.min(idx, Math.max(0, workingItems.length - 1));
+              }
+            }
             onAfterRemove?.();
             if (closed) return;
             if (workingItems.length === 0) {
               close();
             } else {
-              idx = Math.min(idx, workingItems.length - 1);
+              idx = Math.max(0, Math.min(idx, workingItems.length - 1));
               renderCurrent();
             }
+          } catch (err) {
+            console.warn("[media_localizer] Failed removing lightbox item:", err);
           } finally {
-            if (!closed) {
+            removingItems.delete(item);
+            if (!closed && removeBtn.isConnected !== false) {
               removeBtn.disabled = false;
             }
           }
@@ -862,6 +884,45 @@ export function openMediaLightbox(
 
 let sharedThumbObserver: IntersectionObserver | null = null;
 let thumbCallbacks = new WeakMap<Element, () => void>();
+const observedThumbElements = new Set<Element>();
+let thumbPruneTimer: ReturnType<typeof setTimeout> | null = null;
+
+function pruneDetachedThumbTargets(): void {
+  if (!sharedThumbObserver) {
+    observedThumbElements.clear();
+    return;
+  }
+  for (const el of observedThumbElements) {
+    if (el.isConnected === false) {
+      sharedThumbObserver.unobserve(el);
+      thumbCallbacks.delete(el);
+      observedThumbElements.delete(el);
+    }
+  }
+}
+
+function scheduleThumbPrune(delayMs = 50): void {
+  if (thumbPruneTimer !== null || observedThumbElements.size === 0) return;
+  thumbPruneTimer = setTimeout(() => {
+    thumbPruneTimer = null;
+    pruneDetachedThumbTargets();
+    if (observedThumbElements.size > 0 && sharedThumbObserver) {
+      scheduleThumbPrune(2000);
+    }
+  }, delayMs);
+  (thumbPruneTimer as { unref?: () => void }).unref?.();
+}
+
+function observeThumbElement(
+  observer: IntersectionObserver,
+  el: Element,
+  cb: () => void,
+): void {
+  thumbCallbacks.set(el, cb);
+  observedThumbElements.add(el);
+  observer.observe(el);
+  scheduleThumbPrune(50);
+}
 
 function getThumbObserver(): IntersectionObserver | null {
   if (typeof IntersectionObserver === "undefined") return null;
@@ -869,12 +930,21 @@ function getThumbObserver(): IntersectionObserver | null {
     sharedThumbObserver = new IntersectionObserver(
       (entries) => {
         for (const entry of entries) {
-          if (!entry.isIntersecting) continue;
+          if (!entry.isIntersecting) {
+            if (entry.target.isConnected === false) {
+              sharedThumbObserver?.unobserve(entry.target);
+              thumbCallbacks.delete(entry.target);
+              observedThumbElements.delete(entry.target);
+            }
+            continue;
+          }
           const cb = thumbCallbacks.get(entry.target);
           sharedThumbObserver?.unobserve(entry.target);
           thumbCallbacks.delete(entry.target);
+          observedThumbElements.delete(entry.target);
           cb?.();
         }
+        pruneDetachedThumbTargets();
       },
       { rootMargin: "220px" },
     );
@@ -892,10 +962,15 @@ export function cleanupUiHelpers(): void {
   detachTipDocListeners();
   activeLightboxCloseFn?.();
   activeLightboxCloseFn = null;
+  if (thumbPruneTimer !== null) {
+    clearTimeout(thumbPruneTimer);
+    thumbPruneTimer = null;
+  }
   if (sharedThumbObserver) {
     sharedThumbObserver.disconnect();
     sharedThumbObserver = null;
   }
+  observedThumbElements.clear();
   thumbCallbacks = new WeakMap<Element, () => void>();
 }
 
@@ -921,10 +996,9 @@ export function createLazyMediaElement(options: {
     if (options.title) vid.title = options.title;
     if (safeSrc) {
       if (observer) {
-        thumbCallbacks.set(vid, () => {
+        observeThumbElement(observer, vid, () => {
           vid.src = safeSrc;
         });
-        observer.observe(vid);
       } else {
         vid.src = safeSrc;
       }
@@ -940,10 +1014,9 @@ export function createLazyMediaElement(options: {
   if (options.title) img.title = options.title;
   if (safeSrc) {
     if (observer) {
-      thumbCallbacks.set(img, () => {
+      observeThumbElement(observer, img, () => {
         img.src = safeSrc;
       });
-      observer.observe(img);
     } else {
       img.src = safeSrc;
     }

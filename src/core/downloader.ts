@@ -9,6 +9,11 @@ export interface UnmatchedGalleryCandidate {
   mimeType?: string;
 }
 
+export interface DownloadStoreResult extends LocalizedAssetEntry {
+  /** Internal flag indicating an existing gallery/host image was reused (never delete on cancel/race). */
+  reusedExistingImage?: boolean;
+}
+
 export interface DownloadMediaOptions {
   userId: string;
   characterId: string;
@@ -69,6 +74,140 @@ export function validateRemoteMediaUrl(rawUrl: string): URL {
     throw new Error(`Blocked private or local media host: ${parsed.hostname}`);
   }
   return parsed;
+}
+
+const TEXT_PREFIX_SCAN_BYTES = 16 * 1024;
+
+function isAsciiPrintableOrSpaceByte(b: number): boolean {
+  return b === 0x09 || b === 0x0a || b === 0x0d || (b >= 0x20 && b <= 0x7e);
+}
+
+function decodeTextPrefix(bytes: Uint8Array): string {
+  const prefix = bytes.subarray(0, Math.min(bytes.byteLength, TEXT_PREFIX_SCAN_BYTES));
+  if (prefix.byteLength === 0) return "";
+
+  // UTF-32 LE / BE BOM
+  if (prefix.byteLength >= 4) {
+    const isUtf32Le =
+      prefix[0] === 0xff && prefix[1] === 0xfe && prefix[2] === 0x00 && prefix[3] === 0x00;
+    const isUtf32Be =
+      prefix[0] === 0x00 && prefix[1] === 0x00 && prefix[2] === 0xfe && prefix[3] === 0xff;
+    if (isUtf32Le || isUtf32Be) {
+      let out = "";
+      for (let i = 4; i + 3 < prefix.byteLength; i += 4) {
+        const cp = isUtf32Le
+          ? (prefix[i]! | (prefix[i + 1]! << 8) | (prefix[i + 2]! << 16) | (prefix[i + 3]! << 24)) >>> 0
+          : ((prefix[i]! << 24) | (prefix[i + 1]! << 16) | (prefix[i + 2]! << 8) | prefix[i + 3]!) >>> 0;
+        if (cp >= 0x01 && cp <= 0x10ffff) {
+          out += String.fromCodePoint(cp);
+        }
+      }
+      return out;
+    }
+  }
+
+  // UTF-8 BOM
+  if (prefix.byteLength >= 3 && prefix[0] === 0xef && prefix[1] === 0xbb && prefix[2] === 0xbf) {
+    return new TextDecoder().decode(prefix.subarray(3));
+  }
+
+  // UTF-16 LE / BE BOM
+  if (prefix.byteLength >= 2 && prefix[0] === 0xff && prefix[1] === 0xfe) {
+    const body = prefix.subarray(2);
+    return new TextDecoder("utf-16le").decode(body.subarray(0, body.byteLength - (body.byteLength % 2)));
+  }
+  if (prefix.byteLength >= 2 && prefix[0] === 0xfe && prefix[1] === 0xff) {
+    const body = prefix.subarray(2);
+    return new TextDecoder("utf-16be").decode(body.subarray(0, body.byteLength - (body.byteLength % 2)));
+  }
+
+  // Heuristic BOM-less UTF-16 LE / BE detection for ASCII markup/JSON
+  if (prefix.byteLength >= 6) {
+    const samplePairs = Math.min(Math.floor(prefix.byteLength / 2), 32);
+    let leZeros = 0;
+    let leChars = 0;
+    let beZeros = 0;
+    let beChars = 0;
+    for (let p = 0; p < samplePairs; p++) {
+      const b0 = prefix[p * 2]!;
+      const b1 = prefix[p * 2 + 1]!;
+      if (b1 === 0 && isAsciiPrintableOrSpaceByte(b0)) leChars++;
+      if (b1 === 0) leZeros++;
+      if (b0 === 0 && isAsciiPrintableOrSpaceByte(b1)) beChars++;
+      if (b0 === 0) beZeros++;
+    }
+    if (leZeros === samplePairs && leChars === samplePairs) {
+      return new TextDecoder("utf-16le").decode(
+        prefix.subarray(0, prefix.byteLength - (prefix.byteLength % 2)),
+      );
+    }
+    if (beZeros === samplePairs && beChars === samplePairs) {
+      return new TextDecoder("utf-16be").decode(
+        prefix.subarray(0, prefix.byteLength - (prefix.byteLength % 2)),
+      );
+    }
+  }
+
+  return new TextDecoder().decode(prefix);
+}
+
+function stripLeadingMarkupNoise(text: string): { stripped: string; sawXmlDecl: boolean } {
+  let current = text.replace(/^\uFEFF/, "");
+  let sawXmlDecl = false;
+  while (true) {
+    current = current.trimStart();
+    if (current.startsWith("<!--")) {
+      const end = current.indexOf("-->", 4);
+      if (end === -1) break;
+      current = current.slice(end + 3);
+      continue;
+    }
+    if (current.startsWith("<?")) {
+      if (/^<\?xml\b/i.test(current)) {
+        sawXmlDecl = true;
+      }
+      const end = current.indexOf("?>", 2);
+      if (end === -1) break;
+      current = current.slice(end + 2);
+      continue;
+    }
+    break;
+  }
+  return { stripped: current.trimStart(), sawXmlDecl };
+}
+
+function isPrintableTextPrefix(text: string): boolean {
+  if (!text) return false;
+  let hasVisibleChar = false;
+  const limit = Math.min(text.length, 4096);
+  for (let i = 0; i < limit; i++) {
+    const code = text.charCodeAt(i);
+    if (code === 0xfffd) return false;
+    if (code < 0x20 && code !== 0x09 && code !== 0x0a && code !== 0x0d) {
+      return false;
+    }
+    if (code > 0x20 && code !== 0x7f) {
+      hasVisibleChar = true;
+    }
+  }
+  return hasVisibleChar;
+}
+
+function looksLikeJsonBody(bytes: Uint8Array, strippedText: string): boolean {
+  if (!strippedText.startsWith("{") && !strippedText.startsWith("[")) {
+    return false;
+  }
+  if (bytes.byteLength <= 64 * 1024) {
+    try {
+      JSON.parse(strippedText);
+      return true;
+    } catch {
+      // Fall through to prefix heuristic if truncated or slightly over prefix scan
+    }
+  }
+  return /^(?:\{\s*(?:"(?:[^"\\]|\\.)*"\s*:|\})|\[\s*(?:\{|"|-?\d|true\b|false\b|null\b|\]))/.test(
+    strippedText,
+  );
 }
 
 /**
@@ -158,44 +297,71 @@ export function detectMediaMimeType(
     }
   }
 
-  // Check text prefix for HTML error pages, SVGs, or active scripts
-  const headText = new TextDecoder()
-    .decode(bytes.subarray(0, Math.min(bytes.byteLength, 1024)))
-    .replace(/^\uFEFF/, "")
-    .trimStart();
-  if (/^<!doctype\s+html/i.test(headText) || /^<html\b/i.test(headText)) {
-    throw new Error("Remote server returned an HTML page instead of media");
-  }
+  // Check text prefix (UTF-8/UTF-16/UTF-32 with BOM & comment/PI stripping) for HTML/SVG/XML/script
+  const headText = decodeTextPrefix(bytes);
+  const { stripped: strippedHead, sawXmlDecl } = stripLeadingMarkupNoise(headText);
+  const printableText = isPrintableTextPrefix(headText);
+
   if (
-    /^<svg\b/i.test(headText) ||
-    /^<!doctype\s+svg\b/i.test(headText) ||
-    (headText.startsWith("<?xml") && /<svg\b/i.test(headText))
+    /^<svg\b/i.test(strippedHead) ||
+    /^<!doctype\s+svg\b/i.test(strippedHead) ||
+    ((sawXmlDecl || printableText) &&
+      (/<svg[\s>/]/i.test(headText) ||
+        /xmlns\s*=\s*["']http:\/\/www\.w3\.org\/2000\/svg["']/i.test(headText)))
   ) {
     throw new Error("SVG media is disallowed for security reasons");
   }
-  if (/^<script\b/i.test(headText)) {
+  if (/^<script\b/i.test(strippedHead) || (printableText && /<script[\s>/]/i.test(headText))) {
     throw new Error("Remote server returned script content instead of media");
   }
+  if (
+    /^(?:<!doctype\s+html\b|<html\b|<head\b|<body\b|<title\b|<meta\b|<iframe\b|<object\b|<embed\b|<style\b)/i.test(
+      strippedHead,
+    ) ||
+    (printableText &&
+      /<(?:!doctype\s+html|html|head|body|iframe|object|embed)\b/i.test(headText))
+  ) {
+    throw new Error("Remote server returned an HTML page instead of media");
+  }
+  if (
+    sawXmlDecl ||
+    (printableText &&
+      (/^<!--/.test(strippedHead) ||
+        /^<[a-zA-Z_][\w:-]*(?:\s[^>]*)?>/.test(strippedHead)))
+  ) {
+    throw new Error("Remote server returned XML/markup content instead of media");
+  }
 
-  // Fallback to Content-Type header if recognized
+  // Reject disallowed or non-media Content-Type headers before body/extension fallbacks
   const cleanHeader = (headerMimeType ?? "").split(";")[0]?.trim().toLowerCase() ?? "";
   if (cleanHeader === "image/svg+xml" || cleanHeader === "image/svg") {
     throw new Error("SVG media (image/svg+xml) is disallowed for security reasons");
   }
-  if (cleanHeader && MIME_TO_EXT[cleanHeader]) {
-    return { mimeType: cleanHeader, ext: MIME_TO_EXT[cleanHeader]! };
-  }
-
-  // Text/JSON/XML/script bodies are never media, even if the URL path ends in `.png`
   if (
     cleanHeader.startsWith("text/") ||
     cleanHeader === "application/json" ||
+    cleanHeader.endsWith("+json") ||
     cleanHeader === "application/xml" ||
+    cleanHeader.endsWith("+xml") ||
     cleanHeader === "application/xhtml+xml" ||
     cleanHeader === "application/javascript" ||
-    cleanHeader === "text/javascript"
+    cleanHeader === "application/ecmascript"
   ) {
     throw new Error(`Unsupported response content-type: ${cleanHeader}`);
+  }
+
+  // Reject JSON or plain-text error bodies before trusting image/* headers or URL extensions
+  if (printableText) {
+    if (looksLikeJsonBody(bytes, strippedHead)) {
+      throw new Error("Unrecognized media format: remote server returned JSON instead of media");
+    }
+    if (bytes.byteLength >= 8) {
+      throw new Error("Unrecognized media format: remote server returned plain text instead of media");
+    }
+  }
+
+  if (cleanHeader && MIME_TO_EXT[cleanHeader]) {
+    return { mimeType: cleanHeader, ext: MIME_TO_EXT[cleanHeader]! };
   }
 
   // Fallback to URL extension (e.g. CDNs serving `application/octet-stream`)
@@ -373,7 +539,7 @@ function decodeCorsBase64Body(body: string, maxBytes: number): Uint8Array {
 export async function downloadAndStoreMedia(
   spindle: SpindleAPI,
   options: DownloadMediaOptions,
-): Promise<LocalizedAssetEntry> {
+): Promise<DownloadStoreResult> {
   const {
     userId,
     characterId,
@@ -549,6 +715,7 @@ export async function downloadAndStoreMedia(
               ? { galleryItemIds: { [characterId]: cand.galleryItemId } }
               : {}),
             localizedAt: Date.now(),
+            reusedExistingImage: true,
           };
         }
       } catch {

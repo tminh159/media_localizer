@@ -79,6 +79,7 @@ export class UserDownloadQueue {
   private runPromise: Promise<void> | null = null;
   private enqueueLock: Promise<void> = Promise.resolve();
   private readonly inFlight = new Map<string, Promise<TaskOutcome>>();
+  private readonly cancelledCharacterUrls = new Map<string, Set<string> | null>();
 
   constructor(
     private readonly userId: string,
@@ -208,6 +209,7 @@ export class UserDownloadQueue {
         this.resumeResolver = null;
         this.pendingTasks = [...incoming];
         this.inFlight.clear();
+        this.cancelledCharacterUrls.clear();
         const gen = ++this.generation;
         this.progress = {
           status: incoming.length > 0 ? "running" : "completed",
@@ -235,6 +237,17 @@ export class UserDownloadQueue {
           void run;
         }
       } else {
+        for (const t of incoming) {
+          const cancelled = this.cancelledCharacterUrls.get(t.characterId);
+          if (cancelled === null) {
+            this.cancelledCharacterUrls.delete(t.characterId);
+          } else if (cancelled) {
+            cancelled.delete(t.normalizedUrl);
+            if (cancelled.size === 0) {
+              this.cancelledCharacterUrls.delete(t.characterId);
+            }
+          }
+        }
         this.pendingTasks.push(...incoming);
         this.progress.totalQueued += incoming.length;
         if (cappedByLimit) {
@@ -306,6 +319,84 @@ export class UserDownloadQueue {
     }
     this.emit();
     return this.getProgress();
+  }
+
+  private isTaskCancelledForCharacter(
+    characterId: string,
+    normalizedUrl: string,
+  ): boolean {
+    const entry = this.cancelledCharacterUrls.get(characterId);
+    if (entry === undefined) return false;
+    return entry === null || entry.has(normalizedUrl);
+  }
+
+  /**
+   * Cancels pending and active download tasks for a character (optionally restricted
+   * to specific normalized URLs) without cancelling other characters in the batch.
+   */
+  cancelCharacterTasks(characterId: string, onlyUrls?: string[]): number {
+    if (!characterId) return 0;
+    const isActive =
+      this.progress.status === "running" ||
+      this.progress.status === "paused" ||
+      this.progress.status === "cancelling";
+    if (!isActive) return 0;
+
+    const urlSet =
+      onlyUrls && onlyUrls.length > 0 ? new Set(onlyUrls) : null;
+
+    if (!urlSet) {
+      this.cancelledCharacterUrls.set(characterId, null);
+    } else {
+      const existing = this.cancelledCharacterUrls.get(characterId);
+      if (existing !== null) {
+        const next = existing ?? new Set<string>();
+        for (const u of urlSet) next.add(u);
+        this.cancelledCharacterUrls.set(characterId, next);
+      }
+    }
+
+    let affected = 0;
+    if (this.pendingTasks.length > 0) {
+      const remaining: QueuedMediaTask[] = [];
+      let droppedPending = 0;
+      for (const t of this.pendingTasks) {
+        if (
+          t.characterId === characterId &&
+          (!urlSet || urlSet.has(t.normalizedUrl))
+        ) {
+          droppedPending++;
+        } else {
+          remaining.push(t);
+        }
+      }
+      if (droppedPending > 0) {
+        this.pendingTasks = remaining;
+        this.progress.skippedCount += droppedPending;
+        this.progress.completedCount += droppedPending;
+        affected += droppedPending;
+      }
+    }
+
+    for (const active of this.activeControls.values()) {
+      if (
+        active.characterId === characterId &&
+        (!urlSet || urlSet.has(active.url))
+      ) {
+        if (!active.skipped) {
+          active.skipped = true;
+          active.controller.abort(
+            new DOMException("Cancelled by character purge", "AbortError"),
+          );
+          affected++;
+        }
+      }
+    }
+
+    if (affected > 0) {
+      this.emit();
+    }
+    return affected;
   }
 
   cancelAll(): QueueJobProgress {
@@ -397,7 +488,10 @@ export class UserDownloadQueue {
 
       while (true) {
         if (gen !== this.generation) return;
-        if (this.cancelRequested) {
+        if (
+          this.cancelRequested ||
+          this.isTaskCancelledForCharacter(task.characterId, key)
+        ) {
           this.progress.completedCount++;
           this.progress.skippedCount++;
           this.emit();
@@ -410,7 +504,11 @@ export class UserDownloadQueue {
         const outcome = await prior.catch((): TaskOutcome => "failed");
         if (gen !== this.generation) return;
 
-        if (this.cancelRequested || outcome === "aborted") {
+        if (
+          this.cancelRequested ||
+          outcome === "aborted" ||
+          this.isTaskCancelledForCharacter(task.characterId, key)
+        ) {
           this.progress.completedCount++;
           this.progress.skippedCount++;
           this.emit();
@@ -431,7 +529,10 @@ export class UserDownloadQueue {
             // ignore lookup error
           }
           if (gen !== this.generation) return;
-          if (this.cancelRequested) {
+          if (
+            this.cancelRequested ||
+            this.isTaskCancelledForCharacter(task.characterId, key)
+          ) {
             this.progress.completedCount++;
             this.progress.skippedCount++;
             this.emit();
@@ -455,7 +556,10 @@ export class UserDownloadQueue {
       }
 
       if (gen !== this.generation) return;
-      if (this.cancelRequested) {
+      if (
+        this.cancelRequested ||
+        this.isTaskCancelledForCharacter(task.characterId, key)
+      ) {
         this.progress.completedCount++;
         this.progress.skippedCount++;
         this.emit();
@@ -480,7 +584,10 @@ export class UserDownloadQueue {
   ): Promise<TaskOutcome> {
     const checkAbortedOrStale = (): TaskOutcome | null => {
       if (gen !== this.generation) return "aborted";
-      if (this.cancelRequested) {
+      if (
+        this.cancelRequested ||
+        this.isTaskCancelledForCharacter(task.characterId, task.normalizedUrl)
+      ) {
         this.progress.completedCount++;
         this.progress.skippedCount++;
         this.emit();
@@ -489,27 +596,37 @@ export class UserDownloadQueue {
       return null;
     };
 
-    const preStateAborted = checkAbortedOrStale();
-    if (preStateAborted) return preStateAborted;
+    let controlId: string | null = null;
+    let control: ActiveTaskControl | null = null;
 
-    // 1. Check if this URL is already localized in our index (and image still exists)
-    const state = await this.indexStore.getState(this.userId);
-    const postStateAborted = checkAbortedOrStale();
-    if (postStateAborted) return postStateAborted;
+    try {
+      const preStateAborted = checkAbortedOrStale();
+      if (preStateAborted) return preStateAborted;
 
-    const existing = Object.hasOwn(state.assets, task.normalizedUrl)
-      ? state.assets[task.normalizedUrl]
-      : undefined;
-    if (existing) {
-      try {
-        const img = await this.spindle.images.get(
-          existing.imageId,
-          this.userId,
-        );
+      // 1. Check if this URL is already localized in our index (and image still exists)
+      const state = await this.indexStore.getState(this.userId);
+      const postStateAborted = checkAbortedOrStale();
+      if (postStateAborted) return postStateAborted;
+
+      const existing = Object.hasOwn(state.assets, task.normalizedUrl)
+        ? state.assets[task.normalizedUrl]
+        : undefined;
+      let deadImageId: string | undefined;
+      if (existing) {
+        let existingImg: unknown = null;
+        try {
+          existingImg = await this.spindle.images.get(
+            existing.imageId,
+            this.userId,
+          );
+        } catch {
+          // Treat unreadable image lookup as missing so a replacement can be downloaded
+          existingImg = null;
+        }
         const postGetAborted = checkAbortedOrStale();
         if (postGetAborted) return postGetAborted;
 
-        if (img) {
+        if (existingImg) {
           const linked = await this.indexStore.linkExistingAssetToCharacter(
             this.userId,
             task.normalizedUrl,
@@ -524,38 +641,38 @@ export class UserDownloadQueue {
           this.emit(linked ?? existing);
           return "ok";
         }
-      } catch {
-        const errAborted = checkAbortedOrStale();
-        if (errAborted) return errAborted;
-        // Proceed to download if image lookup fails
+        deadImageId = existing.imageId;
       }
-    }
 
-    const preControlAborted = checkAbortedOrStale();
-    if (preControlAborted) return preControlAborted;
+      const preControlAborted = checkAbortedOrStale();
+      if (preControlAborted) return preControlAborted;
 
-    // 2. Download & store with AbortController
-    const controlId = `ctrl_${Date.now()}_${++this.seq}`;
-    const controller = new AbortController();
-    const control: ActiveTaskControl = {
-      id: controlId,
-      url: task.normalizedUrl,
-      characterId: task.characterId,
-      characterName: task.characterName,
-      startedAt: Date.now(),
-      controller,
-      skipped: false,
-    };
+      // 2. Download & store with AbortController
+      controlId = `ctrl_${Date.now()}_${++this.seq}`;
+      const controller = new AbortController();
+      control = {
+        id: controlId,
+        url: task.normalizedUrl,
+        characterId: task.characterId,
+        characterName: task.characterName,
+        startedAt: Date.now(),
+        controller,
+        skipped: false,
+      };
 
-    this.activeControls.set(controlId, control);
-    if (this.cancelRequested || gen !== this.generation) {
-      this.activeControls.delete(controlId);
-      return checkAbortedOrStale() ?? "aborted";
-    }
-    this.emit();
+      this.activeControls.set(controlId, control);
+      if (
+        this.cancelRequested ||
+        gen !== this.generation ||
+        this.isTaskCancelledForCharacter(task.characterId, task.normalizedUrl)
+      ) {
+        this.activeControls.delete(controlId);
+        controlId = null;
+        return checkAbortedOrStale() ?? "aborted";
+      }
+      this.emit();
 
-    try {
-      const entry = await downloadAndStoreMedia(this.spindle, {
+      const downloadResult = await downloadAndStoreMedia(this.spindle, {
         userId: this.userId,
         characterId: task.characterId,
         normalizedUrl: task.normalizedUrl,
@@ -565,9 +682,16 @@ export class UserDownloadQueue {
         signal: controller.signal,
         unmatchedGalleryCandidates: task.unmatchedGalleryCandidates,
       });
+      const { reusedExistingImage, ...entry } = downloadResult;
 
-      if (gen !== this.generation || this.cancelRequested || control.skipped) {
+      if (
+        gen !== this.generation ||
+        this.cancelRequested ||
+        control.skipped ||
+        this.isTaskCancelledForCharacter(task.characterId, task.normalizedUrl)
+      ) {
         if (
+          !reusedExistingImage &&
           !entry.galleryItemIds &&
           typeof this.spindle.images?.deleteMany === "function"
         ) {
@@ -580,6 +704,7 @@ export class UserDownloadQueue {
           }
         }
         this.activeControls.delete(controlId);
+        controlId = null;
         if (gen === this.generation) {
           this.progress.completedCount++;
           this.progress.skippedCount++;
@@ -588,11 +713,16 @@ export class UserDownloadQueue {
         return "aborted";
       }
 
-      const saved = await this.indexStore.recordLocalizedAsset(this.userId, entry);
-      // A parallel path registered this URL first: discard our duplicate upload (never an
-      // adopted Gallery image, which would have the same id as `saved`).
+      const saved = await this.indexStore.recordLocalizedAsset(
+        this.userId,
+        entry,
+        deadImageId ? { replaceIfImageId: deadImageId } : undefined,
+      );
+      // A parallel path registered this URL first: discard our duplicate upload (never a
+      // pre-existing or adopted Gallery image).
       if (
         saved.imageId !== entry.imageId &&
+        !reusedExistingImage &&
         !entry.galleryItemIds &&
         typeof this.spindle.images?.deleteMany === "function"
       ) {
@@ -606,6 +736,7 @@ export class UserDownloadQueue {
       }
 
       this.activeControls.delete(controlId);
+      controlId = null;
       if (gen !== this.generation) return "aborted";
 
       this.progress.completedCount++;
@@ -613,15 +744,19 @@ export class UserDownloadQueue {
       this.emit(saved);
       return "ok";
     } catch (err) {
-      this.activeControls.delete(controlId);
+      if (controlId) {
+        this.activeControls.delete(controlId);
+        controlId = null;
+      }
       if (gen !== this.generation) return "aborted";
 
       this.progress.completedCount++;
 
       const isAborted =
-        control.skipped ||
+        Boolean(control?.skipped) ||
         this.cancelRequested ||
-        controller.signal.aborted ||
+        Boolean(control?.controller.signal.aborted) ||
+        this.isTaskCancelledForCharacter(task.characterId, task.normalizedUrl) ||
         (err instanceof Error && err.name === "AbortError") ||
         (err instanceof Error && /AbortError|cancelled|Skipped/i.test(err.message));
 
@@ -655,10 +790,14 @@ export class UserDownloadQueue {
       this.emit();
       return "failed";
     } finally {
-      this.activeControls.delete(controlId);
+      if (controlId) {
+        this.activeControls.delete(controlId);
+      }
     }
   }
 }
+
+const MAX_QUEUED_USERS = 500;
 
 export class MediaQueueManager {
   private readonly queues = new Map<string, UserDownloadQueue>();
@@ -675,14 +814,27 @@ export class MediaQueueManager {
 
   getQueue(userId: string): UserDownloadQueue {
     let q = this.queues.get(userId);
-    if (!q) {
-      q = new UserDownloadQueue(
-        userId,
-        this.spindle,
-        this.indexStore,
-        this.onUpdate,
-      );
+    if (q) {
+      this.queues.delete(userId);
       this.queues.set(userId, q);
+      return q;
+    }
+    q = new UserDownloadQueue(
+      userId,
+      this.spindle,
+      this.indexStore,
+      this.onUpdate,
+    );
+    this.queues.set(userId, q);
+    if (this.queues.size > MAX_QUEUED_USERS) {
+      for (const [uid, candidate] of this.queues.entries()) {
+        if (this.queues.size <= MAX_QUEUED_USERS) break;
+        if (uid === userId) continue;
+        const st = candidate.getProgress().status;
+        if (st === "idle" || st === "completed" || st === "cancelled") {
+          this.queues.delete(uid);
+        }
+      }
     }
     return q;
   }

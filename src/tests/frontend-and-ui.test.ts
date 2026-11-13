@@ -11,7 +11,9 @@ import {
 import { CharacterMediaWidget } from "../ui/character-media-widget";
 import { NonDestructiveDisplaySwapper } from "../ui/display-swapper";
 import { MediaLocalizerDrawerPanel } from "../ui/drawer-panel";
+import { NativeGalleryTabIntegrator } from "../ui/gallery-integrator";
 import { LibraryGalleryView } from "../ui/library-gallery";
+import { MEDIA_LOCALIZER_STYLES } from "../ui/styles";
 import { PortraitPanelLocalizeController } from "../ui/portrait-button";
 import {
     cleanupUiHelpers,
@@ -520,6 +522,421 @@ describe("ui/drawer-panel tab guards, destroy lifecycle, & bulk purge", () => {
 
         unmount();
     });
+
+    test("Gallery tab preserves options across tab switches and localStorage across panel reloads", async () => {
+        const g = globalThis as { localStorage?: Storage };
+        const hadLocalStorage = Object.prototype.hasOwnProperty.call(g, "localStorage");
+        const prevLocalStorage = g.localStorage;
+        const backing = new Map<string, string>();
+        g.localStorage = {
+            get length() {
+                return backing.size;
+            },
+            clear: () => backing.clear(),
+            getItem: (k: string) => backing.get(k) ?? null,
+            key: (i: number) => Array.from(backing.keys())[i] ?? null,
+            removeItem: (k: string) => {
+                backing.delete(k);
+            },
+            setItem: (k: string, v: string) => {
+                backing.set(k, v);
+            },
+        };
+
+        try {
+            const ctxMock = createFrontendMockCtx({ activeCharacterId: null });
+            const stats: StorageStatsSummary = {
+                totalAssets: 0,
+                totalSizeBytes: 0,
+                totalFailedUrls: 0,
+                settings: { ...DEFAULT_SETTINGS },
+            };
+            let listMediaCalls = 0;
+
+            const makePanel = (container: HTMLElement) => {
+                const panel = new MediaLocalizerDrawerPanel(
+                    ctxMock.ctx,
+                    { ...DEFAULT_SETTINGS },
+                    stats,
+                    makeIdleQueue(),
+                    {
+                        onScanCharacter: async (charId) => makeScan(charId),
+                        onStartDownload: async () => {},
+                        onSaveCharacterOverride: async () => null,
+                        onClearFailedUrls: async () => {},
+                        onQueueControl: async () => {},
+                        onPurgeCharacterCache: async () => {},
+                        onScanLibrary: async () => ({ characters: [], totalUniqueRemote: 0 }),
+                        onListLibraryMedia: async (opts) => {
+                            listMediaCalls++;
+                            return [
+                                {
+                                    characterId: "c-pref-1",
+                                    characterName: "Tagged Char",
+                                    tags: ["Fantasy", "Helper"],
+                                    avatarImageId: "av-1",
+                                    avatarUrl: "/api/v1/images/av-1",
+                                    localizedAssets: [],
+                                    expressions: [],
+                                    totalSizeBytes: 0,
+                                    lastLocalizedAt: 0,
+                                },
+                            ].filter((c) => opts?.includeEmpty || c.localizedAssets.length > 0);
+                        },
+                        onBulkPurgeCharacters: async () => {},
+                        onUpdateSettings: async (patch) => ({
+                            settings: { ...DEFAULT_SETTINGS, ...patch },
+                            stats,
+                        }),
+                        onClearFailed: async () => ({ cleared: 0, stats }),
+                    },
+                );
+                const unmount = panel.mount(container);
+                return { panel, unmount };
+            };
+
+            const container1 = domEnv.document.createElement("div") as unknown as HTMLElement;
+            domEnv.document.body.appendChild(container1 as any);
+            const { panel: panel1, unmount: unmount1 } = makePanel(container1);
+
+            panel1.setActiveTab("gallery");
+            await new Promise((r) => setTimeout(r, 15));
+
+            // Enable All Cards, switch to List view, change Sort to recent, type search query
+            const allCardsBtn = Array.from(container1.querySelectorAll("button") as unknown as Iterable<any>).find((b) =>
+                (b.textContent ?? "").includes("All Cards"),
+            );
+            expect(allCardsBtn).toBeDefined();
+            allCardsBtn.click();
+            await new Promise((r) => setTimeout(r, 15));
+
+            const listBtn = container1.querySelector('button[title="List view"]') as any;
+            expect(listBtn).toBeDefined();
+            listBtn.click();
+
+            const sortSelect = container1.querySelector('select[title="Sort order"]') as any;
+            sortSelect.value = "recent";
+            sortSelect.dispatchEvent(new MockEvent("change", { bubbles: true }));
+
+            const searchInput = container1.querySelector('input[type="search"]') as any;
+            searchInput.value = "tag:fantasy";
+            searchInput.dispatchEvent(new MockEvent("input", { bubbles: true }));
+
+            // Switch to Character tab and back to Gallery -> options, search, and cached cards remain intact without extra RPC
+            const callsBeforeSwitch = listMediaCalls;
+            panel1.setActiveTab("character");
+            panel1.setActiveTab("gallery");
+            await new Promise((r) => setTimeout(r, 15));
+            expect(listMediaCalls).toBe(callsBeforeSwitch);
+
+            const restoredAllCards = Array.from(container1.querySelectorAll("button") as unknown as Iterable<any>).find((b) =>
+                (b.textContent ?? "").includes("All Cards"),
+            );
+            expect(restoredAllCards.className).toContain("is-active");
+            expect((container1.querySelector('button[title="List view"]') as any).className).toContain("is-active");
+            expect((container1.querySelector('select[title="Sort order"]') as any).value).toBe("recent");
+            expect((container1.querySelector('input[type="search"]') as any).value).toBe("tag:fantasy");
+            expect(container1.textContent).toContain("Tagged Char");
+            unmount1();
+
+            // Fresh panel instance restores persisted Gallery preferences from localStorage
+            const container2 = domEnv.document.createElement("div") as unknown as HTMLElement;
+            domEnv.document.body.appendChild(container2 as any);
+            const { panel: panel2, unmount: unmount2 } = makePanel(container2);
+            panel2.setActiveTab("gallery");
+            await new Promise((r) => setTimeout(r, 15));
+
+            const reloadedAllCards = Array.from(container2.querySelectorAll("button") as unknown as Iterable<any>).find((b) =>
+                (b.textContent ?? "").includes("All Cards"),
+            );
+            expect(reloadedAllCards.className).toContain("is-active");
+            expect((container2.querySelector('button[title="List view"]') as any).className).toContain("is-active");
+            expect((container2.querySelector('select[title="Sort order"]') as any).value).toBe("recent");
+            expect(container2.textContent).toContain("Tagged Char");
+            unmount2();
+        } finally {
+            if (hadLocalStorage) {
+                g.localStorage = prevLocalStorage;
+            } else {
+                delete g.localStorage;
+            }
+        }
+    });
+
+    test("Character tab preserves options, override edits, and scan cache across tab switches and localStorage reloads", async () => {
+        const g = globalThis as { localStorage?: Storage };
+        const hadLocalStorage = Object.prototype.hasOwnProperty.call(g, "localStorage");
+        const prevLocalStorage = g.localStorage;
+        const backing = new Map<string, string>();
+        g.localStorage = {
+            get length() {
+                return backing.size;
+            },
+            clear: () => backing.clear(),
+            getItem: (k: string) => backing.get(k) ?? null,
+            key: (i: number) => Array.from(backing.keys())[i] ?? null,
+            removeItem: (k: string) => {
+                backing.delete(k);
+            },
+            setItem: (k: string, v: string) => {
+                backing.set(k, v);
+            },
+        };
+
+        try {
+            const ctxMock = createFrontendMockCtx({ activeCharacterId: "c-char-pref" });
+            const stats: StorageStatsSummary = {
+                totalAssets: 1,
+                totalSizeBytes: 512,
+                totalFailedUrls: 0,
+                settings: { ...DEFAULT_SETTINGS },
+            };
+            let scanCalls = 0;
+            let savedOverride: any = null;
+            let saveOverrideCalls = 0;
+
+            const makeCharacterScan = (charId: string): CharacterMediaScanResult =>
+                makeScan(charId, {
+                    items: [
+                        {
+                            normalizedUrl: "https://cdn.example.com/loc.png",
+                            rawUrls: ["https://cdn.example.com/loc.png"],
+                            domain: "cdn.example.com",
+                            mediaKind: "image",
+                            sources: [{ section: "core_fields", label: "Description" }],
+                            occurrenceCount: 1,
+                            status: "localized",
+                            localizedEntry: {
+                                normalizedUrl: "https://cdn.example.com/loc.png",
+                                rawUrls: ["https://cdn.example.com/loc.png"],
+                                imageId: "img-loc-1",
+                                localUrl: "/api/v1/images/img-loc-1",
+                                filename: "loc.png",
+                                mimeType: "image/png",
+                                sizeBytes: 512,
+                                localizedAt: 1000,
+                                characterIds: [charId],
+                                galleryItemIds: {},
+                            },
+                        },
+                        {
+                            normalizedUrl: "https://cdn.example.com/rem.png",
+                            rawUrls: ["https://cdn.example.com/rem.png"],
+                            domain: "cdn.example.com",
+                            mediaKind: "image",
+                            sources: [{ section: "first_mes", label: "First Message" }],
+                            occurrenceCount: 1,
+                            status: "remote",
+                        },
+                    ],
+                    override: savedOverride,
+                });
+
+            const makePanel = (container: HTMLElement) => {
+                const panel = new MediaLocalizerDrawerPanel(
+                    ctxMock.ctx,
+                    { ...DEFAULT_SETTINGS },
+                    stats,
+                    makeIdleQueue(),
+                    {
+                        onScanCharacter: async (charId) => {
+                            scanCalls++;
+                            return makeCharacterScan(charId);
+                        },
+                        onStartDownload: async () => {},
+                        onSaveCharacterOverride: async (_charId, override) => {
+                            saveOverrideCalls++;
+                            savedOverride = override;
+                            return override;
+                        },
+                        onClearFailedUrls: async () => {},
+                        onQueueControl: async () => {},
+                        onPurgeCharacterCache: async () => {},
+                        onScanLibrary: async () => ({ characters: [], totalUniqueRemote: 0 }),
+                        onListLibraryMedia: async () => [],
+                        onBulkPurgeCharacters: async () => {},
+                        onUpdateSettings: async (patch) => ({
+                            settings: { ...DEFAULT_SETTINGS, ...patch },
+                            stats,
+                        }),
+                        onClearFailed: async () => ({ cleared: 0, stats }),
+                    },
+                );
+                const unmount = panel.mount(container);
+                return { panel, unmount };
+            };
+
+            const container1 = domEnv.document.createElement("div") as unknown as HTMLElement;
+            domEnv.document.body.appendChild(container1 as any);
+            const { panel: panel1, unmount: unmount1 } = makePanel(container1);
+
+            await new Promise((r) => setTimeout(r, 15));
+            expect(scanCalls).toBe(1);
+
+            // Expand Per-Card Download Options, inspect URLs, switch Downloaded Media to List + "localized" filter
+            const gearBtn = container1.querySelector('button[title*="Customize per-card download options"]') as any;
+            expect(gearBtn).not.toBeNull();
+            gearBtn.click();
+
+            expect(container1.textContent).toContain("Per-Card Download Options");
+
+            const urlPickerBtn = Array.from(container1.querySelectorAll("button") as unknown as Iterable<any>).find((b) =>
+                (b.textContent ?? "").includes("Inspect & Pick URLs"),
+            );
+            expect(urlPickerBtn).toBeDefined();
+            urlPickerBtn.click();
+
+            const listBtn = container1.querySelector('button[title="List view"]') as any;
+            listBtn.click();
+
+            const filterSelect = container1.querySelector('select[title="Filter shown media tiles"]') as any;
+            filterSelect.value = "localized";
+            filterSelect.dispatchEvent(new MockEvent("change", { bubbles: true }));
+
+            // Uncheck a section checkbox to trigger debounced override save, then immediately switch tabs before 150ms
+            const firstCb = container1.querySelector('.ml-options-panel input[type="checkbox"]') as any;
+            expect(firstCb).not.toBeNull();
+            firstCb.checked = false;
+            firstCb.dispatchEvent(new MockEvent("change", { bubbles: true }));
+
+            panel1.setActiveTab("gallery");
+            expect(saveOverrideCalls).toBe(1);
+            expect(savedOverride).not.toBeNull();
+
+            // Switch back to Character tab -> options, URL picker, filter, override, and scan cache remain intact without extra scan RPC
+            const scansBeforeReturn = scanCalls;
+            panel1.setActiveTab("character");
+            expect(scanCalls).toBe(scansBeforeReturn);
+            expect(container1.textContent).toContain("Per-Card Download Options");
+            expect(container1.textContent).toContain("Hide URL List");
+            expect((container1.querySelector('button[title="List view"]') as any).className).toContain("is-active");
+            expect((container1.querySelector('select[title="Filter shown media tiles"]') as any).value).toBe("localized");
+            expect((container1.querySelector('.ml-options-panel input[type="checkbox"]') as any).checked).toBe(false);
+
+            // Collapse Downloaded Media and ensure it unmounts tile list
+            const collapseBtn = container1.querySelector('button[title="Collapse Downloaded Media"]') as any;
+            expect(collapseBtn).not.toBeNull();
+            collapseBtn.click();
+            expect(container1.querySelector(".ml-media-list")).toBeNull();
+            unmount1();
+
+            // Fresh panel instance restores persisted Character UI preferences from localStorage across reload
+            const container2 = domEnv.document.createElement("div") as unknown as HTMLElement;
+            domEnv.document.body.appendChild(container2 as any);
+            const { unmount: unmount2 } = makePanel(container2);
+            await new Promise((r) => setTimeout(r, 15));
+
+            expect(container2.textContent).toContain("Per-Card Download Options");
+            expect(container2.textContent).toContain("Hide URL List");
+            expect(container2.querySelector('button[title="Expand Downloaded Media"]')).not.toBeNull();
+            expect(container2.querySelector(".ml-media-list, .ml-asset-grid")).toBeNull();
+
+            // Expand back -> List view and "localized" filter were preserved too
+            (container2.querySelector('button[title="Expand Downloaded Media"]') as any).click();
+            expect((container2.querySelector('button[title="List view"]') as any).className).toContain("is-active");
+            expect((container2.querySelector('select[title="Filter shown media tiles"]') as any).value).toBe("localized");
+            unmount2();
+        } finally {
+            if (hadLocalStorage) {
+                g.localStorage = prevLocalStorage;
+            } else {
+                delete g.localStorage;
+            }
+        }
+    });
+});
+
+describe("ui/gallery-integrator native Character Editor Gallery tab", () => {
+    test("Downloaded Media collapses by default in native Gallery tab and toggles via unobtrusive button", async () => {
+        const galleryTab = domEnv.document.createElement("div") as any;
+        galleryTab.className = "Editor_galleryTab_abc";
+        const nativeScroll = domEnv.document.createElement("div") as any;
+        nativeScroll.className = "Editor_galleryScrollArea_abc";
+        galleryTab.appendChild(nativeScroll);
+        domEnv.document.body.appendChild(galleryTab);
+
+        const editorCtx = {
+            ui: {
+                characterEditor: {
+                    getState: () => ({
+                        open: true,
+                        characterId: "c-native-1",
+                        activeTabId: "gallery",
+                        extensions: {},
+                    }),
+                    onChange: () => () => {},
+                },
+                showConfirm: async () => ({ confirmed: true }),
+            },
+        } as unknown as SpindleFrontendContext;
+
+        const scanWithLocalized = makeScan("c-native-1", {
+            items: [
+                {
+                    normalizedUrl: "https://cdn.example.com/nat.png",
+                    rawUrls: ["https://cdn.example.com/nat.png"],
+                    domain: "cdn.example.com",
+                    mediaKind: "image",
+                    sources: [{ section: "core_fields", label: "Description" }],
+                    occurrenceCount: 1,
+                    status: "localized",
+                    localizedEntry: {
+                        normalizedUrl: "https://cdn.example.com/nat.png",
+                        rawUrls: ["https://cdn.example.com/nat.png"],
+                        imageId: "img-nat-1",
+                        localUrl: "/api/v1/images/img-nat-1",
+                        filename: "nat.png",
+                        mimeType: "image/png",
+                        sizeBytes: 1024,
+                        localizedAt: 1000,
+                        characterIds: ["c-native-1"],
+                        galleryItemIds: {},
+                    },
+                },
+            ],
+        });
+
+        const integrator = new NativeGalleryTabIntegrator(
+            editorCtx,
+            { ...DEFAULT_SETTINGS },
+            makeIdleQueue(),
+            {
+                onScanCharacter: async () => scanWithLocalized,
+                onStartDownload: async () => {},
+                onSaveCharacterOverride: async () => null,
+                onClearFailedUrls: async () => {},
+                onQueueControl: async () => {},
+                onPurgeCharacterCache: async () => {},
+            },
+        );
+
+        integrator.start();
+        await new Promise((r) => setTimeout(r, 15));
+
+        const host = galleryTab.querySelector(".ml-gallery-host") as any;
+        expect(host).not.toBeNull();
+        expect(host.textContent).toContain("Downloaded Media (1)");
+
+        // Collapsed by default: tile grid hidden, expand button present with aria-expanded="false"
+        const expandBtn = host.querySelector('button[title="Expand Downloaded Media"]') as any;
+        expect(expandBtn).not.toBeNull();
+        expect(expandBtn.getAttribute("aria-expanded")).toBe("false");
+        expect(host.querySelector(".ml-asset-grid")).toBeNull();
+
+        // Click unobtrusive toggle -> expands Downloaded Media grid
+        expandBtn.click();
+        const collapseBtn = host.querySelector('button[title="Collapse Downloaded Media"]') as any;
+        expect(collapseBtn).not.toBeNull();
+        expect(collapseBtn.getAttribute("aria-expanded")).toBe("true");
+        expect(host.querySelector(".ml-asset-grid")).not.toBeNull();
+
+        // Click again -> collapses back
+        collapseBtn.click();
+        expect(host.querySelector(".ml-asset-grid")).toBeNull();
+        expect(host.querySelector('button[title="Expand Downloaded Media"]')).not.toBeNull();
+
+        integrator.stop();
+    });
 });
 
 describe("ui/display-swapper URL sanitization, full revert, host-edit guard, & stop() cleanup", () => {
@@ -830,5 +1247,482 @@ describe("frontend setup(ctx) lifecycle & React refresh safety", () => {
         // Teardown cleans UI helpers, cancels timers, and calls ctx.dom.cleanup()
         teardown();
         expect(ctxMock.getCleanupDomCalls()).toBe(1);
+    });
+
+    test("#7.1: CharacterMediaWidget prevents unchecking last greeting, World Book, or domain pill", async () => {
+        const container = domEnv.document.createElement("div") as unknown as HTMLElement;
+        domEnv.document.body.appendChild(container as any);
+        const scan = makeScan("char-empty-pill", {
+            greetingBreakdown: [
+                { greetingIndex: 1, label: "Greeting 1", totalUnique: 1, remoteCount: 1, localizedCount: 0, failedCount: 0 },
+                { greetingIndex: 2, label: "Greeting 2", totalUnique: 1, remoteCount: 0, localizedCount: 0, failedCount: 1 },
+            ],
+            worldBookBreakdown: [
+                { worldBookId: "wb-1", worldBookName: "Lore 1", totalUnique: 1, remoteCount: 1, localizedCount: 0, failedCount: 0 },
+                { worldBookId: "wb-2", worldBookName: "Lore 2", totalUnique: 1, remoteCount: 0, localizedCount: 0, failedCount: 1 },
+            ],
+        });
+        const ctxMock = createFrontendMockCtx({ confirmResult: true });
+        const widget = new CharacterMediaWidget(
+            container,
+            ctxMock.ctx,
+            "char-empty-pill",
+            {
+                ...DEFAULT_SETTINGS,
+                defaultSections: ["core_fields", "alternate_greetings", "world_books"],
+            },
+            makeIdleQueue(),
+            {
+                onScanCharacter: async () => scan,
+                onStartDownload: async () => {},
+                onClearFailedUrls: async () => {},
+                onPurgeCharacterCache: async () => {},
+                onSaveCharacterOverride: async (_cid, ov) => ov,
+                onQueueControl: async () => {},
+            },
+            {
+                initialUiState: {
+                    showDownloadConfig: true,
+                    showGreetingSubfilter: true,
+                    showWorldBookSubfilter: true,
+                },
+            },
+        );
+        await widget.refreshScan(false);
+
+        const dispatch = (el: Element, type: string) =>
+            (el as any).dispatchEvent(new MockEvent(type, { bubbles: true }) as unknown as Event);
+
+        // Greetings subfilter: 2 checkboxes. Uncheck 1st -> allowed; uncheck 2nd -> blocked (stays checked)
+        const getGreetCbs = () =>
+            Array.from(
+                container
+                    .querySelector('[data-scroll-id="greetings-subfilter"]')!
+                    .querySelectorAll("input[type='checkbox']"),
+            ) as HTMLInputElement[];
+        expect(getGreetCbs().length).toBe(2);
+        getGreetCbs()[0]!.checked = false;
+        dispatch(getGreetCbs()[0]!, "change");
+        expect(getGreetCbs()[0]!.checked).toBe(false);
+        getGreetCbs()[1]!.checked = false;
+        dispatch(getGreetCbs()[1]!, "change");
+        expect(getGreetCbs()[1]!.checked).toBe(true);
+
+        // World Books subfilter: 2 checkboxes. Uncheck 1st -> allowed; uncheck 2nd -> blocked (stays checked)
+        const getWbCbs = () =>
+            Array.from(
+                container
+                    .querySelector('[data-scroll-id="worldbooks-subfilter"]')!
+                    .querySelectorAll("input[type='checkbox']"),
+            ) as HTMLInputElement[];
+        expect(getWbCbs().length).toBe(2);
+        getWbCbs()[0]!.checked = false;
+        dispatch(getWbCbs()[0]!, "change");
+        expect(getWbCbs()[0]!.checked).toBe(false);
+        getWbCbs()[1]!.checked = false;
+        dispatch(getWbCbs()[1]!, "change");
+        expect(getWbCbs()[1]!.checked).toBe(true);
+
+        // Domain pills: cdn.example.com and fail.example.com. Uncheck first -> allowed; uncheck second -> blocked
+        const getDomainPills = () =>
+            Array.from(container.querySelectorAll("button.ml-pill")).filter((b) =>
+                (b.textContent ?? "").includes(".example.com"),
+            ) as HTMLButtonElement[];
+        expect(getDomainPills().length).toBe(2);
+        dispatch(getDomainPills()[0]!, "click");
+        expect(getDomainPills()[0]!.classList.contains("is-selected")).toBe(false);
+        dispatch(getDomainPills()[1]!, "click");
+        expect(getDomainPills()[1]!.classList.contains("is-selected")).toBe(true);
+
+        widget.destroy();
+    });
+
+    test("#7.2 & #7.6: onIgnoreUrls flushes pending override save, overlapping scan preserves edits, refresh button locks while busy, and post-confirm destroy aborts", async () => {
+        const container = domEnv.document.createElement("div") as unknown as HTMLElement;
+        domEnv.document.body.appendChild(container as any);
+        const scan = makeScan("char-race");
+        let savedOverride: any = null;
+        let saveCount = 0;
+        let resolveSecondScan!: (res: CharacterMediaScanResult) => void;
+        let scanCall = 0;
+        let downloadCalls = 0;
+        let resolveConfirm!: (res: { confirmed: boolean }) => void;
+
+        const ctxMock = createFrontendMockCtx({ confirmResult: true });
+        (ctxMock.ctx.ui as any).showConfirm = () =>
+            new Promise<{ confirmed: boolean }>((resolve) => {
+                resolveConfirm = resolve;
+            });
+
+        const widget = new CharacterMediaWidget(
+            container,
+            ctxMock.ctx,
+            "char-race",
+            { ...DEFAULT_SETTINGS, confirmThreshold: 0 },
+            makeIdleQueue(),
+            {
+                onScanCharacter: async () => {
+                    scanCall++;
+                    if (scanCall === 1) return scan;
+                    if (scanCall === 2) {
+                        return await new Promise<CharacterMediaScanResult>((resolve) => {
+                            resolveSecondScan = resolve;
+                        });
+                    }
+                    return scan;
+                },
+                onStartDownload: async () => {
+                    downloadCalls++;
+                },
+                onClearFailedUrls: async () => {},
+                onPurgeCharacterCache: async () => {},
+                onSaveCharacterOverride: async (_cid, ov) => {
+                    saveCount++;
+                    savedOverride = ov;
+                    return ov;
+                },
+                onQueueControl: async () => {},
+            },
+            { defaultExpandConfig: true },
+        );
+        await widget.refreshScan(false);
+
+        const clickEl = (el: Element) =>
+            (el as any).dispatchEvent(new MockEvent("click", { bubbles: true }) as unknown as Event);
+        const changeEl = (el: Element) =>
+            (el as any).dispatchEvent(new MockEvent("change", { bubbles: true }) as unknown as Event);
+
+        const refreshBtn = Array.from(container.querySelectorAll("button")).find(
+            (b) => b.title.includes("Rescan character fields"),
+        ) as HTMLButtonElement;
+        clickEl(refreshBtn);
+        expect(refreshBtn.disabled).toBe(true);
+
+        // Toggle Alternate Greetings section off while second scan is in-flight
+        const getAltGreetCb = () => {
+            const label = Array.from(container.querySelectorAll(".ml-options-panel label")).find((c) =>
+                (c.textContent ?? "").includes("Alternate Greetings"),
+            )!;
+            return label.querySelector("input[type='checkbox']") as HTMLInputElement;
+        };
+        const altGreetCb = getAltGreetCb();
+        altGreetCb.checked = false;
+        changeEl(altGreetCb);
+        expect(getAltGreetCb().checked).toBe(false);
+
+        // Finish second scan while debounce is still pending -> local filter selection remains unchecked
+        resolveSecondScan(scan);
+        await new Promise((r) => setTimeout(r, 20));
+        expect(getAltGreetCb().checked).toBe(false);
+        // Wait for 150ms debounce timer to fire and persist the override
+        await new Promise((r) => setTimeout(r, 165));
+        expect(saveCount).toBeGreaterThanOrEqual(1);
+        expect(savedOverride?.sections).not.toContain("alternate_greetings");
+        expect(getAltGreetCb().checked).toBe(false);
+
+        // Trigger ignore failure while another debounced edit is pending -> must flush first
+        const domainPills = Array.from(container.querySelectorAll("button.ml-pill")).filter((b) =>
+            (b.textContent ?? "").includes(".example.com"),
+        ) as HTMLButtonElement[];
+        clickEl(domainPills[0]!);
+        const prevSaves = saveCount;
+        const ignoreBtn = Array.from(container.querySelectorAll("button")).find(
+            (b) => (b.textContent ?? "") === "Ignore All",
+        ) as HTMLButtonElement;
+        clickEl(ignoreBtn);
+        await new Promise((r) => setTimeout(r, 20));
+        expect(saveCount).toBeGreaterThan(prevSaves);
+        expect(savedOverride?.excludedUrls).toContain("https://cdn.example.com/char-race-fail.png");
+
+        // Re-enable domain pill 0 so 1 remote item matches, then start one-click localize above confirmThreshold -> destroy before confirm resolves -> no download
+        const reDomainPills = Array.from(container.querySelectorAll("button.ml-pill")).filter((b) =>
+            (b.textContent ?? "").includes(".example.com"),
+        ) as HTMLButtonElement[];
+        clickEl(reDomainPills[0]!);
+        const localizeBtn = Array.from(container.querySelectorAll("button")).find((b) =>
+            (b.textContent ?? "").includes("Localize"),
+        ) as HTMLButtonElement;
+        clickEl(localizeBtn);
+        widget.destroy();
+        resolveConfirm({ confirmed: true });
+        await new Promise((r) => setTimeout(r, 20));
+        expect(downloadCalls).toBe(0);
+    });
+
+    test("#7.3, #7.4, #7.5, #7.6: Drawer panel Gallery destroy/refresh, scan setting invalidation, 50/page Library pagination, lightbox single-refresh without Random reshuffle, and tab-scoped errors", async () => {
+        const container = domEnv.document.createElement("div") as unknown as HTMLElement;
+        domEnv.document.body.appendChild(container as any);
+        const ctxMock = createFrontendMockCtx({ activeCharacterId: "char-1", confirmResult: true });
+        let currentSettings: MediaLocalizerSettings = { ...DEFAULT_SETTINGS };
+        const stats: StorageStatsSummary = {
+            totalAssets: 2,
+            totalSizeBytes: 240,
+            totalFailedUrls: 0,
+            settings: currentSettings,
+        };
+        let scanCalls = 0;
+        let galleryLoads = 0;
+        const purgedUrls: string[] = [];
+        let rejectSettingsSave!: (err: Error) => void;
+
+        const libChars = Array.from({ length: 120 }, (_, i) => ({
+            characterId: `lib-${i + 1}`,
+            characterName: `Library Char ${String(i + 1).padStart(3, "0")}`,
+            totalUnique: 1,
+            localizedCount: 1,
+            localizedBytes: 512,
+            remoteCount: 1,
+            failedCount: 0,
+            sectionRemoteCounts: {
+                creator_notes: 0,
+                first_mes: 0,
+                core_fields: 1,
+                alternate_greetings: 0,
+                world_books: 0,
+                regex_scripts: 0,
+            },
+        }));
+
+        const galleryChars = [
+            {
+                characterId: "g-1",
+                characterName: "Alpha",
+                tags: [],
+                avatarImageId: null,
+                avatarUrl: null,
+                localizedAssets: [
+                    {
+                        normalizedUrl: "https://cdn.example.com/a1.png",
+                        rawUrls: ["https://cdn.example.com/a1.png"],
+                        imageId: "img-a1",
+                        localUrl: "/api/v1/images/img-a1",
+                        mediaKind: "image" as const,
+                        mimeType: "image/png",
+                        sizeBytes: 120,
+                        filename: "a1.png",
+                        localizedAt: 100,
+                        characterIds: ["g-1"],
+                        galleryItemIds: {},
+                    },
+                    {
+                        normalizedUrl: "https://cdn.example.com/a2.png",
+                        rawUrls: ["https://cdn.example.com/a2.png"],
+                        imageId: "img-a2",
+                        localUrl: "/api/v1/images/img-a2",
+                        mediaKind: "image" as const,
+                        mimeType: "image/png",
+                        sizeBytes: 120,
+                        filename: "a2.png",
+                        localizedAt: 150,
+                        characterIds: ["g-1"],
+                        galleryItemIds: {},
+                    },
+                ],
+                expressions: [],
+                totalSizeBytes: 120,
+                lastLocalizedAt: 100,
+            },
+            {
+                characterId: "g-2",
+                characterName: "Zeta",
+                tags: [],
+                avatarImageId: null,
+                avatarUrl: null,
+                localizedAssets: [
+                    {
+                        normalizedUrl: "https://cdn.example.com/z1.png",
+                        rawUrls: ["https://cdn.example.com/z1.png"],
+                        imageId: "img-z1",
+                        localUrl: "/api/v1/images/img-z1",
+                        mediaKind: "image" as const,
+                        mimeType: "image/png",
+                        sizeBytes: 120,
+                        filename: "z1.png",
+                        localizedAt: 200,
+                        characterIds: ["g-2"],
+                        galleryItemIds: {},
+                    },
+                ],
+                expressions: [],
+                totalSizeBytes: 120,
+                lastLocalizedAt: 200,
+            },
+        ];
+
+        const panel = new MediaLocalizerDrawerPanel(
+            ctxMock.ctx,
+            currentSettings,
+            stats,
+            makeIdleQueue(),
+            {
+                onScanCharacter: async () => {
+                    scanCalls++;
+                    return makeScan("char-1");
+                },
+                onScanLibrary: async () => ({
+                    characters: libChars,
+                    totalUniqueRemote: 120,
+                }),
+                onListLibraryMedia: async () => {
+                    galleryLoads++;
+                    return galleryChars.map((c) => ({
+                        ...c,
+                        localizedAssets: c.localizedAssets.filter(
+                            (a) => !purgedUrls.includes(a.normalizedUrl),
+                        ),
+                    }));
+                },
+                onStartDownload: async () => {},
+                onClearFailedUrls: async () => {},
+                onPurgeCharacterCache: async (_cid, urls) => {
+                    if (urls) purgedUrls.push(...urls);
+                },
+                onBulkPurgeCharacters: async () => {},
+                onSaveCharacterOverride: async (_cid, ov) => ov,
+                onQueueControl: async () => {},
+                onUpdateSettings: (patch) => {
+                    if ("maxFileSizeMb" in patch) {
+                        return new Promise<any>((_, reject) => {
+                            rejectSettingsSave = reject;
+                        });
+                    }
+                    currentSettings = { ...currentSettings, ...patch };
+                    return Promise.resolve({
+                        settings: currentSettings,
+                        stats: { ...stats, settings: currentSettings },
+                    });
+                },
+                onClearFailed: async () => ({ cleared: 0, stats }),
+            },
+        );
+
+        const dispatch = (el: Element, type: string) =>
+            (el as any).dispatchEvent(new MockEvent(type, { bubbles: true }) as unknown as Event);
+
+        const unmount = panel.mount(container);
+        await new Promise((r) => setTimeout(r, 15));
+        expect(scanCalls).toBe(1);
+
+        // Changing scanBareUrls invalidates character scan cache -> re-scans even when scan is already cached
+        const updatedSettings = { ...currentSettings, scanBareUrls: false };
+        panel.updateExternalState(updatedSettings, stats, makeIdleQueue());
+        await new Promise((r) => setTimeout(r, 15));
+        expect(scanCalls).toBe(2);
+
+        // Switch to Settings, reject an in-flight save AFTER switching away -> must not show error on active tab
+        const settingsBtn = Array.from(container.querySelectorAll("button.ml-drawer-nav-btn")).find((b) =>
+            (b.textContent ?? "").includes("Settings"),
+        ) as HTMLButtonElement;
+        dispatch(settingsBtn, "click");
+        const maxSizeCard = Array.from(container.querySelectorAll(".ml-check-card")).find((c) =>
+            (c.textContent ?? "").includes("Max File Size (MB)"),
+        )!;
+        const maxSizeInput = maxSizeCard.querySelector("input[type='number']") as HTMLInputElement;
+        maxSizeInput.value = "42";
+        dispatch(maxSizeInput, "change");
+
+        // Switch to Library before save rejects -> scan library, check 50/page pagination & isolated checkbox DOM update
+        const libraryBtn = Array.from(container.querySelectorAll("button.ml-drawer-nav-btn")).find((b) =>
+            (b.textContent ?? "").includes("Library"),
+        ) as HTMLButtonElement;
+        dispatch(libraryBtn, "click");
+        rejectSettingsSave(new Error("settings boom"));
+        await new Promise((r) => setTimeout(r, 20));
+        expect(container.querySelector(".ml-error-banner")).toBeNull();
+
+        const scanLibBtn = container.querySelector('button[title*="Scan all characters"]') as HTMLButtonElement;
+        dispatch(scanLibBtn, "click");
+        await new Promise((r) => setTimeout(r, 20));
+
+        const rowsPage1 = container.querySelectorAll(".ml-lib-row");
+        expect(rowsPage1.length).toBe(50);
+        const firstCheckbox = rowsPage1[0]!.querySelector("input[type='checkbox']") as HTMLInputElement;
+        const sentinelRow = rowsPage1[0]!;
+        firstCheckbox.checked = true;
+        dispatch(firstCheckbox, "change");
+        // Targeted DOM update preserves row nodes rather than rebuilding the full list
+        expect(container.querySelectorAll(".ml-lib-row")[0]).toBe(sentinelRow);
+
+        const getNextPageBtn = () =>
+            Array.from(container.querySelectorAll("button")).find(
+                (b) => (b.textContent ?? "") === "Next",
+            ) as HTMLButtonElement;
+        dispatch(getNextPageBtn(), "click");
+        expect(container.querySelectorAll(".ml-lib-row").length).toBe(50);
+        dispatch(getNextPageBtn(), "click");
+        expect(container.querySelectorAll(".ml-lib-row").length).toBe(20);
+
+        // Switch to Gallery tab, sort Random, open lightbox & delete 1 item -> single refresh and no Random reshuffle
+        const galleryBtn = Array.from(container.querySelectorAll("button.ml-drawer-nav-btn")).find((b) =>
+            (b.textContent ?? "").includes("Gallery"),
+        ) as HTMLButtonElement;
+        dispatch(galleryBtn, "click");
+        await new Promise((r) => setTimeout(r, 20));
+        expect(galleryLoads).toBe(1);
+
+        const sortSelect = container.querySelector("select.ml-select") as HTMLSelectElement;
+        sortSelect.value = "random";
+        dispatch(sortSelect, "change");
+
+        // Open Alpha drilldown and open lightbox on its asset
+        const alphaName = Array.from(container.querySelectorAll(".ml-char-card-name")).find(
+            (el) => el.textContent === "Alpha",
+        )!;
+        const alphaCard = alphaName.closest(".ml-char-card") as HTMLElement;
+        dispatch(alphaCard, "click");
+        const weightsBeforeDelete = new Map((panel as any).galleryCache.randomWeights);
+        const thumb = container.querySelector(".ml-asset-thumb-wrap") as HTMLElement;
+        dispatch(thumb, "click");
+        const removeBtn = Array.from(domEnv.document.body.querySelectorAll("button")).find(
+            (b) => (b.textContent ?? "") === "Remove",
+        ) as unknown as HTMLButtonElement;
+        const loadsBeforeDelete = galleryLoads;
+        dispatch(removeBtn, "click");
+        await new Promise((r) => setTimeout(r, 25));
+
+        expect(purgedUrls.length).toBe(1);
+        expect(["https://cdn.example.com/a1.png", "https://cdn.example.com/a2.png"]).toContain(
+            purgedUrls[0]!,
+        );
+        expect(galleryLoads).toBe(loadsBeforeDelete + 1); // single refresh, not double
+        expect(new Map((panel as any).galleryCache.randomWeights)).toEqual(weightsBeforeDelete);
+
+        // Return from drilldown and verify external totalAssets change while on Gallery refreshes rather than blanking to empty state
+        const backBtn = Array.from(container.querySelectorAll("button")).find((b) =>
+            (b.textContent ?? "").includes("All Characters"),
+        ) as HTMLButtonElement;
+        dispatch(backBtn, "click");
+        panel.updateExternalState(
+            updatedSettings,
+            { totalAssets: 3, totalSizeBytes: 360, totalFailedUrls: 0, settings: updatedSettings },
+            makeIdleQueue(),
+        );
+        await new Promise((r) => setTimeout(r, 20));
+        expect(galleryLoads).toBe(loadsBeforeDelete + 2);
+        expect(container.querySelector(".ml-char-card-name")).not.toBeNull();
+
+        // Switching away destroys active GalleryView so subsequent external invalidation won't call onLoadLibraryMedia
+        const charBtn = Array.from(container.querySelectorAll("button.ml-drawer-nav-btn")).find((b) =>
+            (b.textContent ?? "").includes("Character"),
+        ) as HTMLButtonElement;
+        dispatch(charBtn, "click");
+        const loadsAfterLeave = galleryLoads;
+        panel.updateExternalState(
+            updatedSettings,
+            { totalAssets: 4, totalSizeBytes: 480, totalFailedUrls: 0, settings: updatedSettings },
+            makeIdleQueue(),
+        );
+        await new Promise((r) => setTimeout(r, 15));
+        expect(galleryLoads).toBe(loadsAfterLeave);
+
+        unmount();
+    });
+
+    test("#7.7: styles include drawer media list uncap, truncation, error wrapping, nav wrapping, and tooltip edge alignment", () => {
+        expect(MEDIA_LOCALIZER_STYLES).toContain(".ml-drawer-root .ml-media-list");
+        expect(MEDIA_LOCALIZER_STYLES).toContain(".ml-check-card-left > span");
+        expect(MEDIA_LOCALIZER_STYLES).toContain("overflow-wrap: anywhere;");
+        expect(MEDIA_LOCALIZER_STYLES).toContain("flex-wrap: wrap;");
+        expect(MEDIA_LOCALIZER_STYLES).toContain(".ml-setting-toggle-row .ml-tip-popover");
     });
 });

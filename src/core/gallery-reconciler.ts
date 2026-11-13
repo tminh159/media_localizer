@@ -167,14 +167,15 @@ export async function reconcileCharacterGalleryWithIndex(
           userId,
         });
         const rows = Array.isArray(listRes?.data) ? listRes.data : [];
+        if (rows.length === 0) break;
         for (const img of rows) {
           if (img && typeof img.id === "string") {
             imageMetaById.set(img.id, img);
           }
         }
         offset += rows.length;
-        const total = typeof listRes?.total === "number" ? listRes.total : rows.length;
-        if (rows.length < pageLimit || offset >= total) break;
+        const total = typeof listRes?.total === "number" ? listRes.total : undefined;
+        if (total !== undefined ? offset >= total : rows.length < pageLimit) break;
       }
     } catch {
       // ignore

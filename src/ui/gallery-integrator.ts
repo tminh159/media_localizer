@@ -11,9 +11,12 @@ import {
   type CharacterMediaWidgetCallbacks,
 } from "./character-media-widget.ts";
 
+const DOM_WAIT_TIMEOUT_MS = 10_000;
+
 export class NativeGalleryTabIntegrator {
   private unsubscribeEditor: (() => void) | null = null;
   private domWaitObserver: MutationObserver | null = null;
+  private domWaitTimer: ReturnType<typeof setTimeout> | null = null;
   private galleryContentObserver: MutationObserver | null = null;
   private galleryRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   private lastKnownGalleryCardCount = -1;
@@ -46,6 +49,7 @@ export class NativeGalleryTabIntegrator {
       this.handleEditorState(this.currentState);
 
       this.unsubscribeEditor = editorApi.onChange((state) => {
+        if (this.stopped) return;
         this.currentState = state;
         this.handleEditorState(state);
       });
@@ -71,16 +75,21 @@ export class NativeGalleryTabIntegrator {
   ): void {
     this.settings = settings;
     this.queueProgress = queueProgress;
+    if (this.stopped) return;
     this.widget?.updateExternalState(settings, queueProgress);
   }
 
   refreshActiveScan(characterId?: string): void {
-    if (!this.widget) return;
+    if (this.stopped || !this.widget) return;
     if (characterId && this.widget.getCharacterId() !== characterId) return;
     void this.widget.refreshScan(true);
   }
 
   private disconnectDomWaitObserver(): void {
+    if (this.domWaitTimer !== null) {
+      clearTimeout(this.domWaitTimer);
+      this.domWaitTimer = null;
+    }
     if (this.domWaitObserver) {
       this.domWaitObserver.disconnect();
       this.domWaitObserver = null;
@@ -101,6 +110,7 @@ export class NativeGalleryTabIntegrator {
 
   private unmountHost(): void {
     this.disconnectGalleryContentObserver();
+    this.widget?.flushPendingOverrideSave();
     this.widget?.destroy();
     this.widget = null;
     if (this.mountedTabEl) {
@@ -115,6 +125,7 @@ export class NativeGalleryTabIntegrator {
 
   private handleEditorState(state: SpindleCharacterEditorState): void {
     this.disconnectDomWaitObserver();
+    if (this.stopped) return;
 
     if (!state.open || state.activeTabId !== "gallery" || !state.characterId) {
       this.unmountHost();
@@ -129,6 +140,10 @@ export class NativeGalleryTabIntegrator {
     // If React hasn't committed `.galleryTab` yet, observe briefly until it mounts
     if (typeof MutationObserver !== "undefined" && typeof document !== "undefined" && document.body) {
       this.domWaitObserver = new MutationObserver(() => {
+        if (this.stopped) {
+          this.disconnectDomWaitObserver();
+          return;
+        }
         if (
           this.currentState.open &&
           this.currentState.activeTabId === "gallery" &&
@@ -145,11 +160,15 @@ export class NativeGalleryTabIntegrator {
         childList: true,
         subtree: true,
       });
+      this.domWaitTimer = setTimeout(() => {
+        this.domWaitTimer = null;
+        this.disconnectDomWaitObserver();
+      }, DOM_WAIT_TIMEOUT_MS);
     }
   }
 
   private tryMountIntoGalleryTab(characterId: string): boolean {
-    if (typeof document === "undefined") return false;
+    if (this.stopped || typeof document === "undefined") return false;
     const galleryTab = document.querySelector<HTMLElement>('[class*="galleryTab"]');
     if (!galleryTab) return false;
 
@@ -172,7 +191,11 @@ export class NativeGalleryTabIntegrator {
       this.settings,
       this.queueProgress,
       this.callbacks,
-      { inDrawer: false, defaultExpandConfig: false },
+      {
+        inDrawer: false,
+        defaultExpandConfig: false,
+        defaultExpandDownloadedMedia: false,
+      },
     );
 
     this.mountedTabEl = galleryTab;
@@ -194,6 +217,7 @@ export class NativeGalleryTabIntegrator {
     this.lastKnownGalleryCardCount = countCards();
 
     this.galleryContentObserver = new MutationObserver((mutations) => {
+      if (this.stopped) return;
       // Ignore mutations strictly inside our own widget host
       const hasExternalMutation = mutations.some(
         (m) => !this.hostEl || !this.hostEl.contains(m.target),

@@ -237,6 +237,9 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     skippedByCapCount: 0,
   };
 
+  let hasLiveStatsUpdate = false;
+  let hasLiveQueueUpdate = false;
+
   let reqSeq = 0;
   const pendingRpc = new Map<
     string,
@@ -252,6 +255,9 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     payload: Record<string, unknown> = {},
     timeoutMs = 60_000,
   ): Promise<T> {
+    if (unloaded) {
+      return Promise.reject(new Error("Media Localizer was unloaded"));
+    }
     const requestId = `ml_rpc_${Date.now()}_${++reqSeq}`;
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -296,6 +302,51 @@ export function setup(ctx: SpindleFrontendContext): () => void {
   // Track in-flight gallery link operations per `characterId:imageId` to prevent duplicates
   const inFlightGalleryLinks = new Set<string>();
   const characterLinkLocks = new Map<string, Promise<void>>();
+  const activeFetchControllers = new Set<AbortController>();
+  const NATIVE_GALLERY_FETCH_TIMEOUT_MS = 15_000;
+
+  async function fetchWithTimeout(
+    input: string,
+    init: RequestInit,
+    timeoutMs = NATIVE_GALLERY_FETCH_TIMEOUT_MS,
+  ): Promise<Response> {
+    if (unloaded) {
+      throw new Error("Media Localizer was unloaded");
+    }
+    const controller =
+      typeof AbortController !== "undefined" ? new AbortController() : null;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    if (controller) {
+      activeFetchControllers.add(controller);
+      timer = setTimeout(() => {
+        controller.abort();
+      }, timeoutMs);
+    }
+    try {
+      return await fetch(input, {
+        ...init,
+        ...(controller ? { signal: controller.signal } : {}),
+      });
+    } finally {
+      if (timer !== null) {
+        clearTimeout(timer);
+      }
+      if (controller) {
+        activeFetchControllers.delete(controller);
+      }
+    }
+  }
+
+  cleanups.push(() => {
+    for (const controller of activeFetchControllers) {
+      try {
+        controller.abort();
+      } catch {
+        // ignore
+      }
+    }
+    activeFetchControllers.clear();
+  });
 
   /**
    * Direct REST fallback for Lumiverse's character gallery endpoint:
@@ -304,10 +355,10 @@ export function setup(ctx: SpindleFrontendContext): () => void {
    */
   async function fetchNativeCharacterGallery(
     characterId: string,
-  ): Promise<NativeGalleryApiItem[]> {
-    if (typeof fetch !== "function" || !characterId || unloaded) return [];
+  ): Promise<NativeGalleryApiItem[] | null> {
+    if (typeof fetch !== "function" || !characterId || unloaded) return null;
     try {
-      const response = await fetch(
+      const response = await fetchWithTimeout(
         `/api/v1/characters/${encodeURIComponent(characterId)}/gallery`,
         {
           method: "GET",
@@ -321,7 +372,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
         console.warn(
           `[media_localizer] Failed fetching native gallery (${response.status} ${response.statusText})`,
         );
-        return [];
+        return null;
       }
       const body = (await response.json()) as
         | NativeGalleryApiItem[]
@@ -340,8 +391,10 @@ export function setup(ctx: SpindleFrontendContext): () => void {
           typeof item.image_id === "string",
       );
     } catch (err) {
-      console.warn("[media_localizer] Failed fetching native gallery:", err);
-      return [];
+      if (!unloaded) {
+        console.warn("[media_localizer] Failed fetching native gallery:", err);
+      }
+      return null;
     }
   }
 
@@ -384,7 +437,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
 
       try {
         if (unloaded) return;
-        const existingGallery = await fetchNativeCharacterGallery(characterId);
+        const existingGallery = (await fetchNativeCharacterGallery(characterId)) ?? [];
         const existingByImageId = new Map<string, NativeGalleryApiItem>();
         for (const gItem of existingGallery) {
           existingByImageId.set(gItem.image_id, gItem);
@@ -404,7 +457,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
           }
 
           try {
-            const response = await fetch(
+            const response = await fetchWithTimeout(
               `/api/v1/characters/${encodeURIComponent(characterId)}/gallery/link`,
               {
                 method: "POST",
@@ -444,10 +497,12 @@ export function setup(ctx: SpindleFrontendContext): () => void {
               addedNewGalleryRow = true;
             }
           } catch (err) {
-            console.warn(
-              "[media_localizer] Network error linking gallery image:",
-              err,
-            );
+            if (!unloaded) {
+              console.warn(
+                "[media_localizer] Network error linking gallery image:",
+                err,
+              );
+            }
           }
         }
       } finally {
@@ -490,6 +545,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     characterId: string,
     galleryItemIds: string[],
     imageIds: string[],
+    options?: { trustGalleryItemIdsWithoutLookup?: boolean },
   ): Promise<void> {
     if (
       typeof fetch !== "function" ||
@@ -500,15 +556,24 @@ export function setup(ctx: SpindleFrontendContext): () => void {
       return;
     }
 
-    const idsToDelete = new Set<string>(galleryItemIds.filter(Boolean));
-    const targetImages = imageIds.filter(Boolean);
-    if (targetImages.length > 0 && idsToDelete.size < targetImages.length) {
-      const targetImageSet = new Set<string>(targetImages);
-      const existingGallery = await fetchNativeCharacterGallery(characterId);
+    const targetGalleryIds = new Set<string>(galleryItemIds.filter(Boolean));
+    const targetImageIds = new Set<string>(imageIds.filter(Boolean));
+    if (targetGalleryIds.size === 0 && targetImageIds.size === 0) {
+      return;
+    }
+
+    const idsToDelete = new Set<string>();
+    const existingGallery = await fetchNativeCharacterGallery(characterId);
+    if (existingGallery !== null) {
       for (const gItem of existingGallery) {
-        if (targetImageSet.has(gItem.image_id) && gItem.id) {
+        if (!gItem.id) continue;
+        if (targetGalleryIds.has(gItem.id) || targetImageIds.has(gItem.image_id)) {
           idsToDelete.add(gItem.id);
         }
+      }
+    } else if (options?.trustGalleryItemIdsWithoutLookup) {
+      for (const id of targetGalleryIds) {
+        idsToDelete.add(id);
       }
     }
 
@@ -518,7 +583,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     for (const itemId of idsToDelete) {
       if (unloaded) break;
       try {
-        const res = await fetch(
+        const res = await fetchWithTimeout(
           `/api/v1/characters/${encodeURIComponent(characterId)}/gallery/${encodeURIComponent(itemId)}`,
           {
             method: "DELETE",
@@ -536,7 +601,9 @@ export function setup(ctx: SpindleFrontendContext): () => void {
           );
         }
       } catch (err) {
-        console.warn("[media_localizer] Network error deleting gallery item:", err);
+        if (!unloaded) {
+          console.warn("[media_localizer] Network error deleting gallery item:", err);
+        }
       }
     }
 
@@ -547,6 +614,8 @@ export function setup(ctx: SpindleFrontendContext): () => void {
 
   // 4. Display-Time Swapper
   const inFlightScans = new Map<string, Promise<CharacterMediaScanResult>>();
+  let scanSeq = 0;
+  const latestScanSeqByChar = new Map<string, number>();
   const displaySwapper = new NonDestructiveDisplaySwapper(ctx);
   displaySwapper.start();
   cleanups.push(() => displaySwapper.stop());
@@ -637,20 +706,29 @@ export function setup(ctx: SpindleFrontendContext): () => void {
       characterId: string,
       forceRefresh = false,
     ): Promise<CharacterMediaScanResult> {
+      const forcedKey = `${characterId}:1`;
       const scanKey = `${characterId}:${forceRefresh ? "1" : "0"}`;
-      const inflight = inFlightScans.get(scanKey);
+      const inflight =
+        (!forceRefresh ? inFlightScans.get(forcedKey) : undefined) ??
+        inFlightScans.get(scanKey);
       if (inflight) return inflight;
+
+      const mySeq = ++scanSeq;
+      latestScanSeqByChar.set(characterId, mySeq);
+
       const run = (async () => {
         const res = await callBackend<{
           scan: CharacterMediaScanResult;
           urlMapPayload: ActiveDisplayUrlMapPayload;
           pendingGalleryLinks?: PendingGalleryLinkItem[];
         }>("scan_character", { characterId, forceRefresh });
+        if (unloaded) return res.scan;
         if (res.urlMapPayload) {
           displaySwapper.updateMap(res.urlMapPayload);
         }
+        const isLatestForChar = latestScanSeqByChar.get(characterId) === mySeq;
         const activeCharId = resolveActiveContextCharacterId();
-        if (activeCharId && activeCharId === characterId && res.scan) {
+        if (isLatestForChar && activeCharId && activeCharId === characterId && res.scan) {
           lastActiveCharacterScan = res.scan;
           refreshPendingCountsFromActiveScan();
         }
@@ -670,7 +748,9 @@ export function setup(ctx: SpindleFrontendContext): () => void {
       try {
         return await run;
       } finally {
-        inFlightScans.delete(scanKey);
+        if (inFlightScans.get(scanKey) === run) {
+          inFlightScans.delete(scanKey);
+        }
       }
     },
 
@@ -695,6 +775,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
         stats: StorageStatsSummary;
       }>("clear_failed", { urls });
       if (res.stats) {
+        hasLiveStatsUpdate = true;
         currentStats = res.stats;
         currentSettings = res.stats.settings;
       }
@@ -707,6 +788,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
         { filter },
       );
       if (res.queueProgress) {
+        hasLiveQueueUpdate = true;
         currentQueueProgress = res.queueProgress;
         notifyUiStateChanged();
       }
@@ -721,6 +803,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
         { control, targetUrl },
       );
       if (res.queueProgress) {
+        hasLiveQueueUpdate = true;
         currentQueueProgress = res.queueProgress;
         notifyUiStateChanged();
       }
@@ -741,15 +824,18 @@ export function setup(ctx: SpindleFrontendContext): () => void {
         characterId,
         res.removedGalleryItemIds ?? [],
         res.removedImageIds ?? [],
+        { trustGalleryItemIdsWithoutLookup: true },
       );
 
       if (res.stats) {
+        hasLiveStatsUpdate = true;
         currentStats = res.stats;
         currentSettings = res.stats.settings;
       }
       if (res.urlMapPayload) {
         displaySwapper.updateMap(res.urlMapPayload);
       }
+      latestScanSeqByChar.set(characterId, ++scanSeq);
       if (lastActiveCharacterScan?.characterId === characterId) {
         lastActiveCharacterScan = null;
       }
@@ -765,42 +851,62 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     },
 
     async onBulkPurgeCharacters(characterIds: string[]): Promise<void> {
+      const uniqueCharIds = Array.from(
+        new Set(
+          characterIds
+            .filter((id): id is string => typeof id === "string")
+            .map((id) => id.trim())
+            .filter(Boolean),
+        ),
+      );
+      if (uniqueCharIds.length === 0) return;
+
       const res = await callBackend<{
         removedGalleryItemIds?: string[];
         removedImageIds?: string[];
         stats: StorageStatsSummary;
         urlMapPayload: ActiveDisplayUrlMapPayload;
-      }>("purge_characters", { characterIds });
+      }>("purge_characters", { characterIds: uniqueCharIds });
 
-      for (const charId of characterIds) {
-        await removeItemsFromNativeGallery(
-          charId,
-          res.removedGalleryItemIds ?? [],
-          res.removedImageIds ?? [],
-        );
+      const removedGalleryIds = res.removedGalleryItemIds ?? [];
+      const removedImageIds = res.removedImageIds ?? [];
+      if (removedGalleryIds.length > 0 || removedImageIds.length > 0) {
+        for (const charId of uniqueCharIds) {
+          if (unloaded) break;
+          await removeItemsFromNativeGallery(
+            charId,
+            removedGalleryIds,
+            removedImageIds,
+            { trustGalleryItemIdsWithoutLookup: uniqueCharIds.length === 1 },
+          );
+        }
       }
 
       if (res.stats) {
+        hasLiveStatsUpdate = true;
         currentStats = res.stats;
         currentSettings = res.stats.settings;
       }
       if (res.urlMapPayload) {
         displaySwapper.updateMap(res.urlMapPayload);
       }
+      for (const charId of uniqueCharIds) {
+        latestScanSeqByChar.set(charId, ++scanSeq);
+      }
       if (
         lastActiveCharacterScan &&
-        characterIds.includes(lastActiveCharacterScan.characterId)
+        uniqueCharIds.includes(lastActiveCharacterScan.characterId)
       ) {
         lastActiveCharacterScan = null;
       }
       notifyUiStateChanged();
       const activeCharId =
         resolveActiveContextCharacterId() ?? lastObservedContextCharId;
-      if (!unloaded && activeCharId && characterIds.includes(activeCharId)) {
+      if (!unloaded && activeCharId && uniqueCharIds.includes(activeCharId)) {
         void callbacks.onScanCharacter(activeCharId, true).catch(() => {});
       }
       if (!unloaded) {
-        for (const charId of characterIds) {
+        for (const charId of uniqueCharIds) {
           galleryIntegrator.refreshActiveScan(charId);
         }
       }
@@ -843,6 +949,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
         stats: StorageStatsSummary;
         urlMapPayload: ActiveDisplayUrlMapPayload;
       }>("update_settings", { patch });
+      hasLiveStatsUpdate = true;
       currentSettings = res.settings;
       currentStats = res.stats;
       if (res.urlMapPayload) {
@@ -857,6 +964,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
         cleared: number;
         stats: StorageStatsSummary;
       }>("clear_failed", {});
+      hasLiveStatsUpdate = true;
       currentStats = res.stats;
       currentSettings = res.stats.settings;
       notifyUiStateChanged();
@@ -871,10 +979,9 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     currentQueueProgress,
     callbacks,
   );
-  galleryIntegrator.start();
   cleanups.push(() => galleryIntegrator.stop());
 
-  // 7. Drawer Tab Registration
+  // 7. Drawer Panel & Portrait Button
   const drawerPanel = new MediaLocalizerDrawerPanel(
     ctx,
     currentSettings,
@@ -883,36 +990,41 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     callbacks,
   );
 
-  try {
-    const tab = ctx.ui.registerDrawerTab({
-      id: "media_localizer",
-      title: "Media Localizer",
-      shortName: "Media",
-      description:
-        "Non-destructively localizes external media embedded in character cards into the Character Gallery & Portrait Panel with granular filters and display-time swapping.",
-      keywords: ["media", "localize", "images", "gallery", "cache", "offline"],
-      headerTitle: "Media Localizer",
-      iconSvg: `<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>`,
-      guide: {
-        title: "Media Localizer Guide",
-        markdown: [
-          "### Non-Destructive Media Localization",
-          "Media Localizer scans character cards, linked World Books, and Regex Scripts for external image, video, and audio URLs.",
-          "",
-          "- **Zero Card Mutation**: Original character card JSON and text fields are never overwritten.",
-          "- **Live Display Swapping**: Localized URLs are transparently swapped in the DOM at display time (`<img>`, `<video>`, `<audio>`, `<source>`, `srcset`, inline SVG `<image>`, CSS `background-image`, and same-origin iframes).",
-          "- **Native Gallery Sync**: Downloaded images are automatically linked into the character's native Lumiverse Gallery & Portrait Panel, and existing Gallery images are adopted automatically.",
-          "- **Granular Controls**: Filter by card section, individual alternate greetings, domain, or explicit URLs.",
-        ].join("\n"),
-      },
-    });
-    drawerTabSetBadge = (text) => tab.setBadge(text);
-    activateDrawerTab = () => tab.activate();
-    updateDrawerTabBadge();
-    const unmountDrawer = drawerPanel.mount(tab.root);
-    cleanups.push(unmountDrawer);
-  } catch (err) {
-    console.warn("[media_localizer] Failed to register drawer tab:", err);
+  let drawerTabRegistered = false;
+  function tryRegisterDrawerTab(): void {
+    if (unloaded || drawerTabRegistered || !ctx.ui?.registerDrawerTab) return;
+    try {
+      const tab = ctx.ui.registerDrawerTab({
+        id: "media_localizer",
+        title: "Media Localizer",
+        shortName: "Media",
+        description:
+          "Non-destructively localizes external media embedded in character cards into the Character Gallery & Portrait Panel with granular filters and display-time swapping.",
+        keywords: ["media", "localize", "images", "gallery", "cache", "offline"],
+        headerTitle: "Media Localizer",
+        iconSvg: `<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>`,
+        guide: {
+          title: "Media Localizer Guide",
+          markdown: [
+            "### Non-Destructive Media Localization",
+            "Media Localizer scans character cards, linked World Books, and Regex Scripts for external image, video, and audio URLs.",
+            "",
+            "- **Zero Card Mutation**: Original character card JSON and text fields are never overwritten.",
+            "- **Live Display Swapping**: Localized URLs are transparently swapped in the DOM at display time (`<img>`, `<video>`, `<audio>`, `<source>`, `srcset`, inline SVG `<image>`, CSS `background-image`, and same-origin iframes).",
+            "- **Native Gallery Sync**: Downloaded images are automatically linked into the character's native Lumiverse Gallery & Portrait Panel, and existing Gallery images are adopted automatically.",
+            "- **Granular Controls**: Filter by card section, individual alternate greetings, domain, or explicit URLs.",
+          ].join("\n"),
+        },
+      });
+      drawerTabRegistered = true;
+      drawerTabSetBadge = (text) => tab.setBadge(text);
+      activateDrawerTab = () => tab.activate();
+      updateDrawerTabBadge();
+      const unmountDrawer = drawerPanel.mount(tab.root);
+      cleanups.push(unmountDrawer);
+    } catch (err) {
+      console.warn("[media_localizer] Failed to register drawer tab:", err);
+    }
   }
 
   portraitButton = new PortraitPanelLocalizeController({
@@ -950,6 +1062,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
         },
       );
       if (enqueueRes.queueProgress) {
+        hasLiveQueueUpdate = true;
         currentQueueProgress = enqueueRes.queueProgress;
         notifyUiStateChanged();
       }
@@ -1027,6 +1140,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
 
     if (msg.type === "QUEUE_PROGRESS" && msg.progress) {
       const wasActive = isQueueActiveStatus(currentQueueProgress.status);
+      hasLiveQueueUpdate = true;
       currentQueueProgress = msg.progress as QueueJobProgress;
       const nowActive = isQueueActiveStatus(currentQueueProgress.status);
       notifyUiStateChanged();
@@ -1085,6 +1199,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
           )
             .then((res) => {
               if (res?.started && res.queueProgress) {
+                hasLiveQueueUpdate = true;
                 currentQueueProgress = res.queueProgress;
                 notifyUiStateChanged();
               }
@@ -1100,31 +1215,56 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     }
   }
 
-  try {
-    const offChatActive = ctx.state?.subscribe?.("chat.active", () => {
-      handleActiveCharacterContextChanged();
-    });
-    if (typeof offChatActive === "function") cleanups.push(offChatActive);
-  } catch {
-    // ignore
-  }
+  const refreshEvents = [
+    "CHAT_SWITCHED",
+    "CHARACTER_MESSAGE_RENDERED",
+    "USER_MESSAGE_RENDERED",
+    "MESSAGE_EDITED",
+    "MESSAGE_SWIPED",
+    "CHARACTER_EDITED",
+  ] as const;
 
-  try {
-    const offDrawerChange = ctx.ui?.events?.onDrawerChange?.((state) => {
-      if (state.open && state.tabId === "media_localizer") {
-        handleActiveCharacterContextChanged();
-      }
-    });
-    if (typeof offDrawerChange === "function") cleanups.push(offDrawerChange);
-  } catch {
-    // ignore
-  }
-
+  let hasChatActiveSub = false;
+  let hasDrawerChangeSub = false;
   let hasEditorStateSub = false;
   let hasEditingIdSub = false;
+  const boundRefreshEvents = new Set<string>();
+
   function bindPermissionGatedSubscriptions(): void {
     if (unloaded) return;
+    tryRegisterDrawerTab();
     galleryIntegrator.start();
+
+    if (!hasChatActiveSub) {
+      try {
+        const offChatActive = ctx.state?.subscribe?.("chat.active", () => {
+          handleActiveCharacterContextChanged();
+        });
+        if (typeof offChatActive === "function") {
+          hasChatActiveSub = true;
+          cleanups.push(offChatActive);
+        }
+      } catch {
+        // Permission may not be granted yet
+      }
+    }
+
+    if (!hasDrawerChangeSub) {
+      try {
+        const offDrawerChange = ctx.ui?.events?.onDrawerChange?.((state) => {
+          if (state.open && state.tabId === "media_localizer") {
+            handleActiveCharacterContextChanged();
+          }
+        });
+        if (typeof offDrawerChange === "function") {
+          hasDrawerChangeSub = true;
+          cleanups.push(offDrawerChange);
+        }
+      } catch {
+        // Permission may not be granted yet
+      }
+    }
+
     if (!hasEditorStateSub) {
       try {
         const offEditor = ctx.ui?.characterEditor?.onChange?.(() => {
@@ -1138,6 +1278,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
         // Permission may not be granted yet
       }
     }
+
     if (!hasEditingIdSub) {
       try {
         const offEditingId = ctx.state?.subscribe?.(
@@ -1154,56 +1295,73 @@ export function setup(ctx: SpindleFrontendContext): () => void {
         // Permission may not be granted yet
       }
     }
+
+    for (const evName of refreshEvents) {
+      if (boundRefreshEvents.has(evName)) continue;
+      try {
+        const off = ctx.events?.on?.(evName, () => {
+          displaySwapper.schedulePass();
+          if (evName === "CHARACTER_EDITED") {
+            drawerPanel.refreshActiveScan(resolveActiveContextCharacterId() ?? undefined);
+          }
+          if (evName === "CHAT_SWITCHED" || evName === "CHARACTER_EDITED") {
+            handleActiveCharacterContextChanged(true);
+          }
+        });
+        if (typeof off === "function") {
+          boundRefreshEvents.add(evName);
+          cleanups.push(off);
+        }
+      } catch {
+        // Permission may not be granted yet
+      }
+    }
   }
   bindPermissionGatedSubscriptions();
 
-  // Re-bind permission-gated listeners once permissions resolve
+  // Re-bind deferred registrations once permissions resolve (including partial/denied grants)
   try {
     if (ctx.permissions?.getGranted) {
       void ctx.permissions
         .getGranted()
-        .then((granted) => {
-          const grantedSet = new Set(granted);
+        .then(async (granted) => {
+          if (unloaded) return;
+          const grantedSet = new Set(Array.isArray(granted) ? granted : []);
           const missing = REQUIRED_PERMISSIONS.filter(
             (p) => !grantedSet.has(p),
           );
           if (missing.length > 0 && ctx.permissions?.request) {
-            return ctx.permissions.request([...missing]);
+            try {
+              const updated = await ctx.permissions.request([...missing]);
+              const updatedSet = new Set(Array.isArray(updated) ? updated : []);
+              const stillMissing = REQUIRED_PERMISSIONS.filter(
+                (p) => !updatedSet.has(p) && !grantedSet.has(p),
+              );
+              if (stillMissing.length > 0) {
+                console.warn(
+                  `[media_localizer] Some permissions were not granted (${stillMissing.join(", ")}); continuing with available permissions.`,
+                );
+              }
+            } catch (err) {
+              console.warn(
+                "[media_localizer] Permission request was denied or failed; continuing with available permissions:",
+                err,
+              );
+            }
           }
-          return granted;
-        })
-        .then(() => {
           if (unloaded) return;
           bindPermissionGatedSubscriptions();
           handleActiveCharacterContextChanged(true);
         })
-        .catch(() => {});
+        .catch((err) => {
+          if (unloaded) return;
+          console.warn("[media_localizer] Failed checking granted permissions:", err);
+          bindPermissionGatedSubscriptions();
+          handleActiveCharacterContextChanged(true);
+        });
     }
   } catch {
     // ignore
-  }
-
-  const refreshEvents = [
-    "CHAT_SWITCHED",
-    "CHARACTER_MESSAGE_RENDERED",
-    "USER_MESSAGE_RENDERED",
-    "MESSAGE_EDITED",
-    "MESSAGE_SWIPED",
-    "CHARACTER_EDITED",
-  ] as const;
-
-  for (const evName of refreshEvents) {
-    try {
-      const off = ctx.events.on(evName, () => {
-        displaySwapper.schedulePass();
-        if (evName === "CHAT_SWITCHED" || evName === "CHARACTER_EDITED") {
-          handleActiveCharacterContextChanged(true);
-        }
-      });
-      if (typeof off === "function") cleanups.push(off);
-    } catch {
-      // ignore
-    }
   }
 
   // 10. Initial Bootstrap
@@ -1214,11 +1372,11 @@ export function setup(ctx: SpindleFrontendContext): () => void {
   }>("get_init_state")
     .then((init) => {
       if (unloaded) return;
-      if (init.stats) {
+      if (init.stats && !hasLiveStatsUpdate) {
         currentStats = init.stats;
         currentSettings = init.stats.settings;
       }
-      if (init.queueProgress) {
+      if (init.queueProgress && !hasLiveQueueUpdate) {
         currentQueueProgress = init.queueProgress;
       }
       if (init.urlMapPayload) {

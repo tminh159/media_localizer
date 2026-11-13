@@ -42,7 +42,87 @@ export interface CharacterMediaWidgetCallbacks {
   onPurgeCharacterCache(characterId: string, urls?: string[]): Promise<void>;
 }
 
-type MediaGridFilter = "all" | "localized" | "expressions" | "video";
+export type MediaGridFilter = "all" | "localized" | "expressions" | "video";
+
+export interface CharacterWidgetPreferences {
+  showDownloadConfig: boolean;
+  showGreetingSubfilter: boolean;
+  showWorldBookSubfilter: boolean;
+  showUrlPicker: boolean;
+  showRemoteThumbnails: boolean;
+  mediaViewMode: "grid" | "list";
+  mediaFilter: MediaGridFilter;
+  showDownloadedMedia: boolean;
+}
+
+export interface CharacterWidgetUiState extends CharacterWidgetPreferences {
+  expandedUrls: string[];
+}
+
+const VALID_MEDIA_FILTERS = new Set<MediaGridFilter>([
+  "all",
+  "localized",
+  "expressions",
+  "video",
+]);
+
+export function getDefaultCharacterPreferences(
+  defaultExpandDownloadedMedia = true,
+): CharacterWidgetPreferences {
+  return {
+    showDownloadConfig: false,
+    showGreetingSubfilter: false,
+    showWorldBookSubfilter: false,
+    showUrlPicker: false,
+    showRemoteThumbnails: false,
+    mediaViewMode: "grid",
+    mediaFilter: "all",
+    showDownloadedMedia: defaultExpandDownloadedMedia,
+  };
+}
+
+export function sanitizeCharacterPreferences(
+  raw: unknown,
+  defaultExpandDownloadedMedia = true,
+): CharacterWidgetPreferences {
+  const defaults = getDefaultCharacterPreferences(defaultExpandDownloadedMedia);
+  if (!raw || typeof raw !== "object") return defaults;
+  const obj = raw as Record<string, unknown>;
+  const mediaFilter =
+    typeof obj.mediaFilter === "string" &&
+    VALID_MEDIA_FILTERS.has(obj.mediaFilter as MediaGridFilter)
+      ? (obj.mediaFilter as MediaGridFilter)
+      : defaults.mediaFilter;
+
+  return {
+    showDownloadConfig:
+      typeof obj.showDownloadConfig === "boolean"
+        ? obj.showDownloadConfig
+        : defaults.showDownloadConfig,
+    showGreetingSubfilter:
+      typeof obj.showGreetingSubfilter === "boolean"
+        ? obj.showGreetingSubfilter
+        : defaults.showGreetingSubfilter,
+    showWorldBookSubfilter:
+      typeof obj.showWorldBookSubfilter === "boolean"
+        ? obj.showWorldBookSubfilter
+        : defaults.showWorldBookSubfilter,
+    showUrlPicker:
+      typeof obj.showUrlPicker === "boolean"
+        ? obj.showUrlPicker
+        : defaults.showUrlPicker,
+    showRemoteThumbnails:
+      typeof obj.showRemoteThumbnails === "boolean"
+        ? obj.showRemoteThumbnails
+        : defaults.showRemoteThumbnails,
+    mediaViewMode: obj.mediaViewMode === "list" ? "list" : "grid",
+    mediaFilter,
+    showDownloadedMedia:
+      typeof obj.showDownloadedMedia === "boolean"
+        ? obj.showDownloadedMedia
+        : defaults.showDownloadedMedia,
+  };
+}
 
 function sameSetAsList<T>(set: Set<T>, list: readonly T[]): boolean {
   const target = new Set(list);
@@ -67,6 +147,7 @@ export class CharacterMediaWidget {
   private showRemoteThumbnails = false;
   private mediaViewMode: "grid" | "list" = "grid";
   private mediaFilter: MediaGridFilter = "all";
+  private showDownloadedMedia = true;
   private queueBannerEl: HTMLElement | null = null;
 
   // Effective filter state (defaults from global settings, overlaid by per-card override)
@@ -82,6 +163,12 @@ export class CharacterMediaWidget {
   private hasCustomOverride = false;
   private filtersInitializedForChar: string | null = null;
   private overrideSaveTimer: ReturnType<typeof setTimeout> | null = null;
+  private pendingOverrideSave: {
+    charId: string;
+    override: CharacterDownloadOverride | null;
+  } | null = null;
+  private inFlightOverrideSaves = new Map<string, Promise<void>>();
+  private refreshBtnEl: HTMLButtonElement | null = null;
   private scanGeneration = 0;
   private destroyed = false;
 
@@ -95,20 +182,102 @@ export class CharacterMediaWidget {
     private readonly options: {
       inDrawer?: boolean;
       defaultExpandConfig?: boolean;
+      defaultExpandDownloadedMedia?: boolean;
+      initialUiState?: Partial<CharacterWidgetUiState>;
+      initialScan?: CharacterMediaScanResult | null;
+      onUiStateChange?: (state: CharacterWidgetUiState) => void;
+      onScanChange?: (scan: CharacterMediaScanResult | null) => void;
     } = {},
   ) {
     this.characterId = characterId;
     this.batchCap = settings.defaultBatchCap;
-    this.showDownloadConfig = Boolean(options.defaultExpandConfig);
+    const defaultExpandDownloaded =
+      options.defaultExpandDownloadedMedia ?? options.inDrawer !== false;
+    const prefs = sanitizeCharacterPreferences(
+      options.initialUiState,
+      defaultExpandDownloaded,
+    );
+    this.showDownloadConfig =
+      options.defaultExpandConfig === true ? true : prefs.showDownloadConfig;
+    this.showGreetingSubfilter = prefs.showGreetingSubfilter;
+    this.showWorldBookSubfilter = prefs.showWorldBookSubfilter;
+    this.showUrlPicker = prefs.showUrlPicker;
+    this.showRemoteThumbnails = prefs.showRemoteThumbnails;
+    this.mediaViewMode = prefs.mediaViewMode;
+    this.mediaFilter = prefs.mediaFilter;
+    this.showDownloadedMedia =
+      options.initialUiState?.showDownloadedMedia !== undefined
+        ? prefs.showDownloadedMedia
+        : defaultExpandDownloaded;
+    if (Array.isArray(options.initialUiState?.expandedUrls)) {
+      this.expandedUrls = new Set(options.initialUiState.expandedUrls);
+    }
+    if (options.initialScan && options.initialScan.characterId === characterId) {
+      this.scan = options.initialScan;
+      this.initFiltersFromScan(options.initialScan, true);
+    }
+  }
+
+  private emitUiStateChange(): void {
+    this.options.onUiStateChange?.({
+      showDownloadConfig: this.showDownloadConfig,
+      showGreetingSubfilter: this.showGreetingSubfilter,
+      showWorldBookSubfilter: this.showWorldBookSubfilter,
+      showUrlPicker: this.showUrlPicker,
+      showRemoteThumbnails: this.showRemoteThumbnails,
+      mediaViewMode: this.mediaViewMode,
+      mediaFilter: this.mediaFilter,
+      showDownloadedMedia: this.showDownloadedMedia,
+      expandedUrls: Array.from(this.expandedUrls),
+    });
+  }
+
+  private persistOverrideNow(
+    charId: string,
+    override: CharacterDownloadOverride | null,
+  ): Promise<void> {
+    const prev = this.inFlightOverrideSaves.get(charId);
+    const runSave = () =>
+      this.callbacks.onSaveCharacterOverride(charId, override);
+    const next = (prev ? prev.catch(() => undefined).then(runSave) : runSave())
+      .then(() => undefined)
+      .catch((err) => {
+        console.warn("[media_localizer] Failed saving character override:", err);
+      })
+      .finally(() => {
+        if (this.inFlightOverrideSaves.get(charId) === next) {
+          this.inFlightOverrideSaves.delete(charId);
+        }
+      });
+    this.inFlightOverrideSaves.set(charId, next);
+    return next;
+  }
+
+  private hasPendingOverrideFor(charId: string): boolean {
+    return (
+      (this.pendingOverrideSave !== null && this.pendingOverrideSave.charId === charId) ||
+      this.inFlightOverrideSaves.has(charId)
+    );
+  }
+
+  flushPendingOverrideSave(): Promise<void> {
+    if (this.overrideSaveTimer !== null) {
+      clearTimeout(this.overrideSaveTimer);
+      this.overrideSaveTimer = null;
+    }
+    const pending = this.pendingOverrideSave;
+    this.pendingOverrideSave = null;
+    if (!pending) {
+      return this.inFlightOverrideSaves.get(this.characterId) ?? Promise.resolve();
+    }
+    return this.persistOverrideNow(pending.charId, pending.override);
   }
 
   destroy(): void {
     this.destroyed = true;
     this.scanGeneration++;
-    if (this.overrideSaveTimer !== null) {
-      clearTimeout(this.overrideSaveTimer);
-      this.overrideSaveTimer = null;
-    }
+    this.refreshBtnEl = null;
+    void this.flushPendingOverrideSave();
   }
 
   getCharacterId(): string {
@@ -128,6 +297,13 @@ export class CharacterMediaWidget {
   setCharacterId(nextId: string): void {
     if (this.destroyed) return;
     if (this.characterId === nextId && (this.scan || this.loading)) return;
+    if (this.characterId !== nextId) {
+      void this.flushPendingOverrideSave();
+      if (this.expandedUrls.size > 0) {
+        this.expandedUrls.clear();
+        this.emitUiStateChange();
+      }
+    }
     this.characterId = nextId;
     this.scan = null;
     this.error = null;
@@ -140,12 +316,21 @@ export class CharacterMediaWidget {
     queueProgress: QueueJobProgress,
   ): void {
     if (this.destroyed) return;
+    const prevSettings = this.settings;
     const prevStatus = this.queueProgress.status;
     const settingsChanged = JSON.stringify(settings) !== JSON.stringify(this.settings);
+    const scanSettingsChanged =
+      settings.scanBareUrls !== prevSettings.scanBareUrls ||
+      settings.adoptNativeGalleryImages !== prevSettings.adoptNativeGalleryImages;
     this.settings = settings;
     this.queueProgress = queueProgress;
 
-    if (settingsChanged && this.scan && !this.hasCustomOverride) {
+    if (
+      settingsChanged &&
+      this.scan &&
+      !this.hasCustomOverride &&
+      !this.hasPendingOverrideFor(this.scan.characterId)
+    ) {
       this.filtersInitializedForChar = null;
       this.initFiltersFromScan(this.scan);
     }
@@ -153,8 +338,8 @@ export class CharacterMediaWidget {
     const wasActive = isQueueActiveStatus(prevStatus);
     const nowActive = isQueueActiveStatus(queueProgress.status);
 
-    if (wasActive && !nowActive) {
-      void this.refreshScan(false);
+    if ((wasActive && !nowActive) || (scanSettingsChanged && this.scan)) {
+      void this.refreshScan(scanSettingsChanged);
       return;
     }
 
@@ -185,14 +370,33 @@ export class CharacterMediaWidget {
     this.error = null;
     if (!this.scan) {
       this.render();
+    } else if (this.refreshBtnEl) {
+      this.refreshBtnEl.disabled = true;
+      this.refreshBtnEl.classList.add("is-busy");
     }
     try {
+      if (this.hasPendingOverrideFor(targetId)) {
+        await this.flushPendingOverrideSave();
+        await this.inFlightOverrideSaves.get(targetId);
+        if (this.destroyed || gen !== this.scanGeneration || this.characterId !== targetId) {
+          return;
+        }
+      }
       const result = await this.callbacks.onScanCharacter(targetId, forceRefresh);
       if (this.destroyed || gen !== this.scanGeneration || this.characterId !== targetId) {
         return;
       }
-      this.scan = result;
-      this.initFiltersFromScan(result, forceRefresh);
+      if (this.hasPendingOverrideFor(result.characterId)) {
+        // User edited local filters while scan was in-flight; preserve local edits instead of wiping them.
+        const localOverride = this.buildOverrideFromState();
+        result.override = localOverride;
+        this.hasCustomOverride = localOverride !== null;
+        this.scan = result;
+      } else {
+        this.scan = result;
+        this.initFiltersFromScan(result, forceRefresh);
+      }
+      this.options.onScanChange?.(result);
     } catch (err) {
       if (this.destroyed || gen !== this.scanGeneration || this.characterId !== targetId) {
         return;
@@ -217,8 +421,8 @@ export class CharacterMediaWidget {
     }
   }
 
-  private initFiltersFromScan(scan: CharacterMediaScanResult, preserveEdits = false): void {
-    if (!preserveEdits && this.filtersInitializedForChar === scan.characterId) {
+  private initFiltersFromScan(scan: CharacterMediaScanResult, reinitExisting = false): void {
+    if (!reinitExisting && this.filtersInitializedForChar === scan.characterId) {
       this.hasCustomOverride = Boolean(scan.override && !isOverrideEmpty(scan.override));
       return;
     }
@@ -300,29 +504,34 @@ export class CharacterMediaWidget {
     this.hasCustomOverride = nextOverride !== null;
     if (this.scan && this.scan.characterId === targetCharId) {
       this.scan.override = nextOverride;
+      this.options.onScanChange?.(this.scan);
     }
 
     if (this.overrideSaveTimer) clearTimeout(this.overrideSaveTimer);
+    this.pendingOverrideSave = { charId: targetCharId, override: nextOverride };
     this.overrideSaveTimer = setTimeout(() => {
       this.overrideSaveTimer = null;
+      this.pendingOverrideSave = null;
       if (this.destroyed) return;
-      void this.callbacks
-        .onSaveCharacterOverride(targetCharId, nextOverride)
-        .catch((err) => console.warn("[media_localizer] Failed saving character override:", err));
+      void this.persistOverrideNow(targetCharId, nextOverride);
     }, 150);
   }
 
   private async resetToGlobalDefaults(): Promise<void> {
     if (!this.scan) return;
+    const targetCharId = this.scan.characterId;
     if (this.overrideSaveTimer) {
       clearTimeout(this.overrideSaveTimer);
       this.overrideSaveTimer = null;
     }
+    this.pendingOverrideSave = null;
     this.scan.override = null;
     this.hasCustomOverride = false;
     this.filtersInitializedForChar = null;
     this.initFiltersFromScan(this.scan);
-    await this.callbacks.onSaveCharacterOverride(this.scan.characterId, null);
+    this.options.onScanChange?.(this.scan);
+    await this.persistOverrideNow(targetCharId, null);
+    if (this.destroyed || this.characterId !== targetCharId) return;
     this.render();
   }
 
@@ -377,8 +586,10 @@ export class CharacterMediaWidget {
   }
 
   async triggerOneClickLocalize(): Promise<void> {
+    if (this.destroyed) return;
     const scan = this.scan;
     if (!scan) return;
+    const targetCharId = scan.characterId;
     const filter = this.buildCurrentFilter(true);
     const matched = filterScanItemsForDownload(scan, filter);
     const effectiveCount =
@@ -392,12 +603,14 @@ export class CharacterMediaWidget {
         confirmLabel: `Localize ${effectiveCount}`,
         cancelLabel: "Cancel",
       });
-      if (!res?.confirmed) return;
+      if (this.destroyed || this.characterId !== targetCharId || !res?.confirmed) {
+        return;
+      }
     }
 
     await this.runAction(() =>
       this.callbacks.onStartDownload({
-        characterIds: [scan.characterId],
+        characterIds: [targetCharId],
         ...filter,
       }),
     );
@@ -408,6 +621,7 @@ export class CharacterMediaWidget {
     const scrollState = this.captureScrollState();
     this.root.innerHTML = "";
     this.queueBannerEl = null;
+    this.refreshBtnEl = null;
 
     const wrap = document.createElement("div");
     wrap.className = "ml-widget";
@@ -503,6 +717,7 @@ export class CharacterMediaWidget {
         for (const u of urls) this.excludedUrls.add(u);
         this.scheduleSaveOverride();
         void this.runAction(async () => {
+          await this.flushPendingOverrideSave();
           await this.callbacks.onClearFailedUrls(urls);
           await this.refreshScan(false);
         });
@@ -600,6 +815,7 @@ export class CharacterMediaWidget {
       size: 14,
       onClick: () => {
         this.showDownloadConfig = !this.showDownloadConfig;
+        this.emitUiStateChange();
         this.render();
       },
     });
@@ -610,8 +826,12 @@ export class CharacterMediaWidget {
       className: `ml-btn ml-icon-btn ${this.loading ? "is-busy" : ""}`,
       size: 14,
       disabled: this.loading,
-      onClick: () => void this.refreshScan(true),
+      onClick: () => {
+        if (this.loading) return;
+        void this.refreshScan(true);
+      },
     });
+    this.refreshBtnEl = refreshBtn;
 
     actions.append(localizeBtn, gearBtn, refreshBtn);
     titleLine.append(titleGroup, actions);
@@ -713,6 +933,7 @@ export class CharacterMediaWidget {
         : `Filter Greetings (${scan.greetingBreakdown.length})...`;
       subBtn.addEventListener("click", () => {
         this.showGreetingSubfilter = !this.showGreetingSubfilter;
+        this.emitUiStateChange();
         this.render();
       });
       subBar.appendChild(subBtn);
@@ -738,9 +959,25 @@ export class CharacterMediaWidget {
                 scan.greetingBreakdown.map((item) => item.greetingIndex),
               );
             }
-            if (gCb.checked) this.selectedGreetings.add(g.greetingIndex);
-            else this.selectedGreetings.delete(g.greetingIndex);
-            if (this.selectedGreetings.size === scan.greetingBreakdown.length) {
+            if (gCb.checked) {
+              this.selectedGreetings.add(g.greetingIndex);
+            } else {
+              const remaining = scan.greetingBreakdown.filter(
+                (item) =>
+                  item.greetingIndex !== g.greetingIndex &&
+                  this.selectedGreetings!.has(item.greetingIndex),
+              );
+              if (remaining.length === 0) {
+                gCb.checked = true;
+                return;
+              }
+              this.selectedGreetings.delete(g.greetingIndex);
+            }
+            if (
+              scan.greetingBreakdown.every((item) =>
+                this.selectedGreetings!.has(item.greetingIndex),
+              )
+            ) {
               this.selectedGreetings = null;
             }
             this.scheduleSaveOverride();
@@ -772,6 +1009,7 @@ export class CharacterMediaWidget {
         : `Filter World Books (${scan.worldBookBreakdown.length})...`;
       wbBtn.addEventListener("click", () => {
         this.showWorldBookSubfilter = !this.showWorldBookSubfilter;
+        this.emitUiStateChange();
         this.render();
       });
       wbRow.appendChild(wbBtn);
@@ -795,9 +1033,25 @@ export class CharacterMediaWidget {
                 scan.worldBookBreakdown.map((item) => item.worldBookId),
               );
             }
-            if (wbCb.checked) this.selectedWorldBooks.add(wb.worldBookId);
-            else this.selectedWorldBooks.delete(wb.worldBookId);
-            if (this.selectedWorldBooks.size === scan.worldBookBreakdown.length) {
+            if (wbCb.checked) {
+              this.selectedWorldBooks.add(wb.worldBookId);
+            } else {
+              const remaining = scan.worldBookBreakdown.filter(
+                (item) =>
+                  item.worldBookId !== wb.worldBookId &&
+                  this.selectedWorldBooks!.has(item.worldBookId),
+              );
+              if (remaining.length === 0) {
+                wbCb.checked = true;
+                return;
+              }
+              this.selectedWorldBooks.delete(wb.worldBookId);
+            }
+            if (
+              scan.worldBookBreakdown.every((item) =>
+                this.selectedWorldBooks!.has(item.worldBookId),
+              )
+            ) {
               this.selectedWorldBooks = null;
             }
             this.scheduleSaveOverride();
@@ -846,11 +1100,17 @@ export class CharacterMediaWidget {
             this.selectedDomains = new Set(remoteDomains.map((d) => d.domain));
           }
           if (this.selectedDomains.has(dom.domain)) {
+            const remaining = remoteDomains.filter(
+              (d) => d.domain !== dom.domain && this.selectedDomains!.has(d.domain),
+            );
+            if (remaining.length === 0) {
+              return;
+            }
             this.selectedDomains.delete(dom.domain);
           } else {
             this.selectedDomains.add(dom.domain);
           }
-          if (this.selectedDomains.size === remoteDomains.length) {
+          if (remoteDomains.every((d) => this.selectedDomains!.has(d.domain))) {
             this.selectedDomains = null;
           }
           this.scheduleSaveOverride();
@@ -872,6 +1132,7 @@ export class CharacterMediaWidget {
       : `Inspect & Pick URLs (${selectedPending.length}/${candidateItems.length})...`;
     togglePickerBtn.addEventListener("click", () => {
       this.showUrlPicker = !this.showUrlPicker;
+      this.emitUiStateChange();
       this.render();
     });
     pickerBar.appendChild(togglePickerBtn);
@@ -884,6 +1145,7 @@ export class CharacterMediaWidget {
       thumbCb.checked = this.showRemoteThumbnails;
       thumbCb.addEventListener("change", () => {
         this.showRemoteThumbnails = thumbCb.checked;
+        this.emitUiStateChange();
         this.render();
       });
       thumbToggle.append(thumbCb, document.createTextNode("Remote Previews"));
@@ -958,6 +1220,7 @@ export class CharacterMediaWidget {
       collapseAllBtn.textContent = `Collapse (${this.expandedUrls.size})`;
       collapseAllBtn.addEventListener("click", () => {
         this.expandedUrls.clear();
+        this.emitUiStateChange();
         this.render();
       });
       urlTopBtns.appendChild(collapseAllBtn);
@@ -1042,6 +1305,7 @@ export class CharacterMediaWidget {
         } else {
           this.expandedUrls.add(item.normalizedUrl);
         }
+        this.emitUiStateChange();
         this.render();
       });
 
@@ -1302,14 +1566,41 @@ export class CharacterMediaWidget {
 
     const titleWrap = document.createElement("div");
     titleWrap.className = "ml-inline-title";
+    const collapseBtn = createIconButton({
+      icon: this.showDownloadedMedia ? "chevron-down" : "chevron-right",
+      title: this.showDownloadedMedia
+        ? "Collapse Downloaded Media"
+        : "Expand Downloaded Media",
+      className: "ml-btn ml-icon-btn is-sm ml-collapse-btn",
+      size: 13,
+      onClick: () => {
+        this.showDownloadedMedia = !this.showDownloadedMedia;
+        this.emitUiStateChange();
+        this.render();
+      },
+    });
+    collapseBtn.setAttribute("aria-expanded", String(this.showDownloadedMedia));
+    collapseBtn.setAttribute(
+      "aria-label",
+      this.showDownloadedMedia
+        ? "Collapse Downloaded Media"
+        : "Expand Downloaded Media",
+    );
     const titleSpan = document.createElement("span");
     titleSpan.textContent = `Downloaded Media (${localizedItems.length}${expressions.length > 0 ? ` + ${expressions.length} expr` : ""})`;
     titleWrap.append(
+      collapseBtn,
       titleSpan,
       createInfoTip(
         "Click any tile to open the lightbox. Character Avatar and native Expressions are read-only; localized assets can be removed individually or in bulk.",
       ),
     );
+
+    if (!this.showDownloadedMedia) {
+      topBar.appendChild(titleWrap);
+      box.appendChild(topBar);
+      return box;
+    }
 
     const toolbar = document.createElement("div");
     toolbar.className = "ml-header-actions";
@@ -1330,8 +1621,10 @@ export class CharacterMediaWidget {
       if (c.val === this.mediaFilter) opt.selected = true;
       filterSelect.appendChild(opt);
     }
+    filterSelect.value = this.mediaFilter;
     filterSelect.addEventListener("change", () => {
       this.mediaFilter = filterSelect.value as MediaGridFilter;
+      this.emitUiStateChange();
       this.render();
     });
     toolbar.appendChild(filterSelect);
@@ -1344,6 +1637,7 @@ export class CharacterMediaWidget {
         size: 13,
         onClick: () => {
           this.mediaViewMode = "grid";
+          this.emitUiStateChange();
           this.render();
         },
       }),
@@ -1356,6 +1650,7 @@ export class CharacterMediaWidget {
         size: 13,
         onClick: () => {
           this.mediaViewMode = "list";
+          this.emitUiStateChange();
           this.render();
         },
       }),
@@ -1369,6 +1664,7 @@ export class CharacterMediaWidget {
           className: "ml-btn ml-icon-btn is-danger is-sm",
           size: 13,
           onClick: async () => {
+            const targetCharId = scan.characterId;
             const msg = this.settings.deleteImagesOnPurge
               ? `Remove all ${localizedItems.length} localized media assets for "${scan.characterName}" from the Gallery & local cache? Original card URLs and native expressions remain untouched.`
               : `Remove all ${localizedItems.length} localized index entries for "${scan.characterName}"? Stored Gallery images will be kept.`;
@@ -1379,9 +1675,12 @@ export class CharacterMediaWidget {
               cancelLabel: "Cancel",
               variant: "danger",
             });
-            if (!res?.confirmed) return;
+            if (this.destroyed || this.characterId !== targetCharId || !res?.confirmed) {
+              return;
+            }
             await this.runAction(async () => {
-              await this.callbacks.onPurgeCharacterCache(scan.characterId);
+              await this.callbacks.onPurgeCharacterCache(targetCharId);
+              if (this.destroyed || this.characterId !== targetCharId) return;
               await this.refreshScan(false);
             });
           },

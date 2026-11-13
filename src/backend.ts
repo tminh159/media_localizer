@@ -7,11 +7,16 @@ import {
 import { MediaIndexStore } from "./core/index-store.ts";
 import { MediaQueueManager, type QueuedMediaTask } from "./core/queue.ts";
 import { buildEffectiveFilter, sanitizeOverride } from "./shared/download-config.ts";
-import { buildLibraryMedia } from "./shared/library-media.ts";
+import {
+  buildLibraryMedia,
+  buildLibraryMediaCharacter,
+  groupLibraryAssetsByCharacter,
+} from "./shared/library-media.ts";
 import {
   type CharacterMediaScanResult,
   type DownloadFilterOptions,
   type LibraryCharacterSummary,
+  type LibraryMediaCharacter,
   type MediaLocalizerSettings,
   type MediaSourceSection,
   type PendingGalleryLinkItem,
@@ -26,8 +31,10 @@ import {
 declare const spindle: SpindleAPI;
 
 const MAX_KNOWN_USERS = 500;
-const MAX_CHARACTER_CACHE_ENTRIES = 500;
+const MAX_CHARACTER_CACHE_ENTRIES = 2000;
 const CHARACTER_SCAN_CACHE_TTL_MS = 60_000;
+const CHARACTER_LIST_PAGE_LIMIT = 200;
+const MAX_CHARACTER_LIST_PAGES = 1000;
 const MIN_FILE_SIZE_BYTES = 1 * 1024 * 1024;
 const MAX_FILE_SIZE_BYTES = 200 * 1024 * 1024;
 const MIN_TIMEOUT_MS = 5_000;
@@ -243,10 +250,9 @@ try {
       }
       if (knownUsers.size === 0) {
         try {
-          // User-scoped extensions infer the extension owner when userId is omitted.
-          return await indexStore.buildActiveDisplayUrlMap(
-            undefined as unknown as string,
-          );
+          // User-scoped extensions infer the extension owner when userId is omitted;
+          // load directly without caching under an undefined key in indexStore.
+          return await indexStore.buildActiveDisplayUrlMap();
         } catch (err) {
           logWarn(
             "media_localizer.url_map could not resolve default user storage before any user session:",
@@ -423,8 +429,8 @@ async function fetchWorldBookWithEntries(
         });
       }
       offset += rows.length;
-      const total = typeof entriesRes?.total === "number" ? entriesRes.total : offset;
-      if (rows.length < pageLimit || offset >= total) break;
+      const total = typeof entriesRes?.total === "number" ? entriesRes.total : undefined;
+      if (total !== undefined ? offset >= total : rows.length < pageLimit) break;
     }
     return {
       id: wb.id,
@@ -465,8 +471,8 @@ async function fetchCharacterRegexScripts(
         });
       }
       offset += scripts.length;
-      const total = typeof scriptsRes?.total === "number" ? scriptsRes.total : offset;
-      if (scripts.length < pageLimit || offset >= total) break;
+      const total = typeof scriptsRes?.total === "number" ? scriptsRes.total : undefined;
+      if (total !== undefined ? offset >= total : scripts.length < pageLimit) break;
     }
   } catch (err) {
     failed = true;
@@ -483,6 +489,8 @@ export async function performCharacterScan(
   options?: {
     preloadedCharacter?: CharacterDTO;
     forceRefresh?: boolean;
+    skipMedia?: boolean;
+    skipGalleryLinkBroadcast?: boolean;
   },
 ): Promise<CharacterMediaScanResult> {
   const character =
@@ -598,22 +606,25 @@ export async function performCharacterScan(
     }
   }
 
-  // Opportunistically link shared assets already localized by another character
-  let linkedAny = false;
-  for (const item of scan.items) {
-    if (
+  // Opportunistically link shared assets already localized by another character in one batch write
+  const itemsToLink = scan.items.filter(
+    (item) =>
       item.status === "localized" &&
       item.localizedEntry &&
-      !item.localizedEntry.characterIds.includes(characterId)
-    ) {
-      await indexStore.linkExistingAssetToCharacter(
-        userId,
-        item.normalizedUrl,
-        item.rawUrls,
-        characterId,
-      );
-      linkedAny = true;
-    }
+      !item.localizedEntry.characterIds.includes(characterId),
+  );
+  let linkedAny = false;
+  if (itemsToLink.length > 0) {
+    const linkBatch = await indexStore.batchUpdate(userId, (tx) => {
+      for (const item of itemsToLink) {
+        tx.linkExistingAssetToCharacter(
+          item.normalizedUrl,
+          item.rawUrls,
+          characterId,
+        );
+      }
+    });
+    linkedAny = linkBatch.changed;
   }
 
   // Reconcile native Lumiverse Gallery (`character_gallery` + `images`) with MediaIndexStore:
@@ -668,7 +679,7 @@ export async function performCharacterScan(
     scheduleUrlMapSync(userId);
   }
 
-  {
+  if (!options?.skipMedia) {
     const mediaState = await indexStore.getState(userId);
     scan.media =
       buildLibraryMedia(
@@ -677,6 +688,7 @@ export async function performCharacterScan(
             id: character.id,
             name: character.name,
             image_id: (character as { image_id?: string | null }).image_id ?? null,
+            tags: Array.isArray(character.tags) ? character.tags : [],
             extensions: (character.extensions as Record<string, unknown> | null) ?? null,
           },
         ],
@@ -685,7 +697,11 @@ export async function performCharacterScan(
       )[0] ?? null;
   }
 
-  if (state.settings.autoLinkGallery && reconciliation.pendingGalleryLinks.length > 0) {
+  if (
+    !options?.skipGalleryLinkBroadcast &&
+    state.settings.autoLinkGallery &&
+    reconciliation.pendingGalleryLinks.length > 0
+  ) {
     try {
       spindle.sendToFrontend(
         {
@@ -703,6 +719,49 @@ export async function performCharacterScan(
   return scan;
 }
 
+/**
+ * Iterates through every page of `spindle.characters.list` without assuming the
+ * host honors the requested page size (Lumiverse caps `limit` at 200), and
+ * discards each page after `onPage` finishes so large libraries do not keep
+ * every full character DTO in memory at once.
+ */
+async function forEachCharacterPage(
+  userId: string,
+  onPage: (rows: CharacterDTO[]) => Promise<void> | void,
+): Promise<void> {
+  let offset = 0;
+  const seenIds = new Set<string>();
+  for (let page = 0; page < MAX_CHARACTER_LIST_PAGES; page++) {
+    const res = await spindle.characters.list({
+      limit: CHARACTER_LIST_PAGE_LIMIT,
+      offset,
+      userId,
+    });
+    const rows = Array.isArray(res?.data) ? res.data : [];
+    if (rows.length === 0) break;
+
+    const freshRows: CharacterDTO[] = [];
+    for (const row of rows) {
+      if (!row || typeof row.id !== "string" || seenIds.has(row.id)) continue;
+      seenIds.add(row.id);
+      freshRows.push(row);
+    }
+    if (freshRows.length > 0) {
+      await onPage(freshRows);
+    }
+
+    offset += rows.length;
+    const total = typeof res?.total === "number" ? res.total : undefined;
+    if (
+      total !== undefined
+        ? offset >= total
+        : rows.length < CHARACTER_LIST_PAGE_LIMIT
+    ) {
+      break;
+    }
+  }
+}
+
 export async function performLibraryScan(
   userId: string,
   options?: { forceRefresh?: boolean },
@@ -710,27 +769,6 @@ export async function performLibraryScan(
   characters: LibraryCharacterSummary[];
   totalUniqueRemote: number;
 }> {
-  const allCharacters: CharacterDTO[] = [];
-  let offset = 0;
-  const pageLimit = 500;
-  for (let page = 0; page < 20; page++) {
-    const allCharactersRes = await spindle.characters.list({
-      limit: pageLimit,
-      offset,
-      userId,
-    });
-    const rows = Array.isArray(allCharactersRes?.data)
-      ? allCharactersRes.data
-      : [];
-    allCharacters.push(...rows);
-    offset += rows.length;
-    const total =
-      typeof allCharactersRes?.total === "number"
-        ? allCharactersRes.total
-        : rows.length;
-    if (rows.length < pageLimit || offset >= total) break;
-  }
-
   const summaries: LibraryCharacterSummary[] = [];
   const globalRemoteUrls = new Set<string>();
   const worldBookCache = new Map<string, Promise<ScannableWorldBookInput | null>>();
@@ -739,6 +777,8 @@ export async function performLibraryScan(
     const scan = await performCharacterScan(userId, char.id, true, worldBookCache, {
       preloadedCharacter: char,
       forceRefresh: Boolean(options?.forceRefresh),
+      skipMedia: true,
+      skipGalleryLinkBroadcast: true,
     });
 
     let localizedCount = 0;
@@ -792,29 +832,31 @@ export async function performLibraryScan(
     };
   };
 
-  // Process library characters with bounded concurrency (6 at a time)
+  // Process library characters page-by-page with bounded concurrency (6 at a time)
   const concurrency = 6;
-  let cursor = 0;
-  const workers = Array.from(
-    { length: Math.min(concurrency, allCharacters.length) },
-    async () => {
-      while (cursor < allCharacters.length) {
-        const idx = cursor++;
-        const char = allCharacters[idx];
-        if (!char) continue;
-        try {
-          const summary = await scanOneCharacter(char);
-          summaries.push(summary);
-        } catch (err) {
-          logWarn(
-            `Failed to scan character ${char.id} (${char.name}) during library scan:`,
-            err,
-          );
+  await forEachCharacterPage(userId, async (pageRows) => {
+    let cursor = 0;
+    const workers = Array.from(
+      { length: Math.min(concurrency, pageRows.length) },
+      async () => {
+        while (cursor < pageRows.length) {
+          const idx = cursor++;
+          const char = pageRows[idx];
+          if (!char) continue;
+          try {
+            const summary = await scanOneCharacter(char);
+            summaries.push(summary);
+          } catch (err) {
+            logWarn(
+              `Failed to scan character ${char.id} (${char.name}) during library scan:`,
+              err,
+            );
+          }
         }
-      }
-    },
-  );
-  await Promise.all(workers);
+      },
+    );
+    await Promise.all(workers);
+  });
 
   summaries.sort(
     (a, b) =>
@@ -827,6 +869,174 @@ export async function performLibraryScan(
     characters: summaries,
     totalUniqueRemote: globalRemoteUrls.size,
   };
+}
+
+function sanitizeDownloadFilter(raw: unknown): DownloadFilterOptions {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return { characterIds: [] };
+  }
+  const obj = raw as Record<string, unknown>;
+  const baseOverride = sanitizeOverride(obj);
+  const characterIds = Array.isArray(obj.characterIds)
+    ? Array.from(
+        new Set(
+          obj.characterIds
+            .filter((id): id is string => typeof id === "string" && id.trim().length > 0)
+            .map((id) => id.trim()),
+        ),
+      )
+    : [];
+
+  const explicitUrls = Array.isArray(obj.explicitUrls)
+    ? Array.from(
+        new Set(
+          obj.explicitUrls
+            .filter((u): u is string => typeof u === "string" && u.trim().length > 0)
+            .map((u) => u.trim()),
+        ),
+      )
+    : undefined;
+
+  const result: DownloadFilterOptions = {
+    characterIds,
+    ...baseOverride,
+  };
+  if (explicitUrls && explicitUrls.length > 0) {
+    result.explicitUrls = explicitUrls;
+  }
+  if (
+    typeof obj.maxFileSizeBytes === "number" &&
+    Number.isFinite(obj.maxFileSizeBytes) &&
+    obj.maxFileSizeBytes > 0
+  ) {
+    result.maxFileSizeBytes = obj.maxFileSizeBytes;
+  }
+  if (
+    typeof obj.timeoutMs === "number" &&
+    Number.isFinite(obj.timeoutMs) &&
+    obj.timeoutMs > 0
+  ) {
+    result.timeoutMs = obj.timeoutMs;
+  }
+  if (
+    typeof obj.concurrency === "number" &&
+    Number.isFinite(obj.concurrency) &&
+    obj.concurrency > 0
+  ) {
+    result.concurrency = obj.concurrency;
+  }
+  return result;
+}
+
+async function enqueueDownloadInternal(
+  userId: string,
+  rawFilter: unknown,
+  useCharacterOverrides: boolean,
+  preloadedScans?: Map<string, CharacterMediaScanResult>,
+) {
+  const filter = sanitizeDownloadFilter(rawFilter);
+  const charIds = filter.characterIds;
+  if (charIds.length === 0) {
+    throw new Error("Select at least one character to localize");
+  }
+
+  const state = await indexStore.getState(userId);
+  const settings = state.settings;
+  const tasks: QueuedMediaTask[] = [];
+  const worldBookCache = new Map<string, Promise<ScannableWorldBookInput | null>>();
+
+  const { characterIds: _ignoredCharIds, ...definedFilter } = filter;
+  const hasValidFilterMaxItems =
+    typeof filter.maxItems === "number" &&
+    Number.isFinite(filter.maxItems) &&
+    filter.maxItems >= 0;
+  let resolvedMaxItems = hasValidFilterMaxItems
+    ? Math.floor(filter.maxItems as number)
+    : settings.defaultBatchCap;
+
+  for (const charId of charIds) {
+    const scan =
+      preloadedScans?.get(charId) ??
+      (await performCharacterScan(userId, charId, true, worldBookCache));
+    const unmatchedCandidates = getLruMapEntry(
+      unmatchedGalleryCache,
+      `${userId}:${scan.characterId}`,
+    )?.items;
+    const effective = useCharacterOverrides
+      ? buildEffectiveFilter(settings, scan)
+      : null;
+    if (
+      effective &&
+      charIds.length === 1 &&
+      !hasValidFilterMaxItems &&
+      typeof effective.maxItems === "number" &&
+      Number.isFinite(effective.maxItems) &&
+      effective.maxItems >= 0
+    ) {
+      resolvedMaxItems = Math.floor(effective.maxItems);
+    }
+    const charFilter: Omit<DownloadFilterOptions, "characterIds"> = effective
+      ? { ...effective, ...definedFilter }
+      : definedFilter;
+    const matchingItems = filterScanItemsForDownload(scan, charFilter);
+    for (const item of matchingItems) {
+      tasks.push({
+        characterId: scan.characterId,
+        characterName: scan.characterName,
+        normalizedUrl: item.normalizedUrl,
+        rawUrls: item.rawUrls,
+        ...(unmatchedCandidates && unmatchedCandidates.length > 0
+          ? { unmatchedGalleryCandidates: unmatchedCandidates }
+          : {}),
+      });
+    }
+  }
+
+  const clampPositiveInt = (
+    raw: unknown,
+    fallback: number,
+    min: number,
+    max: number,
+  ): number => {
+    const value =
+      typeof raw === "number" && Number.isFinite(raw) && raw > 0
+        ? Math.floor(raw)
+        : fallback;
+    return Math.min(max, Math.max(min, value));
+  };
+
+  const maxItems = resolvedMaxItems;
+  const maxFileSizeBytes = clampPositiveInt(
+    filter.maxFileSizeBytes,
+    settings.maxFileSizeMb * 1024 * 1024,
+    MIN_FILE_SIZE_BYTES,
+    MAX_FILE_SIZE_BYTES,
+  );
+  const timeoutMs = clampPositiveInt(
+    filter.timeoutMs,
+    settings.timeoutSeconds * 1000,
+    MIN_TIMEOUT_MS,
+    MAX_TIMEOUT_MS,
+  );
+  const concurrency = clampPositiveInt(
+    filter.concurrency,
+    settings.concurrency,
+    MIN_CONCURRENCY,
+    MAX_CONCURRENCY,
+  );
+
+  const queueProgress = await queueManager
+    .getQueue(userId)
+    .startOrAppendBatch({
+      userId,
+      tasks,
+      maxItems,
+      maxFileSizeBytes,
+      timeoutMs,
+      concurrency,
+    });
+
+  return { queueProgress };
 }
 
 export async function handleFrontendRpcAction(
@@ -867,111 +1077,11 @@ export async function handleFrontendRpcAction(
     }
 
     case "enqueue_download": {
-      const filter = (payload.filter ?? {}) as DownloadFilterOptions;
-      const useCharacterOverrides = Boolean(payload.useCharacterOverrides);
-      const charIds = Array.isArray(filter.characterIds)
-        ? filter.characterIds.filter((id): id is string => typeof id === "string" && id.trim().length > 0)
-        : [];
-      if (charIds.length === 0) {
-        throw new Error("Select at least one character to localize");
-      }
-
-      const state = await indexStore.getState(userId);
-      const settings = state.settings;
-      const tasks: QueuedMediaTask[] = [];
-
-      const definedFilter = Object.fromEntries(
-        Object.entries(filter).filter(([, v]) => v !== undefined),
-      ) as Partial<DownloadFilterOptions>;
-      const hasValidFilterMaxItems =
-        typeof filter.maxItems === "number" &&
-        Number.isFinite(filter.maxItems) &&
-        filter.maxItems >= 0;
-      let resolvedMaxItems = hasValidFilterMaxItems
-        ? Math.floor(filter.maxItems as number)
-        : settings.defaultBatchCap;
-
-      for (const charId of charIds) {
-        const scan = await performCharacterScan(userId, charId, true);
-        const unmatchedCandidates = getLruMapEntry(
-          unmatchedGalleryCache,
-          `${userId}:${scan.characterId}`,
-        )?.items;
-        const effective = useCharacterOverrides
-          ? buildEffectiveFilter(settings, scan)
-          : null;
-        if (
-          effective &&
-          charIds.length === 1 &&
-          !hasValidFilterMaxItems &&
-          typeof effective.maxItems === "number" &&
-          Number.isFinite(effective.maxItems) &&
-          effective.maxItems >= 0
-        ) {
-          resolvedMaxItems = Math.floor(effective.maxItems);
-        }
-        const charFilter: Omit<DownloadFilterOptions, "characterIds"> = effective
-          ? { ...effective, ...definedFilter }
-          : filter;
-        const matchingItems = filterScanItemsForDownload(scan, charFilter);
-        for (const item of matchingItems) {
-          tasks.push({
-            characterId: scan.characterId,
-            characterName: scan.characterName,
-            normalizedUrl: item.normalizedUrl,
-            rawUrls: item.rawUrls,
-            ...(unmatchedCandidates && unmatchedCandidates.length > 0
-              ? { unmatchedGalleryCandidates: unmatchedCandidates }
-              : {}),
-          });
-        }
-      }
-
-      const clampPositiveInt = (
-        raw: unknown,
-        fallback: number,
-        min: number,
-        max: number,
-      ): number => {
-        const value =
-          typeof raw === "number" && Number.isFinite(raw) && raw > 0
-            ? Math.floor(raw)
-            : fallback;
-        return Math.min(max, Math.max(min, value));
-      };
-
-      const maxItems = resolvedMaxItems;
-      const maxFileSizeBytes = clampPositiveInt(
-        filter.maxFileSizeBytes,
-        settings.maxFileSizeMb * 1024 * 1024,
-        MIN_FILE_SIZE_BYTES,
-        MAX_FILE_SIZE_BYTES,
+      return await enqueueDownloadInternal(
+        userId,
+        payload.filter,
+        Boolean(payload.useCharacterOverrides),
       );
-      const timeoutMs = clampPositiveInt(
-        filter.timeoutMs,
-        settings.timeoutSeconds * 1000,
-        MIN_TIMEOUT_MS,
-        MAX_TIMEOUT_MS,
-      );
-      const concurrency = clampPositiveInt(
-        filter.concurrency,
-        settings.concurrency,
-        MIN_CONCURRENCY,
-        MAX_CONCURRENCY,
-      );
-
-      const queueProgress = await queueManager
-        .getQueue(userId)
-        .startOrAppendBatch({
-          userId,
-          tasks,
-          maxItems,
-          maxFileSizeBytes,
-          timeoutMs,
-          concurrency,
-        });
-
-      return { queueProgress };
     }
 
     case "queue_control": {
@@ -999,43 +1109,42 @@ export async function handleFrontendRpcAction(
 
     case "list_library_media": {
       const includeEmpty = Boolean(payload?.includeEmpty);
-      const allCharacters: CharacterDTO[] = [];
-      let offset = 0;
-      const pageLimit = 500;
-      for (let page = 0; page < 20; page++) {
-        const res = await spindle.characters.list({ limit: pageLimit, offset, userId });
-        const rows = Array.isArray(res?.data) ? res.data : [];
-        allCharacters.push(...rows);
-        offset += rows.length;
-        const total = typeof res?.total === "number" ? res.total : rows.length;
-        if (rows.length < pageLimit || offset >= total) break;
-      }
       const { assets } = await indexStore.getState(userId);
-      const characters = buildLibraryMedia(
-        allCharacters.map((c) => ({
-          id: c.id,
-          name: c.name,
-          image_id: (c as { image_id?: string | null }).image_id ?? null,
-          extensions: (c.extensions as Record<string, unknown> | null) ?? null,
-        })),
-        assets,
-        { includeEmpty },
-      );
+      const byCharacter = groupLibraryAssetsByCharacter(assets);
+      const characters: LibraryMediaCharacter[] = [];
+      await forEachCharacterPage(userId, (rows) => {
+        for (const c of rows) {
+          const item = buildLibraryMediaCharacter(
+            {
+              id: c.id,
+              name: c.name,
+              image_id: (c as { image_id?: string | null }).image_id ?? null,
+              tags: Array.isArray(c.tags) ? c.tags : [],
+              extensions: (c.extensions as Record<string, unknown> | null) ?? null,
+            },
+            byCharacter,
+            { includeEmpty },
+          );
+          if (item) {
+            characters.push(item);
+          }
+        }
+      });
       return { characters };
     }
 
     case "auto_localize_character": {
       const characterId = String(payload.characterId ?? "").trim();
       if (!characterId) throw new Error("characterId is required");
-      const state = await indexStore.getState(userId);
-      if (!state.settings.autoLocalizeOnOpen) return { started: false };
-      if (state.autoLocalizedCharacterIds.includes(characterId)) {
-        return { started: false };
-      }
       const lockKey = `${userId}:${characterId}`;
       if (inFlightAutoLocalize.has(lockKey)) return { started: false };
       inFlightAutoLocalize.add(lockKey);
       try {
+        const state = await indexStore.getState(userId);
+        if (!state.settings.autoLocalizeOnOpen) return { started: false };
+        if (state.autoLocalizedCharacterIds.includes(characterId)) {
+          return { started: false };
+        }
         const scan = await performCharacterScan(userId, characterId, true);
         const filter = buildEffectiveFilter(state.settings, scan);
         const matching = filterScanItemsForDownload(scan, filter);
@@ -1043,9 +1152,15 @@ export async function handleFrontendRpcAction(
           await indexStore.markAutoLocalized(userId, characterId);
           return { started: false };
         }
-        const result = (await handleFrontendRpcAction(userId, "enqueue_download", {
-          filter: { ...filter, characterIds: [characterId] },
-        })) as { queueProgress: unknown };
+        const preloadedScans = new Map<string, CharacterMediaScanResult>([
+          [characterId, scan],
+        ]);
+        const result = await enqueueDownloadInternal(
+          userId,
+          { ...filter, characterIds: [characterId] },
+          false,
+          preloadedScans,
+        );
         await indexStore.markAutoLocalized(userId, characterId);
         return { started: true, queueProgress: result.queueProgress };
       } finally {
@@ -1125,7 +1240,10 @@ export async function handleFrontendRpcAction(
       const allRemovedImageIds = new Set<string>();
       let removedCount = 0;
 
+      const userQueue = queueManager.getQueue(userId);
       for (const characterId of targetCharacterIds) {
+        userQueue.cancelCharacterTasks(characterId, urls);
+        evictCharacterCaches(characterId, [userId]);
         const res = await indexStore.removeCharacterAssets(userId, characterId, urls);
         removedCount += res.removedCount;
         for (const id of res.orphanedImageIds) allOrphanedImageIds.add(id);
@@ -1177,14 +1295,20 @@ spindle.onFrontendMessage(async (msg: unknown, rawUserId: string) => {
       : {};
   const userId = resolveActingUser(rawUserId);
   if (!userId) {
-    if (requestId) {
+    const trimmedRawUserId =
+      typeof rawUserId === "string" ? rawUserId.trim() : "";
+    if (requestId && trimmedRawUserId) {
       spindle.sendToFrontend(
         {
           type: "RPC_RESPONSE",
           requestId,
           error: "Could not resolve active user session",
         },
-        rawUserId,
+        trimmedRawUserId,
+      );
+    } else if (requestId) {
+      logWarn(
+        `Dropping RPC_RESPONSE for ${action || "unknown"} (${requestId}) because active user session could not be resolved`,
       );
     }
     return;
@@ -1357,6 +1481,7 @@ spindle.on("CHARACTER_DELETED", async (event: unknown, rawUserId?: string) => {
 
   for (const userId of targetUsers) {
     try {
+      queueManager.getQueue(userId).cancelCharacterTasks(characterId);
       const { orphanedImageIds, removedCount } =
         await indexStore.removeCharacterAssets(userId, characterId);
       const { settings } = await indexStore.getState(userId);
