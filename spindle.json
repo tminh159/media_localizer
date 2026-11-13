@@ -2,7 +2,7 @@
   "identifier": "media_localizer",
   "version": "1.0.0",
   "name": "Media Localizer",
-  "author": "Developer",
+  "author": "Gehihi",
   "description": "Non-destructively localizes external media embedded in character cards, world books, and regex scripts with granular download filters and display-time swapping.",
   "permissions": [
     "characters",
