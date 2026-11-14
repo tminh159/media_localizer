@@ -1,6 +1,6 @@
 {
   "name": "media-localizer",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
   "description": "Lumiverse Spindle extension that non-destructively localizes embedded character media with granular filters and display-time URL swapping.",
