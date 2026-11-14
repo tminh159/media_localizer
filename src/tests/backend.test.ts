@@ -878,3 +878,213 @@ describe("backend audit fixes #8.7 (perf & filter validation) and #8.8 (cleanup)
         }
     });
 });
+
+describe("backend audit fixes M-02, M-05, and H-02 support", () => {
+    test("[M-02] multi-character enqueue_download enforces per-character override.maxItems without starving later characters", async () => {
+        const userId = "u-multi-cap";
+        controller.resetCallLogs();
+
+        controller.characters.set("c-cap-a", {
+            id: "c-cap-a",
+            name: "CapA",
+            updated_at: 10,
+            description: [
+                "![](https://cdn.example.com/cap-a1.png)",
+                "![](https://cdn.example.com/cap-a2.png)",
+                "![](https://cdn.example.com/cap-a3.png)",
+                "![](https://cdn.example.com/cap-a4.png)",
+            ].join("\n"),
+        });
+        controller.characters.set("c-cap-b", {
+            id: "c-cap-b",
+            name: "CapB",
+            updated_at: 11,
+            description: [
+                "![](https://cdn.example.com/cap-b1.png)",
+                "![](https://cdn.example.com/cap-b2.png)",
+                "![](https://cdn.example.com/cap-b3.png)",
+            ].join("\n"),
+        });
+
+        await backend.handleFrontendRpcAction(userId, "update_settings", {
+            patch: { defaultBatchCap: 4 },
+        });
+        await backend.handleFrontendRpcAction(userId, "save_character_override", {
+            characterId: "c-cap-a",
+            override: { maxItems: 2 },
+        });
+
+        const queued = (await backend.handleFrontendRpcAction(userId, "enqueue_download", {
+            useCharacterOverrides: true,
+            filter: { characterIds: ["c-cap-a", "c-cap-b"] },
+        })) as any;
+
+        // Without per-character capping, CapA would take all 4 slots of defaultBatchCap=4 and starve CapB.
+        // With M-02 fix, CapA queues 2 and CapB queues 2 (4 total).
+        expect(queued.queueProgress.totalQueued).toBe(4);
+
+        const deadline = Date.now() + 2000;
+        while (Date.now() < deadline) {
+            const p = (await backend.handleFrontendRpcAction(userId, "queue_control", { control: "status" })) as any;
+            if (p.queueProgress.status === "completed") break;
+            await new Promise((r) => setTimeout(r, 10));
+        }
+
+        const lib = (await backend.handleFrontendRpcAction(userId, "list_library_media", {})) as any;
+        const charA = lib.characters.find((c: any) => c.characterId === "c-cap-a");
+        const charB = lib.characters.find((c: any) => c.characterId === "c-cap-b");
+        expect(charA?.localizedAssets?.length).toBe(2);
+        expect(charB?.localizedAssets?.length).toBe(2);
+
+        controller.characters.delete("c-cap-a");
+        controller.characters.delete("c-cap-b");
+    });
+
+    test("[M-05] mid-flight purge/delete invalidation epoch aborts scan caching, linking, autoLocalize marking, and enqueueing", async () => {
+        const userId = "u-epoch-inv";
+        controller.resetCallLogs();
+
+        // Seed an asset on an owner character so performCharacterScan would normally link it to char-inv-1
+        controller.characters.set("char-inv-owner", {
+            id: "char-inv-owner",
+            name: "InvOwner",
+            updated_at: 1,
+            description: "![](https://cdn.example.com/shared-inv.png)",
+        });
+        await backend.handleFrontendRpcAction(userId, "enqueue_download", {
+            filter: { characterIds: ["char-inv-owner"], maxItems: 0 },
+        });
+        const dlDeadline = Date.now() + 2000;
+        while (Date.now() < dlDeadline) {
+            const p = (await backend.handleFrontendRpcAction(userId, "queue_control", { control: "status" })) as any;
+            if (p.queueProgress.status === "completed") break;
+            await new Promise((r) => setTimeout(r, 10));
+        }
+
+        let releaseWb!: () => void;
+        const wbGate = new Promise<void>((r) => {
+            releaseWb = r;
+        });
+        const origGetWb = controller.spindle.world_books.get;
+        controller.spindle.world_books.get = async (id: string, uid?: string) => {
+            if (id === "wb-slow-inv") {
+                await wbGate;
+            }
+            return origGetWb(id, uid);
+        };
+
+        try {
+            controller.characters.set("char-inv-1", {
+                id: "char-inv-1",
+                name: "Inv1",
+                updated_at: 50,
+                description: "![](https://cdn.example.com/shared-inv.png) ![](https://cdn.example.com/new-inv.png)",
+                world_book_ids: ["wb-slow-inv"],
+            });
+            controller.worldBooks.set("wb-slow-inv", {
+                id: "wb-slow-inv",
+                name: "SlowWB",
+                entries: [],
+            });
+            await backend.handleFrontendRpcAction(userId, "update_settings", {
+                patch: { autoLocalizeOnOpen: true },
+            });
+
+            // 1. Start auto_localize_character (which awaits slow WB during performCharacterScan)
+            const autoPromise = backend.handleFrontendRpcAction(userId, "auto_localize_character", {
+                characterId: "char-inv-1",
+            }) as Promise<{ started: boolean }>;
+
+            await new Promise((r) => setTimeout(r, 20));
+            // Trigger purge_character_cache mid-flight -> bumps epoch
+            await backend.handleFrontendRpcAction(userId, "purge_character_cache", {
+                characterId: "char-inv-1",
+            });
+            releaseWb();
+
+            const autoRes = await autoPromise;
+            expect(autoRes.started).toBe(false);
+
+            // Must NOT have linked shared-inv.png to char-inv-1, marked autoLocalized, or cached scan
+            const rawJson = await controller.getStore(userId).read("media_index.json");
+            const persisted = JSON.parse(rawJson);
+            expect(persisted.assets["https://cdn.example.com/shared-inv.png"]?.characterIds).toEqual(["char-inv-owner"]);
+            expect(persisted.autoLocalizedCharacterIds).not.toContain("char-inv-1");
+
+            const wbCountBefore = controller.worldBookFetchCounts.get("wb-slow-inv") ?? 0;
+            await backend.performCharacterScan(userId, "char-inv-1", true);
+            expect(controller.worldBookFetchCounts.get("wb-slow-inv")).toBe(wbCountBefore + 1);
+
+            // 2. enqueue_download skips character invalidated mid-scan (e.g. CHARACTER_DELETED)
+            // Bump updated_at so enqueue_download misses characterScanCache and awaits wbGate2
+            controller.characters.get("char-inv-1")!.updated_at = 51;
+            const wbGate2 = new Promise<void>((r) => {
+                releaseWb = r;
+            });
+            controller.spindle.world_books.get = async (id: string, uid?: string) => {
+                if (id === "wb-slow-inv") {
+                    await wbGate2;
+                }
+                return origGetWb(id, uid);
+            };
+            const enqPromise = backend.handleFrontendRpcAction(userId, "enqueue_download", {
+                filter: { characterIds: ["char-inv-1"], maxItems: 0 },
+            }) as Promise<{ queueProgress: { totalQueued: number } }>;
+
+            await new Promise((r) => setTimeout(r, 20));
+            await controller.emitEvent("CHARACTER_DELETED", { characterId: "char-inv-1" }, userId);
+            releaseWb();
+
+            const enqRes = await enqPromise;
+            expect(enqRes.queueProgress.totalQueued).toBe(0);
+        } finally {
+            releaseWb?.();
+            controller.spindle.world_books.get = origGetWb;
+            controller.characters.delete("char-inv-owner");
+            controller.characters.delete("char-inv-1");
+            controller.worldBooks.delete("wb-slow-inv");
+        }
+    });
+
+    test("[H-02 Support] broadcasts StorageStatsSummary in terminal QUEUE_PROGRESS and URL_MAP_UPDATED", async () => {
+        const userId = "u-stats-broadcast";
+        controller.resetCallLogs();
+
+        controller.characters.set("char-stats-1", {
+            id: "char-stats-1",
+            name: "StatsChar",
+            updated_at: 1,
+            description: "![](https://cdn.example.com/stats-pic.png)",
+        });
+
+        await backend.handleFrontendRpcAction(userId, "enqueue_download", {
+            filter: { characterIds: ["char-stats-1"], maxItems: 0 },
+        });
+
+        const deadline = Date.now() + 2000;
+        while (Date.now() < deadline) {
+            const p = (await backend.handleFrontendRpcAction(userId, "queue_control", { control: "status" })) as any;
+            if (p.queueProgress.status === "completed") break;
+            await new Promise((r) => setTimeout(r, 10));
+        }
+        // Wait for coalesced scheduleUrlMapSync (200ms)
+        await new Promise((r) => setTimeout(r, 260));
+
+        const terminalProgressMsg = controller.sentToFrontend.find(
+            (m) =>
+                m.userId === userId &&
+                m.msg.type === "QUEUE_PROGRESS" &&
+                m.msg.progress?.status === "completed",
+        );
+        expect(terminalProgressMsg?.msg.stats?.totalAssets).toBe(1);
+        expect(terminalProgressMsg?.msg.stats?.totalSizeBytes).toBeGreaterThan(0);
+
+        const urlMapMsg = controller.sentToFrontend.find(
+            (m) => m.userId === userId && m.msg.type === "URL_MAP_UPDATED",
+        );
+        expect(urlMapMsg?.msg.stats?.totalAssets).toBe(1);
+        expect(urlMapMsg?.msg.stats?.settings).toBeDefined();
+
+        controller.characters.delete("char-stats-1");
+    });
+});

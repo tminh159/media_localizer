@@ -9,6 +9,20 @@ import {
   type SectionCountSummary,
 } from "../shared/types.ts";
 
+function hasBalancedParens(value: string): boolean {
+  let depth = 0;
+  for (let i = 0; i < value.length; i++) {
+    const ch = value[i];
+    if (ch === "(") {
+      depth++;
+    } else if (ch === ")") {
+      depth--;
+      if (depth < 0) return false;
+    }
+  }
+  return depth === 0;
+}
+
 /**
  * Validates that a URL is either a single-slash relative path (`/path`) or an
  * explicit `http:` / `https:` URL, blocking `javascript:`, `data:`, and `//host`.
@@ -27,7 +41,7 @@ export function sanitizeSafeMediaUrl(
     if (/[\s"'\\<>()`]/.test(trimmed)) return null;
     return trimmed;
   }
-  if (/[\s"'\\<>`]/.test(trimmed)) return null;
+  if (/[\s"'\\<>`]/.test(trimmed) || !hasBalancedParens(trimmed)) return null;
   try {
     const parsed = new URL(trimmed);
     if (parsed.protocol === "http:" || parsed.protocol === "https:") {
@@ -50,6 +64,85 @@ export function safeOpenExternalUrl(
   if (!safeUrl || typeof window === "undefined") return false;
   window.open(safeUrl, "_blank", "noopener,noreferrer");
   return true;
+}
+
+export interface HostSurfacesCapableContext {
+  host?: {
+    surfaces?: {
+      invoke?(
+        ref: { kind: string; id: string },
+        params?: Record<string, unknown>,
+      ): void | Promise<void>;
+    };
+  };
+  permissions?: {
+    request?(
+      permissions: string[],
+      options?: { reason?: string },
+    ): Promise<string[]>;
+  };
+}
+
+/**
+ * Returns true if the Lumiverse host exposes `ctx.host.surfaces.invoke(...)`
+ * so the extension can open the native Character Editor modal directly.
+ */
+export function canOpenNativeCharacterEditor(ctx: unknown): boolean {
+  const invoke = (ctx as HostSurfacesCapableContext | null | undefined)?.host
+    ?.surfaces?.invoke;
+  return typeof invoke === "function";
+}
+
+/**
+ * Opens Lumiverse's native Character Editor (`modal:character_editor`, falling
+ * back to `route:/characters/:id`) for the given character ID.
+ */
+export async function openNativeCharacterEditor(
+  ctx: unknown,
+  characterId: string,
+): Promise<boolean> {
+  const trimmedId = typeof characterId === "string" ? characterId.trim() : "";
+  if (!trimmedId) return false;
+  const capCtx = ctx as HostSurfacesCapableContext | null | undefined;
+  const invoke = capCtx?.host?.surfaces?.invoke;
+  if (typeof invoke !== "function") return false;
+
+  try {
+    await invoke({ kind: "modal", id: "character_editor" }, { id: trimmedId });
+    return true;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (
+      msg.includes("PERMISSION_DENIED") &&
+      typeof capCtx?.permissions?.request === "function"
+    ) {
+      try {
+        const granted = await capCtx.permissions.request(["characters"], {
+          reason:
+            "Allow Media Localizer to open Lumiverse's native Character Editor for this card.",
+        });
+        if (Array.isArray(granted) && granted.includes("characters")) {
+          await invoke(
+            { kind: "modal", id: "character_editor" },
+            { id: trimmedId },
+          );
+          return true;
+        }
+      } catch {
+        // Fall through to route fallback
+      }
+    }
+    try {
+      await invoke({ kind: "route", id: "/characters/:id" }, { id: trimmedId });
+      return true;
+    } catch {
+      console.warn(
+        "[media_localizer] Failed to open native Character Editor:",
+        err,
+      );
+      return false;
+    }
+  }
 }
 
 export type IconName =
@@ -77,7 +170,18 @@ export type IconName =
   | "arrow-up"
   | "arrow-down"
   | "shuffle"
-  | "users";
+  | "users"
+  | "edit"
+  | "search"
+  | "play"
+  | "smile"
+  | "user"
+  | "sliders"
+  | "layers"
+  | "folder"
+  | "database"
+  | "shield"
+  | "filter";
 
 const ICON_PATHS: Record<IconName, string> = {
   download:
@@ -125,6 +229,27 @@ const ICON_PATHS: Record<IconName, string> = {
     '<polyline points="16 3 21 3 21 8"/><line x1="4" y1="20" x2="21" y2="3"/><polyline points="21 16 21 21 16 21"/><line x1="15" y1="15" x2="21" y2="21"/><line x1="4" y1="4" x2="9" y2="9"/>',
   users:
     '<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>',
+  edit:
+    '<path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/>',
+  search:
+    '<circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>',
+  play: '<polygon points="6 4 20 12 6 20 6 4"/>',
+  smile:
+    '<circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/>',
+  user:
+    '<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>',
+  sliders:
+    '<line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/>',
+  layers:
+    '<polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/>',
+  folder:
+    '<path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>',
+  database:
+    '<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>',
+  shield:
+    '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>',
+  filter:
+    '<polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/>',
 };
 
 export function createIcon(name: IconName, size = 14): SVGSVGElement {
@@ -169,10 +294,15 @@ export function createIconButton(options: {
 }
 
 let activeTipCloseFn: (() => void) | null = null;
+let activeTipTrigger: HTMLElement | null = null;
 let tipDocListenersAttached = false;
 
 function onTipDocumentClick(ev: Event): void {
   if (!activeTipCloseFn) return;
+  if (activeTipTrigger && activeTipTrigger.isConnected === false) {
+    activeTipCloseFn();
+    return;
+  }
   const target = ev.target as Node | null;
   if (target && (target as HTMLElement).closest?.(".ml-tip-wrap.is-open")) {
     return;
@@ -181,7 +311,12 @@ function onTipDocumentClick(ev: Event): void {
 }
 
 function onTipDocumentKeyDown(ev: KeyboardEvent): void {
-  if (ev.key === "Escape" && activeTipCloseFn) {
+  if (!activeTipCloseFn) return;
+  if (activeTipTrigger && activeTipTrigger.isConnected === false) {
+    activeTipCloseFn();
+    return;
+  }
+  if (ev.key === "Escape") {
     activeTipCloseFn();
   }
 }
@@ -223,13 +358,81 @@ export function createInfoTip(text: string): HTMLElement {
   popover.setAttribute("role", "tooltip");
   popover.textContent = text;
 
+  const updateTipAlignment = () => {
+    wrap.classList.remove("is-align-right");
+    popover.style.left = "";
+    popover.style.right = "";
+    popover.style.maxWidth = "";
+
+    if (typeof wrap.getBoundingClientRect !== "function") return;
+    const wrapRect = wrap.getBoundingClientRect();
+    if (!wrapRect || wrapRect.width <= 0) return;
+
+    const container = wrap.closest?.(
+      ".ml-drawer-body, .ml-gallery-host, .ml-widget",
+    ) as HTMLElement | null;
+    const boundsRect =
+      typeof container?.getBoundingClientRect === "function"
+        ? container.getBoundingClientRect()
+        : null;
+    const winWidth =
+      typeof window !== "undefined" && typeof window.innerWidth === "number"
+        ? window.innerWidth
+        : 0;
+    const leftBound =
+      boundsRect && boundsRect.width > 0 ? boundsRect.left + 8 : 8;
+    const rightBound =
+      boundsRect && boundsRect.width > 0
+        ? boundsRect.right - 8
+        : winWidth > 0
+          ? winWidth - 8
+          : 0;
+    if (rightBound <= leftBound) return;
+
+    const popRect =
+      typeof popover.getBoundingClientRect === "function"
+        ? popover.getBoundingClientRect()
+        : null;
+    const clampedMaxWidth = Math.max(120, Math.floor(rightBound - leftBound));
+    const tipWidth =
+      popRect && popRect.width > 0
+        ? popRect.width
+        : Math.min(240, clampedMaxWidth);
+
+    if (wrapRect.left + tipWidth > rightBound) {
+      if (wrapRect.right - tipWidth >= leftBound) {
+        wrap.classList.add("is-align-right");
+      } else {
+        const targetLeft = Math.max(
+          leftBound,
+          Math.min(wrapRect.left, rightBound - Math.min(tipWidth, clampedMaxWidth)),
+        );
+        popover.style.left = `${Math.round(targetLeft - wrapRect.left)}px`;
+        popover.style.right = "auto";
+        popover.style.maxWidth = `${clampedMaxWidth}px`;
+      }
+    } else if (popRect && popRect.width > 0 && popRect.left < leftBound) {
+      const targetLeft = Math.max(leftBound, wrapRect.left);
+      popover.style.left = `${Math.round(targetLeft - wrapRect.left)}px`;
+      popover.style.right = "auto";
+      popover.style.maxWidth = `${clampedMaxWidth}px`;
+    }
+  };
+
   const close = () => {
-    wrap.classList.remove("is-open");
+    wrap.classList.remove("is-open", "is-align-right");
+    popover.style.left = "";
+    popover.style.right = "";
+    popover.style.maxWidth = "";
     if (activeTipCloseFn === close) {
       activeTipCloseFn = null;
+      activeTipTrigger = null;
       detachTipDocListeners();
     }
   };
+
+  wrap.addEventListener("pointerenter", updateTipAlignment);
+  btn.addEventListener("focus", updateTipAlignment);
 
   btn.addEventListener("click", (ev) => {
     ev.stopPropagation();
@@ -243,7 +446,9 @@ export function createInfoTip(text: string): HTMLElement {
     } else {
       wrap.classList.add("is-open");
       activeTipCloseFn = close;
+      activeTipTrigger = wrap;
       ensureTipDocListeners();
+      updateTipAlignment();
     }
   });
 
@@ -263,13 +468,30 @@ export function renderQueueBanner(
   ) => Promise<void>,
 ): HTMLElement {
   const banner = document.createElement("div");
-  banner.className = "ml-queue-banner";
+  const stateClass =
+    q.status === "paused"
+      ? "is-paused"
+      : q.status === "cancelling"
+        ? "is-cancelling"
+        : "is-running";
+  banner.className = `ml-queue-banner ${stateClass}`;
 
   const topRow = document.createElement("div");
   topRow.className = "ml-header-bar";
 
-  const statusText = document.createElement("div");
-  statusText.style.fontWeight = "600";
+  const statusWrap = document.createElement("div");
+  statusWrap.className = "ml-inline-title";
+
+  const statusIcon = createIcon(
+    q.status === "paused"
+      ? "pause"
+      : q.status === "cancelling"
+        ? "rotate-ccw"
+        : "download",
+    13,
+  );
+  const statusText = document.createElement("span");
+  statusText.className = "ml-queue-status-text";
   const pct =
     q.totalQueued > 0
       ? Math.min(100, Math.round((q.completedCount / q.totalQueued) * 100))
@@ -280,7 +502,8 @@ export function renderQueueBanner(
       : q.status === "cancelling"
         ? "Stopping..."
         : "Downloading";
-  statusText.textContent = `${stateLabel}: ${q.completedCount} / ${q.totalQueued} (${pct}%) — ${q.succeededCount} saved, ${q.skippedCount} skipped, ${q.failedCount} failed`;
+  statusText.textContent = `${stateLabel}: ${q.completedCount} / ${q.totalQueued} (${pct}%)`;
+  statusWrap.append(statusIcon, statusText);
 
   const controls = document.createElement("div");
   controls.className = "ml-header-actions";
@@ -327,16 +550,32 @@ export function renderQueueBanner(
   cancelBtn.addEventListener("click", () => void onQueueControl("cancel_all"));
   controls.appendChild(cancelBtn);
 
-  topRow.append(statusText, controls);
+  topRow.append(statusWrap, controls);
 
   const track = document.createElement("div");
   track.className = "ml-progress-track";
   const fill = document.createElement("div");
-  fill.className = "ml-progress-fill";
+  fill.className =
+    q.status === "running" ? "ml-progress-fill is-active" : "ml-progress-fill";
   fill.style.width = `${pct}%`;
   track.appendChild(fill);
 
-  banner.append(topRow, track);
+  const statStrip = document.createElement("div");
+  statStrip.className = "ml-stat-strip";
+
+  const savedChip = document.createElement("span");
+  savedChip.className = "ml-stat-chip is-success";
+  savedChip.textContent = `${q.succeededCount} saved`;
+  const skippedChip = document.createElement("span");
+  skippedChip.className = "ml-stat-chip is-muted";
+  skippedChip.textContent = `${q.skippedCount} skipped`;
+  const failedChip = document.createElement("span");
+  failedChip.className =
+    q.failedCount > 0 ? "ml-stat-chip is-danger" : "ml-stat-chip is-muted";
+  failedChip.textContent = `${q.failedCount} failed`;
+  statStrip.append(savedChip, skippedChip, failedChip);
+
+  banner.append(topRow, track, statStrip);
 
   if (q.activeUrls.length > 0) {
     const activeLine = document.createElement("div");
@@ -364,7 +603,7 @@ export function renderSharedDownloadConfigControls(options: {
   sectionCounts?: Record<MediaSourceSection, SectionCountSummary>;
   batchCapHint?: string;
   sectionTip?: string;
-  onChange: () => void;
+  onChange: (state: SharedDownloadFilterState) => void;
 }): HTMLElement {
   const wrap = document.createElement("div");
   wrap.className = "ml-stack";
@@ -400,7 +639,7 @@ export function renderSharedDownloadConfigControls(options: {
         cb.checked = true;
         return;
       }
-      options.onChange();
+      options.onChange(options.state);
     });
 
     const text = document.createElement("span");
@@ -435,7 +674,7 @@ export function renderSharedDownloadConfigControls(options: {
         cb.checked = true;
         return;
       }
-      options.onChange();
+      options.onChange(options.state);
     });
     const span = document.createElement("span");
     span.textContent = kind === "image" ? "Images" : "Videos";
@@ -450,7 +689,7 @@ export function renderSharedDownloadConfigControls(options: {
   failedCb.checked = options.state.includeFailed;
   failedCb.addEventListener("change", () => {
     options.state.includeFailed = failedCb.checked;
-    options.onChange();
+    options.onChange(options.state);
   });
   const failedSpan = document.createElement("span");
   failedSpan.textContent = "Retry previously failed URLs";
@@ -469,9 +708,13 @@ export function renderSharedDownloadConfigControls(options: {
   capInput.max = "2000";
   capInput.value = String(options.state.batchCap);
   capInput.addEventListener("change", () => {
-    const parsed = Math.max(0, Math.floor(Number(capInput.value) || 0));
+    const rawNum = Number(capInput.value);
+    const parsed = Number.isFinite(rawNum)
+      ? Math.min(2000, Math.max(0, Math.floor(rawNum)))
+      : options.state.batchCap;
+    capInput.value = String(parsed);
     options.state.batchCap = parsed;
-    options.onChange();
+    options.onChange(options.state);
   });
   capLbl.append(capSpan, capInput, createInfoTip("Maximum URLs queued per batch (0 = unlimited)."));
   row.appendChild(capLbl);
@@ -624,6 +867,7 @@ export interface LightboxItem {
   readOnly?: boolean;
   badgeText?: string;
   onRemove?: () => Promise<void>;
+  onEditCharacter?: () => void;
 }
 
 let activeLightboxCloseFn: (() => void) | null = null;
@@ -711,12 +955,15 @@ export function openMediaLightbox(
   const onKeyDown = (ev: KeyboardEvent) => {
     if (ev.key === "Escape") {
       ev.preventDefault();
+      ev.stopPropagation();
       close();
     } else if (ev.key === "ArrowLeft") {
       ev.preventDefault();
+      ev.stopPropagation();
       step(-1);
     } else if (ev.key === "ArrowRight") {
       ev.preventDefault();
+      ev.stopPropagation();
       step(1);
     }
   };
@@ -747,6 +994,12 @@ export function openMediaLightbox(
     renderCurrent();
   }
 
+  function updateNavChrome() {
+    counterEl.textContent = `${idx + 1} / ${workingItems.length}`;
+    prevBtn.style.visibility = workingItems.length > 1 ? "visible" : "hidden";
+    nextBtn.style.visibility = workingItems.length > 1 ? "visible" : "hidden";
+  }
+
   function renderCurrent() {
     if (closed) return;
     const item = workingItems[idx];
@@ -755,15 +1008,13 @@ export function openMediaLightbox(
       return;
     }
 
-    counterEl.textContent = `${idx + 1} / ${workingItems.length}`;
-    prevBtn.style.visibility = workingItems.length > 1 ? "visible" : "hidden";
-    nextBtn.style.visibility = workingItems.length > 1 ? "visible" : "hidden";
+    updateNavChrome();
 
     const safeLocalUrl = sanitizeSafeMediaUrl(item.localUrl);
     mediaSlot.innerHTML = "";
     if (!safeLocalUrl) {
       const blocked = document.createElement("div");
-      blocked.className = "ml-empty-hint";
+      blocked.className = "ml-empty";
       blocked.textContent = "Blocked unsafe media URL.";
       mediaSlot.appendChild(blocked);
     } else if (item.mediaKind === "video") {
@@ -785,7 +1036,9 @@ export function openMediaLightbox(
     metaCol.innerHTML = "";
     const titleRow = document.createElement("div");
     titleRow.className = "ml-lightbox-title";
-    titleRow.textContent = item.title;
+    const titleSpan = document.createElement("span");
+    titleSpan.textContent = item.title;
+    titleRow.appendChild(titleSpan);
     if (item.badgeText) {
       const badge = document.createElement("span");
       badge.className = "ml-badge is-info";
@@ -830,6 +1083,22 @@ export function openMediaLightbox(
       actionsCol.appendChild(copyBtn);
     }
 
+    if (item.onEditCharacter) {
+      const editBtn = createIconButton({
+        icon: "edit",
+        label: "Edit Card",
+        title: "Open native Character Editor for this character",
+        className: "ml-btn is-sm",
+        size: 13,
+        onClick: () => {
+          const onEdit = item.onEditCharacter;
+          close();
+          onEdit?.();
+        },
+      });
+      actionsCol.appendChild(editBtn);
+    }
+
     if (!item.readOnly && item.onRemove) {
       const removeBtn = createIconButton({
         icon: "trash",
@@ -848,6 +1117,7 @@ export function openMediaLightbox(
             if (removeAt === -1) {
               removeAt = workingItems.findIndex((entry) => entry.id === item.id);
             }
+            const removedCurrentSlide = removeAt !== -1 && removeAt === idx;
             if (removeAt !== -1) {
               workingItems.splice(removeAt, 1);
               if (removeAt < idx) {
@@ -862,7 +1132,11 @@ export function openMediaLightbox(
               close();
             } else {
               idx = Math.max(0, Math.min(idx, workingItems.length - 1));
-              renderCurrent();
+              if (removedCurrentSlide) {
+                renderCurrent();
+              } else {
+                updateNavChrome();
+              }
             }
           } catch (err) {
             console.warn("[media_localizer] Failed removing lightbox item:", err);
@@ -895,7 +1169,6 @@ function pruneDetachedThumbTargets(): void {
   for (const el of observedThumbElements) {
     if (el.isConnected === false) {
       sharedThumbObserver.unobserve(el);
-      thumbCallbacks.delete(el);
       observedThumbElements.delete(el);
     }
   }
@@ -933,7 +1206,6 @@ function getThumbObserver(): IntersectionObserver | null {
           if (!entry.isIntersecting) {
             if (entry.target.isConnected === false) {
               sharedThumbObserver?.unobserve(entry.target);
-              thumbCallbacks.delete(entry.target);
               observedThumbElements.delete(entry.target);
             }
             continue;
@@ -946,10 +1218,61 @@ function getThumbObserver(): IntersectionObserver | null {
         }
         pruneDetachedThumbTargets();
       },
-      { rootMargin: "220px" },
+      { rootMargin: "600px" },
     );
   }
   return sharedThumbObserver;
+}
+
+/**
+ * Re-attaches `sharedThumbObserver` (or runs the deferred `src` callback if
+ * `IntersectionObserver` is unavailable) for any cached lazy `<img>`/`<video>`
+ * elements that were pruned while temporarily detached from the DOM.
+ */
+export function reobserveLazyMedia(
+  root: ParentNode | Element | null | undefined,
+): void {
+  if (!root) return;
+  const candidates: Element[] = [];
+  const rootTag = (root as { tagName?: unknown }).tagName;
+  if (typeof rootTag === "string") {
+    const lower = rootTag.toLowerCase();
+    if (lower === "img" || lower === "video") {
+      candidates.push(root as Element);
+    }
+  }
+  const queried = (
+    root as { querySelectorAll?: (selectors: string) => Iterable<Element> }
+  ).querySelectorAll?.("img, video");
+  if (queried) {
+    for (const el of Array.from(queried)) {
+      candidates.push(el);
+    }
+  }
+  if (candidates.length === 0) return;
+
+  const observer = getThumbObserver();
+  for (const el of candidates) {
+    const cb = thumbCallbacks.get(el);
+    if (!cb) continue;
+    const currentSrc =
+      typeof (el as { getAttribute?: (name: string) => string | null })
+        .getAttribute === "function"
+        ? el.getAttribute("src")
+        : (el as { src?: string }).src;
+    if (currentSrc) {
+      thumbCallbacks.delete(el);
+      continue;
+    }
+    if (observer) {
+      if (!observedThumbElements.has(el)) {
+        observeThumbElement(observer, el, cb);
+      }
+    } else {
+      thumbCallbacks.delete(el);
+      cb();
+    }
+  }
 }
 
 /**
@@ -959,6 +1282,7 @@ function getThumbObserver(): IntersectionObserver | null {
 export function cleanupUiHelpers(): void {
   activeTipCloseFn?.();
   activeTipCloseFn = null;
+  activeTipTrigger = null;
   detachTipDocListeners();
   activeLightboxCloseFn?.();
   activeLightboxCloseFn = null;
@@ -974,9 +1298,115 @@ export function cleanupUiHelpers(): void {
   thumbCallbacks = new WeakMap<Element, () => void>();
 }
 
+const LOCAL_IMAGE_THUMB_PATH_RE = /^\/api\/v1\/images\/(?!remote$|wallpapers$)[^/?#]+$/;
+
+export type ThumbnailSize = "sm" | "md" | "lg";
+export type ThumbnailImageTier = "sm" | "lg";
+
+export const THUMBNAIL_SIZE_OPTIONS: readonly ThumbnailSize[] = [
+  "sm",
+  "md",
+  "lg",
+] as const;
+
+export const DEFAULT_THUMBNAIL_SIZE: ThumbnailSize = "md";
+
 /**
- * Creates a lazy-loaded `<img>` or muted preview `<video>` tile so large libraries
- * only decode thumbnails as they scroll near the viewport.
+ * Validates a persisted or user-supplied thumbnail size preset, falling back
+ * to {@link DEFAULT_THUMBNAIL_SIZE}.
+ */
+export function sanitizeThumbnailSize(raw: unknown): ThumbnailSize {
+  return raw === "sm" || raw === "md" || raw === "lg"
+    ? raw
+    : DEFAULT_THUMBNAIL_SIZE;
+}
+
+/**
+ * Maps a UI thumbnail size preset to a Lumiverse `/api/v1/images/:id?size=`
+ * tier (`sm` ~300px or `lg` ~700px; `md` is not a host endpoint tier).
+ */
+export function getThumbnailImageTier(size: ThumbnailSize): ThumbnailImageTier {
+  return size === "lg" ? "lg" : "sm";
+}
+
+/**
+ * Returns the `.ml-widget` modifier class corresponding to a thumbnail size.
+ */
+export function getThumbnailSizeClass(size: ThumbnailSize): string {
+  return `is-thumb-${size}`;
+}
+
+const THUMBNAIL_SIZE_LABELS: Record<
+  ThumbnailSize,
+  { short: string; title: string }
+> = {
+  sm: { short: "S", title: "Small thumbnails" },
+  md: { short: "M", title: "Medium thumbnails" },
+  lg: { short: "L", title: "Large thumbnails" },
+};
+
+/**
+ * Builds a compact `S / M / L` segmented toggle for thumbnail size presets.
+ */
+export function createThumbnailSizeSegmented(
+  currentSize: ThumbnailSize,
+  onChange: (size: ThumbnailSize) => void,
+): HTMLElement {
+  let activeSize = currentSize;
+  const wrap = document.createElement("div");
+  wrap.className = "ml-segmented ml-thumb-size-segmented";
+  wrap.setAttribute("role", "group");
+  wrap.setAttribute("aria-label", "Thumbnail size");
+
+  const buttons = new Map<ThumbnailSize, HTMLButtonElement>();
+  const syncActive = () => {
+    for (const [sz, button] of buttons) {
+      const isAct = sz === activeSize;
+      button.className = `ml-btn is-xs${isAct ? " is-active" : ""}`;
+      button.setAttribute("aria-pressed", isAct ? "true" : "false");
+    }
+  };
+
+  for (const size of THUMBNAIL_SIZE_OPTIONS) {
+    const meta = THUMBNAIL_SIZE_LABELS[size];
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.textContent = meta.short;
+    btn.title = meta.title;
+    btn.setAttribute("aria-label", meta.title);
+    btn.addEventListener("click", () => {
+      if (size === activeSize) return;
+      activeSize = size;
+      syncActive();
+      onChange(size);
+    });
+    buttons.set(size, btn);
+    wrap.appendChild(btn);
+  }
+
+  syncActive();
+  return wrap;
+}
+
+/**
+ * Converts a bare local `/api/v1/images/:id` URL into a lightweight `?size=sm`
+ * or `?size=lg` thumbnail URL for image tiles so full-resolution bitmaps do
+ * not exhaust Chromium's decoded-image cache during scrolling.
+ */
+export function toThumbnailMediaUrl(
+  safeSrc: string | null,
+  mediaKind: MediaKind = "image",
+  tier: ThumbnailImageTier = "sm",
+): string | null {
+  if (!safeSrc || mediaKind !== "image") return safeSrc;
+  return LOCAL_IMAGE_THUMB_PATH_RE.test(safeSrc)
+    ? `${safeSrc}?size=${tier}`
+    : safeSrc;
+}
+
+/**
+ * Creates an `<img>` or muted preview `<video>` tile, optionally deferring `src`
+ * assignment via `sharedThumbObserver` until the tile scrolls near the viewport.
  */
 export function createLazyMediaElement(options: {
   src: string;
@@ -984,9 +1414,11 @@ export function createLazyMediaElement(options: {
   alt: string;
   className: string;
   title?: string;
+  eager?: boolean;
+  thumbTier?: ThumbnailImageTier;
 }): HTMLImageElement | HTMLVideoElement {
   const safeSrc = sanitizeSafeMediaUrl(options.src);
-  const observer = safeSrc ? getThumbObserver() : null;
+  const observer = safeSrc && !options.eager ? getThumbObserver() : null;
   if (options.mediaKind === "video") {
     const vid = document.createElement("video");
     vid.className = options.className;
@@ -997,6 +1429,7 @@ export function createLazyMediaElement(options: {
     if (safeSrc) {
       if (observer) {
         observeThumbElement(observer, vid, () => {
+          thumbCallbacks.delete(vid);
           vid.src = safeSrc;
         });
       } else {
@@ -1006,19 +1439,25 @@ export function createLazyMediaElement(options: {
     return vid;
   }
 
+  const thumbSrc = toThumbnailMediaUrl(
+    safeSrc,
+    "image",
+    options.thumbTier ?? "sm",
+  );
   const img = document.createElement("img");
   img.className = options.className;
-  img.loading = "lazy";
+  img.loading = "eager";
   img.decoding = "async";
   img.alt = options.alt;
   if (options.title) img.title = options.title;
-  if (safeSrc) {
+  if (thumbSrc) {
     if (observer) {
       observeThumbElement(observer, img, () => {
-        img.src = safeSrc;
+        thumbCallbacks.delete(img);
+        img.src = thumbSrc;
       });
     } else {
-      img.src = safeSrc;
+      img.src = thumbSrc;
     }
   }
   return img;
@@ -1026,4 +1465,210 @@ export function createLazyMediaElement(options: {
 
 export function formatByteBadge(bytes: number): string {
   return bytes > 0 ? formatBytes(bytes) : "0 B";
+}
+
+export interface PendingScrollRestore {
+  cancel: () => void;
+}
+
+const SCROLLABLE_OVERFLOW_VALUES = new Set(["auto", "scroll", "overlay"]);
+
+function isAncestorOrSelf(
+  ancestor: HTMLElement | null,
+  node: HTMLElement | null,
+): boolean {
+  let cur: HTMLElement | null = node;
+  while (cur) {
+    if (cur === ancestor) return true;
+    cur = cur.parentElement;
+  }
+  return false;
+}
+
+/**
+ * Returns true if `el` is currently scrolled or has vertical overflow inside a
+ * scrollable container (including `document.scrollingElement`).
+ */
+export function isElementScrollable(el: HTMLElement | null | undefined): boolean {
+  if (!el || typeof el.scrollTop !== "number" || !Number.isFinite(el.scrollTop)) {
+    return false;
+  }
+  if (el.scrollTop > 0) {
+    return true;
+  }
+  const hasOverflow =
+    typeof el.scrollHeight === "number" &&
+    typeof el.clientHeight === "number" &&
+    el.clientHeight > 0 &&
+    el.scrollHeight > el.clientHeight + 1;
+  if (!hasOverflow) {
+    return false;
+  }
+
+  const doc = typeof document !== "undefined" ? document : undefined;
+  if (
+    doc &&
+    (el === (doc.scrollingElement as HTMLElement | null) ||
+      el === (doc.documentElement as HTMLElement | null))
+  ) {
+    return true;
+  }
+
+  if (typeof getComputedStyle === "function") {
+    try {
+      const computedOverflowY = getComputedStyle(el as Element).overflowY;
+      if (computedOverflowY) {
+        return SCROLLABLE_OVERFLOW_VALUES.has(computedOverflowY);
+      }
+    } catch {
+      // Ignore mock elements that are not native DOM Element instances
+    }
+  }
+
+  const inlineOverflowY = (el as { style?: { overflowY?: string } }).style?.overflowY;
+  if (inlineOverflowY) {
+    return SCROLLABLE_OVERFLOW_VALUES.has(inlineOverflowY);
+  }
+
+  return true;
+}
+
+/**
+ * Finds the nearest scrollable element starting at `startEl` and walking up
+ * `parentElement` (including `document.scrollingElement`), falling back to a
+ * previously observed scroll container or `fallbackEl` when layout metrics are absent.
+ */
+export function resolveScrollContainer(
+  startEl: HTMLElement | null,
+  rememberedEl?: HTMLElement | null,
+  fallbackEl?: HTMLElement | null,
+): HTMLElement | null {
+  let cur: HTMLElement | null = startEl;
+  while (cur) {
+    if (isElementScrollable(cur)) {
+      return cur;
+    }
+    cur = cur.parentElement;
+  }
+
+  const docScrollEl =
+    typeof document !== "undefined"
+      ? (document.scrollingElement as HTMLElement | null)
+      : null;
+  if (docScrollEl && isElementScrollable(docScrollEl)) {
+    return docScrollEl;
+  }
+
+  if (
+    rememberedEl &&
+    startEl &&
+    isAncestorOrSelf(rememberedEl, startEl) &&
+    typeof rememberedEl.scrollTop === "number"
+  ) {
+    return rememberedEl;
+  }
+
+  return fallbackEl ?? startEl;
+}
+
+/**
+ * Sets `scrollTop` synchronously on the resolved scroll container and, when
+ * restoring a non-zero offset in a browser environment, guards against
+ * pre-layout clamping by re-applying on up to two animation frames if clamped.
+ */
+export function applyScrollTopWithSettlement(
+  getContainer: () => HTMLElement | null,
+  scrollTop: number,
+  prevPending: PendingScrollRestore | null,
+  shouldAbort?: () => boolean,
+): PendingScrollRestore | null {
+  prevPending?.cancel();
+  const next = Number.isFinite(scrollTop) && scrollTop >= 0 ? scrollTop : 0;
+  const host = getContainer();
+  if (!host || typeof host.scrollTop !== "number") {
+    return null;
+  }
+  host.scrollTop = next;
+  if (next <= 0 || typeof requestAnimationFrame !== "function") {
+    return null;
+  }
+
+  const afterSync = Number.isFinite(host.scrollTop) ? host.scrollTop : 0;
+  let cancelled = false;
+  let rafId = 0;
+  let followUpRafId = 0;
+
+  const cancel = () => {
+    if (cancelled) return;
+    cancelled = true;
+    if (typeof cancelAnimationFrame === "function") {
+      if (rafId) cancelAnimationFrame(rafId);
+      if (followUpRafId) cancelAnimationFrame(followUpRafId);
+    }
+  };
+
+  const reapplyIfClamped = (): number => {
+    if (cancelled || shouldAbort?.()) return next;
+    const target = getContainer();
+    if (!target || typeof target.scrollTop !== "number") return next;
+    const current = Number.isFinite(target.scrollTop) ? target.scrollTop : 0;
+    if (current < next && (afterSync < next || current === 0)) {
+      target.scrollTop = next;
+      return Number.isFinite(target.scrollTop) ? target.scrollTop : 0;
+    }
+    return current;
+  };
+
+  rafId = requestAnimationFrame(() => {
+    rafId = 0;
+    const current = reapplyIfClamped();
+    if (
+      !cancelled &&
+      !shouldAbort?.() &&
+      current < next &&
+      (afterSync < next || current === 0)
+    ) {
+      followUpRafId = requestAnimationFrame(() => {
+        followUpRafId = 0;
+        reapplyIfClamped();
+      });
+    }
+  });
+
+  return { cancel };
+}
+
+export const GALLERY_PREFS_STORAGE_KEY =
+  "lumiverse.media_localizer.gallery_prefs.v1";
+export const CHARACTER_PREFS_STORAGE_KEY =
+  "lumiverse.media_localizer.character_prefs.v1";
+
+/**
+ * Loads and sanitizes persisted UI preferences from `localStorage`, falling back
+ * to `fallback()` when storage is empty, malformed, or unavailable.
+ */
+export function loadPrefsFromStorage<T>(
+  key: string,
+  sanitize: (raw: unknown) => T,
+  fallback: () => T,
+): T {
+  try {
+    const raw = globalThis.localStorage?.getItem?.(key);
+    if (!raw) return fallback();
+    return sanitize(JSON.parse(raw));
+  } catch {
+    return fallback();
+  }
+}
+
+/**
+ * Persists UI preferences to `localStorage`, ignoring storage unavailability
+ * (e.g. private browsing or test environments).
+ */
+export function savePrefsToStorage<T>(key: string, prefs: T): void {
+  try {
+    globalThis.localStorage?.setItem?.(key, JSON.stringify(prefs));
+  } catch {
+    // Ignore storage unavailability (private browsing, test envs)
+  }
 }

@@ -4,12 +4,26 @@ import {
   type MediaKind,
 } from "../shared/types.ts";
 import {
+  applyScrollTopWithSettlement,
   createIcon,
   createIconButton,
   createInfoTip,
   createLazyMediaElement,
+  createThumbnailSizeSegmented,
+  DEFAULT_THUMBNAIL_SIZE,
+  getThumbnailImageTier,
+  getThumbnailSizeClass,
   openMediaLightbox,
+  reobserveLazyMedia,
+  resolveScrollContainer,
+  sanitizeSafeMediaUrl,
+  sanitizeThumbnailSize,
+  toThumbnailMediaUrl,
+  type IconName,
   type LightboxItem,
+  type PendingScrollRestore,
+  type ThumbnailImageTier,
+  type ThumbnailSize,
 } from "./ui-helpers.ts";
 
 export interface LibraryGalleryCallbacks {
@@ -18,9 +32,12 @@ export interface LibraryGalleryCallbacks {
   }): Promise<LibraryMediaCharacter[]>;
   onPurgeAsset(characterId: string, normalizedUrl: string): Promise<void>;
   onOpenCharacterTab?(characterId: string): void;
+  onOpenCharacterEditor?(characterId: string): void;
   onStateChange?(state: LibraryGalleryState): void;
   onCacheChange?(cache: LibraryGalleryCacheSnapshot): void;
   onScrollToTop?(): void;
+  onGetScrollTop?(): number;
+  onSetScrollTop?(scrollTop: number): void;
 }
 
 export type GalleryMediaType = "image" | "video" | "expression" | "avatar";
@@ -45,12 +62,15 @@ export interface LibraryGalleryPreferences {
   selectedMediaTypes: GalleryMediaType[];
   includeEmptyCharacters: boolean;
   pageSize: number;
+  thumbnailSize: ThumbnailSize;
 }
 
 export interface LibraryGalleryState extends LibraryGalleryPreferences {
   searchQuery: string;
   currentPage: number;
   activeCharacterId: string | null;
+  listScrollTop?: number;
+  listPageBeforeDrilldown?: number;
 }
 
 export interface LibraryGalleryCacheSnapshot {
@@ -76,6 +96,7 @@ export function getDefaultGalleryPreferences(): LibraryGalleryPreferences {
     selectedMediaTypes: [...ALL_GALLERY_MEDIA_TYPES],
     includeEmptyCharacters: false,
     pageSize: DEFAULT_GALLERY_PAGE_SIZE,
+    thumbnailSize: DEFAULT_THUMBNAIL_SIZE,
   };
 }
 
@@ -120,6 +141,7 @@ export function sanitizeGalleryPreferences(
   const pageSize = (GALLERY_PAGE_SIZE_OPTIONS as readonly number[]).includes(rawPageSize)
     ? rawPageSize
     : defaults.pageSize;
+  const thumbnailSize = sanitizeThumbnailSize(obj.thumbnailSize);
 
   return {
     grouped,
@@ -129,6 +151,7 @@ export function sanitizeGalleryPreferences(
     selectedMediaTypes,
     includeEmptyCharacters,
     pageSize,
+    thumbnailSize,
   };
 }
 
@@ -253,13 +276,201 @@ interface FlatMediaEntry {
 interface PrecomputedCharData {
   lowerName: string;
   lowerTags: string[];
+  tagsSig: string;
+  summaryText: string;
   hasMedia: boolean;
+  hasAvatar: boolean;
+  hasImage: boolean;
+  hasVideo: boolean;
+  hasExpression: boolean;
+  videoCount: number;
+  thumbUrl: string;
+  thumbKind: MediaKind;
   avatarEntry: FlatMediaEntry | null;
   localizedEntries: Array<{ kind: MediaKind; entry: FlatMediaEntry }>;
   expressionEntries: FlatMediaEntry[];
 }
 
 const GALLERY_COLLATOR = new Intl.Collator();
+const MAX_WARM_THUMB_CACHE = 240;
+const MAX_DOM_NODE_CACHE = 192;
+const EAGER_PAGE_ITEM_LIMIT = 96;
+const EAGER_LEADING_WINDOW = 48;
+const warmThumbCache = new Map<string, HTMLImageElement>();
+
+function warmGalleryThumb(url: string): void {
+  if (!url || typeof Image !== "function") return;
+  const existing = warmThumbCache.get(url);
+  if (existing) {
+    warmThumbCache.delete(url);
+    warmThumbCache.set(url, existing);
+    return;
+  }
+  try {
+    const preloader = new Image();
+    preloader.decoding = "async";
+    preloader.src = url;
+    warmThumbCache.set(url, preloader);
+    if (warmThumbCache.size > MAX_WARM_THUMB_CACHE) {
+      const oldestKey = warmThumbCache.keys().next().value;
+      if (oldestKey !== undefined) {
+        warmThumbCache.delete(oldestKey);
+      }
+    }
+  } catch {
+    // Ignore non-browser environments
+  }
+}
+
+export function clearWarmGalleryThumbs(url?: string): void {
+  if (url !== undefined) {
+    warmThumbCache.delete(url);
+    return;
+  }
+  warmThumbCache.clear();
+}
+
+function createGalleryMediaElement(options: {
+  src: string;
+  mediaKind: MediaKind;
+  alt: string;
+  className: string;
+  title?: string;
+  eager?: boolean;
+  thumbTier?: ThumbnailImageTier;
+}): HTMLImageElement | HTMLVideoElement {
+  const thumbTier = options.thumbTier ?? "sm";
+  if (options.mediaKind === "image" && options.eager) {
+    const safeSrc = sanitizeSafeMediaUrl(options.src);
+    const thumbSrc = toThumbnailMediaUrl(safeSrc, "image", thumbTier);
+    const img = document.createElement("img");
+    img.className = options.className;
+    img.loading = "eager";
+    img.decoding = "async";
+    img.alt = options.alt;
+    if (options.title) img.title = options.title;
+    if (thumbSrc) {
+      img.src = thumbSrc;
+      warmGalleryThumb(thumbSrc);
+    }
+    return img;
+  }
+
+  const el = createLazyMediaElement({
+    src: options.src,
+    mediaKind: options.mediaKind,
+    alt: options.alt,
+    className: options.className,
+    title: options.title,
+    eager: options.eager,
+    thumbTier,
+  });
+  if (options.mediaKind === "image") {
+    const img = el as HTMLImageElement;
+    // Avoid Chromium's native loading="lazy" offscreen eviction / re-evaluation
+    img.loading = "eager";
+    const safeSrc = sanitizeSafeMediaUrl(options.src);
+    const thumbSrc = toThumbnailMediaUrl(safeSrc, "image", thumbTier);
+    if (thumbSrc) {
+      if (img.complete && img.src) {
+        warmGalleryThumb(thumbSrc);
+      } else if (typeof img.addEventListener === "function") {
+        img.addEventListener("load", () => warmGalleryThumb(thumbSrc), { once: true });
+      }
+    }
+  }
+  return el;
+}
+
+function isGalleryMediaContainer(el: Element): boolean {
+  const cls = el.className ?? "";
+  return (
+    cls.includes("ml-char-card-grid") ||
+    cls.includes("ml-asset-grid") ||
+    cls.includes("ml-media-list")
+  );
+}
+
+function reconcileContainerChildren(
+  container: HTMLElement,
+  nextChildren: HTMLElement[],
+): void {
+  const current = Array.from(container.children);
+  if (
+    current.length === nextChildren.length &&
+    nextChildren.every((el, idx) => current[idx] === el)
+  ) {
+    return;
+  }
+
+  if (typeof container.insertBefore !== "function") {
+    container.innerHTML = "";
+    for (const child of nextChildren) {
+      container.appendChild(child);
+    }
+    return;
+  }
+
+  const keepSet = new Set<Element>(nextChildren);
+  for (const child of current) {
+    if (!keepSet.has(child)) {
+      child.remove();
+    }
+  }
+
+  let cursor: Element | null = container.firstElementChild;
+  for (const target of nextChildren) {
+    while (cursor && !keepSet.has(cursor)) {
+      const nextSib = cursor.nextElementSibling;
+      cursor.remove();
+      cursor = nextSib;
+    }
+    if (cursor === target) {
+      cursor = cursor.nextElementSibling;
+    } else {
+      container.insertBefore(target, cursor);
+    }
+  }
+}
+
+function updateContentSlotInPlace(
+  bodyOnly: HTMLElement,
+  nextContent: HTMLElement,
+): void {
+  if (typeof bodyOnly.insertBefore !== "function") {
+    bodyOnly.replaceWith(nextContent);
+    return;
+  }
+
+  const oldChildren = Array.from(bodyOnly.children) as HTMLElement[];
+  const newChildren = Array.from(nextContent.children) as HTMLElement[];
+  const oldGrid = oldChildren.find(isGalleryMediaContainer);
+  const newGrid = newChildren.find(isGalleryMediaContainer);
+
+  if (!oldGrid || !newGrid || oldGrid.className !== newGrid.className) {
+    bodyOnly.replaceWith(nextContent);
+    return;
+  }
+
+  const nextCards = Array.from(newGrid.children) as HTMLElement[];
+  reconcileContainerChildren(oldGrid, nextCards);
+
+  const newGridIdx = newChildren.indexOf(newGrid);
+  for (const child of oldChildren) {
+    if (child !== oldGrid) {
+      child.remove();
+    }
+  }
+  for (let i = 0; i < newChildren.length; i++) {
+    if (i === newGridIdx) continue;
+    const child = newChildren[i]!;
+    if (i < newGridIdx) {
+      bodyOnly.insertBefore(child, oldGrid);
+    } else {
+      bodyOnly.appendChild(child);
+    }
+  }
+}
 
 function inferKind(mimeType: string, filename: string): MediaKind {
   if (mimeType.startsWith("video/") || /\.(mp4|webm|mov|m4v|ogv)(?:$|[?#])/i.test(filename)) {
@@ -283,11 +494,49 @@ function formatCharacterSummary(char: LibraryMediaCharacter): string {
   if (char.totalSizeBytes > 0) {
     parts.push(formatBytes(char.totalSizeBytes));
   }
-  return parts.length > 0 ? parts.join(" · ") : "No localized media yet";
+  return parts.length > 0 ? parts.join(" · ") : "No media";
 }
 
 function defaultDirectionForSort(mode: GallerySortMode): GallerySortDirection {
   return mode === "name" ? "asc" : "desc";
+}
+
+function buildGalleryEmptyState(options: {
+  icon: IconName;
+  message: string;
+  className?: string;
+}): HTMLElement {
+  const el = document.createElement("div");
+  el.className = options.className ?? "ml-empty ml-empty-card";
+
+  const iconWrap = document.createElement("span");
+  iconWrap.className = "ml-empty-icon";
+  iconWrap.appendChild(createIcon(options.icon, 15));
+
+  const text = document.createElement("div");
+  text.className = "ml-empty-text";
+  text.textContent = options.message;
+
+  el.append(iconWrap, text);
+  return el;
+}
+
+function buildTileKindBadge(options: {
+  icon?: IconName;
+  label: string;
+  modifier?: string;
+  title?: string;
+}): HTMLElement {
+  const badge = document.createElement("span");
+  badge.className = options.modifier ? `ml-tile-badge ${options.modifier}` : "ml-tile-badge";
+  if (options.title) badge.title = options.title;
+  if (options.icon) {
+    badge.appendChild(createIcon(options.icon, 9));
+  }
+  const span = document.createElement("span");
+  span.textContent = options.label;
+  badge.appendChild(span);
+  return badge;
 }
 
 export class LibraryGalleryView {
@@ -307,11 +556,23 @@ export class LibraryGalleryView {
   private includeEmptyCharacters = false;
   private loadedIncludeEmpty = false;
   private pageSize = DEFAULT_GALLERY_PAGE_SIZE;
+  private thumbnailSize: ThumbnailSize = DEFAULT_THUMBNAIL_SIZE;
   private currentPage = 1;
   private randomWeights = new Map<string, number>();
   private randomWeightsDirty = false;
   private searchQuery = "";
   private activeCharacterId: string | null = null;
+  private listScrollTop = 0;
+  private listPageBeforeDrilldown = 1;
+  private widgetWrapEl: HTMLElement | null = null;
+  private refreshBtnEl: HTMLButtonElement | null = null;
+  private charCardCache = new Map<string, { sig: string; el: HTMLElement }>();
+  private assetCardCache = new Map<string, { sig: string; el: HTMLElement }>();
+  private listRowCache = new Map<string, { sig: string; el: HTMLElement }>();
+  private cardClickHandlers = new WeakMap<HTMLElement, () => void>();
+  private cardEditHandlers = new WeakMap<HTMLElement, () => void>();
+  private rememberedScrollContainer: HTMLElement | null = null;
+  private pendingScrollRestore: PendingScrollRestore | null = null;
 
   constructor(
     private readonly root: HTMLElement,
@@ -330,6 +591,7 @@ export class LibraryGalleryView {
       this.selectedMediaTypes = new Set(prefs.selectedMediaTypes);
       this.includeEmptyCharacters = prefs.includeEmptyCharacters;
       this.pageSize = prefs.pageSize;
+      this.thumbnailSize = prefs.thumbnailSize;
       if (typeof initial.state.searchQuery === "string") {
         this.searchQuery = initial.state.searchQuery;
       }
@@ -345,6 +607,20 @@ export class LibraryGalleryView {
         initial.state.activeCharacterId === null
       ) {
         this.activeCharacterId = initial.state.activeCharacterId;
+      }
+      if (
+        typeof initial.state.listScrollTop === "number" &&
+        Number.isFinite(initial.state.listScrollTop) &&
+        initial.state.listScrollTop >= 0
+      ) {
+        this.listScrollTop = initial.state.listScrollTop;
+      }
+      if (
+        typeof initial.state.listPageBeforeDrilldown === "number" &&
+        Number.isFinite(initial.state.listPageBeforeDrilldown) &&
+        initial.state.listPageBeforeDrilldown >= 1
+      ) {
+        this.listPageBeforeDrilldown = Math.floor(initial.state.listPageBeforeDrilldown);
       }
     }
     if (initial?.cache) {
@@ -365,15 +641,93 @@ export class LibraryGalleryView {
       selectedMediaTypes: Array.from(this.selectedMediaTypes),
       includeEmptyCharacters: this.includeEmptyCharacters,
       pageSize: this.pageSize,
+      thumbnailSize: this.thumbnailSize,
       searchQuery: this.searchQuery,
       currentPage: this.currentPage,
       activeCharacterId: this.activeCharacterId,
+      listScrollTop: this.listScrollTop,
+      listPageBeforeDrilldown: this.listPageBeforeDrilldown,
     };
+  }
+
+  private getScrollContainer(): HTMLElement | null {
+    return resolveScrollContainer(
+      this.root.parentElement,
+      this.rememberedScrollContainer,
+      this.root.parentElement,
+    );
+  }
+
+  private readScrollTop(): number {
+    if (this.callbacks.onGetScrollTop) {
+      const value = this.callbacks.onGetScrollTop();
+      return Number.isFinite(value) && value >= 0 ? value : 0;
+    }
+    const host = this.getScrollContainer();
+    if (host && typeof host.scrollTop === "number" && Number.isFinite(host.scrollTop)) {
+      this.rememberedScrollContainer = host;
+      return Math.max(0, host.scrollTop);
+    }
+    return 0;
+  }
+
+  private applyScrollTop(scrollTop: number): void {
+    const next = Number.isFinite(scrollTop) && scrollTop >= 0 ? scrollTop : 0;
+    if (this.callbacks.onSetScrollTop) {
+      this.callbacks.onSetScrollTop(next);
+      return;
+    }
+    this.pendingScrollRestore = applyScrollTopWithSettlement(
+      () => this.getScrollContainer(),
+      next,
+      this.pendingScrollRestore,
+      () => this.destroyed,
+    );
   }
 
   destroy(): void {
     this.destroyed = true;
+    this.pendingScrollRestore?.cancel();
+    this.pendingScrollRestore = null;
+    this.rememberedScrollContainer = null;
     this.pendingRefresh = null;
+    this.widgetWrapEl = null;
+    this.refreshBtnEl = null;
+    this.clearRenderCaches();
+  }
+
+  private syncWrapperThumbnailClass(): void {
+    if (this.widgetWrapEl) {
+      this.widgetWrapEl.className = `ml-widget ${getThumbnailSizeClass(this.thumbnailSize)}`;
+    }
+  }
+
+  private clearRenderCaches(): void {
+    this.charCardCache.clear();
+    this.assetCardCache.clear();
+    this.listRowCache.clear();
+  }
+
+  private pruneRenderCache(
+    cache: Map<string, { sig: string; el: HTMLElement }>,
+    usedKeys: Set<string>,
+    maxSize = MAX_DOM_NODE_CACHE,
+  ): void {
+    const limit = Math.max(maxSize, usedKeys.size);
+    if (cache.size <= limit) return;
+    for (const key of cache.keys()) {
+      if (cache.size <= limit) break;
+      if (!usedKeys.has(key)) {
+        cache.delete(key);
+      }
+    }
+  }
+
+  private syncToolbarControls(): void {
+    if (this.refreshBtnEl) {
+      this.refreshBtnEl.disabled = this.loading;
+      this.refreshBtnEl.className = `ml-btn ml-icon-btn is-sm${this.loading ? " is-busy" : ""}`;
+    }
   }
 
   private emitStateChange(): void {
@@ -418,6 +772,10 @@ export class LibraryGalleryView {
     }
 
     const run = (async () => {
+      const prevActiveCharId = this.activeCharacterId;
+      const prevHadError =
+        Boolean(this.error) || Boolean(this.root.querySelector(".ml-error-banner"));
+      let drilldownExited = false;
       let nextRefresh: { preserveActive: boolean; reshuffleRandom: boolean } | null = {
         preserveActive,
         reshuffleRandom,
@@ -432,7 +790,11 @@ export class LibraryGalleryView {
         if (this.sortMode === "random" && current.reshuffleRandom) {
           this.reshuffleRandomOrder();
         }
-        if (!this.characters) this.render();
+        if (!this.characters) {
+          this.render();
+        } else if (this.root.querySelector(".ml-gallery-toolbar")) {
+          this.syncToolbarControls();
+        }
         try {
           const loaded = await this.callbacks.onLoadLibraryMedia({
             includeEmpty: requestedIncludeEmpty,
@@ -441,12 +803,16 @@ export class LibraryGalleryView {
           this.characters = loaded;
           this.precomputedCharCache = new WeakMap();
           this.loadedIncludeEmpty = requestedIncludeEmpty;
-          if (
-            !current.preserveActive ||
-            (this.activeCharacterId &&
-              !this.characters.some((c) => c.characterId === this.activeCharacterId))
-          ) {
+          const activeCharMissing =
+            Boolean(this.activeCharacterId) &&
+            !this.characters.some((c) => c.characterId === this.activeCharacterId);
+          if (!current.preserveActive || activeCharMissing) {
             this.activeCharacterId = null;
+            if (activeCharMissing && current.preserveActive) {
+              this.currentPage =
+                this.listPageBeforeDrilldown >= 1 ? this.listPageBeforeDrilldown : 1;
+              drilldownExited = true;
+            }
           }
           this.emitCacheChange();
           this.emitStateChange();
@@ -470,7 +836,23 @@ export class LibraryGalleryView {
         }
       }
       if (!this.destroyed) {
-        this.render();
+        drilldownExited =
+          drilldownExited &&
+          prevActiveCharId !== null &&
+          this.activeCharacterId === null;
+        const canUpdateInPlace =
+          Boolean(this.characters && this.characters.length > 0) &&
+          !this.error &&
+          !prevHadError &&
+          this.activeCharacterId === prevActiveCharId &&
+          Boolean(this.root.querySelector(".ml-gallery-toolbar")) &&
+          Boolean(this.root.querySelector(".ml-gallery-content-slot"));
+        if (canUpdateInPlace) {
+          this.syncToolbarControls();
+          this.rerenderContentSlot();
+        } else {
+          this.render(drilldownExited ? { scrollTop: this.listScrollTop } : undefined);
+        }
       }
     })().finally(() => {
       this.activeRefreshPromise = null;
@@ -516,16 +898,29 @@ export class LibraryGalleryView {
     return w;
   }
 
-  render(): void {
+  render(options?: { scrollTop?: number }): void {
     if (this.destroyed) return;
+    const isPlaceholder = !this.characters && (this.loading || !this.error);
+    const targetScrollTop =
+      options?.scrollTop !== undefined
+        ? options.scrollTop
+        : isPlaceholder
+          ? undefined
+          : this.readScrollTop();
     this.root.innerHTML = "";
+    this.widgetWrapEl = null;
+    this.refreshBtnEl = null;
     const wrap = document.createElement("div");
-    wrap.className = "ml-widget";
+    wrap.className = `ml-widget ${getThumbnailSizeClass(this.thumbnailSize)}`;
+    this.widgetWrapEl = wrap;
 
     if (this.error) {
       const err = document.createElement("div");
       err.className = "ml-error-banner";
-      err.textContent = this.error;
+      err.appendChild(createIcon("alert", 13));
+      const errText = document.createElement("span");
+      errText.textContent = this.error;
+      err.appendChild(errText);
       wrap.appendChild(err);
     }
 
@@ -533,24 +928,35 @@ export class LibraryGalleryView {
     const toolbar = this.renderToolbar();
     wrap.appendChild(toolbar);
 
-    if (!this.characters && (this.loading || !this.error)) {
-      const msg = document.createElement("div");
-      msg.className = "ml-section ml-empty";
-      msg.textContent = "Loading library media gallery...";
-      wrap.appendChild(msg);
+    if (isPlaceholder) {
+      this.clearRenderCaches();
+      wrap.appendChild(
+        buildGalleryEmptyState({
+          icon: "refresh",
+          message: "Loading library media gallery...",
+          className: "ml-section ml-empty ml-loading-card ml-placeholder",
+        }),
+      );
       this.root.appendChild(wrap);
       return;
     }
 
     const chars = this.characters ?? [];
     if (chars.length === 0) {
-      const empty = document.createElement("div");
-      empty.className = "ml-section ml-empty";
-      empty.textContent = this.includeEmptyCharacters
-        ? "No character cards found in your library."
-        : "No localized media or native expressions found yet. Enable All Cards to browse every character.";
-      wrap.appendChild(empty);
+      this.clearRenderCaches();
+      wrap.appendChild(
+        buildGalleryEmptyState({
+          icon: "image",
+          message: this.includeEmptyCharacters
+            ? "No character cards found in your library."
+            : "No localized media or native expressions found yet. Enable All Cards to browse every character.",
+          className: "ml-section ml-empty ml-empty-card",
+        }),
+      );
       this.root.appendChild(wrap);
+      if (targetScrollTop !== undefined) {
+        this.applyScrollTop(targetScrollTop);
+      }
       return;
     }
 
@@ -560,9 +966,14 @@ export class LibraryGalleryView {
         if (selected) {
           wrap.appendChild(this.renderCharacterDrilldown(selected));
           this.root.appendChild(wrap);
+          if (targetScrollTop !== undefined) {
+            this.applyScrollTop(targetScrollTop);
+          }
           return;
         }
         this.activeCharacterId = null;
+        this.currentPage =
+          this.listPageBeforeDrilldown >= 1 ? this.listPageBeforeDrilldown : 1;
       }
       wrap.appendChild(this.renderGroupedCharacters(chars));
     } else {
@@ -570,6 +981,9 @@ export class LibraryGalleryView {
     }
 
     this.root.appendChild(wrap);
+    if (targetScrollTop !== undefined) {
+      this.applyScrollTop(targetScrollTop);
+    }
   }
 
   private renderToolbar(): HTMLElement {
@@ -577,71 +991,35 @@ export class LibraryGalleryView {
     box.className = "ml-section ml-gallery-toolbar";
 
     const row1 = document.createElement("div");
-    row1.className = "ml-header-bar";
+    row1.className = "ml-gallery-controls";
 
-    const titleWrap = document.createElement("div");
-    titleWrap.className = "ml-inline-title";
-    const title = document.createElement("span");
-    title.className = "ml-title";
-    title.textContent = "Library Gallery";
-    titleWrap.append(
-      title,
-      createInfoTip(
-        "Browse localized media and character expressions across your entire library. Search by character name, tag (e.g. tag:fantasy or #fantasy), filename, or expression.",
-      ),
+    const infoTip = createInfoTip(
+      "Browse localized media and character expressions across your entire library. Search by character name, tag (e.g. tag:fantasy or #fantasy), filename, or expression.",
     );
 
-    const rightBtns = document.createElement("div");
-    rightBtns.className = "ml-header-actions";
+    const searchWrap = document.createElement("div");
+    searchWrap.className = "ml-input-wrap";
+    const searchIcon = document.createElement("span");
+    searchIcon.className = "ml-input-icon";
+    searchIcon.appendChild(createIcon("search", 13));
 
-    const groupBtn = createIconButton({
-      icon: "group",
-      label: "Group",
-      title: this.grouped
-        ? "Grouped by character card (click for flat media view)"
-        : "Flat media view (click to group by character card)",
-      className: `ml-btn is-sm ${this.grouped ? "is-active" : ""}`,
-      size: 13,
-      onClick: () => {
-        this.grouped = !this.grouped;
-        this.currentPage = 1;
-        if (!this.grouped) {
-          this.activeCharacterId = null;
-          if (this.sortMode === "count") {
-            this.sortMode = "recent";
-            this.sortDirection = defaultDirectionForSort("recent");
-          }
-        }
-        if (this.sortMode === "random") this.reshuffleRandomOrder();
-        this.emitStateChange();
-        this.render();
-      },
+    const searchInput = document.createElement("input");
+    searchInput.type = "search";
+    searchInput.className = "ml-input-text has-icon";
+    searchInput.placeholder = "Search name, tag, tag:name, file...";
+    searchInput.value = this.searchQuery;
+    searchInput.addEventListener("input", () => {
+      this.searchQuery = searchInput.value;
+      this.currentPage = 1;
+      this.emitStateChange();
+      this.rerenderContentSlot();
     });
-
-    const allCardsBtn = createIconButton({
-      icon: "users",
-      label: "All Cards",
-      title: "Show all character cards in the library, even those without localized media yet",
-      className: `ml-btn is-sm ${this.includeEmptyCharacters ? "is-active" : ""}`,
-      size: 13,
-      onClick: () => {
-        this.includeEmptyCharacters = !this.includeEmptyCharacters;
-        this.currentPage = 1;
-        if (this.sortMode === "random") this.reshuffleRandomOrder();
-        this.emitStateChange();
-        if (this.includeEmptyCharacters && !this.loadedIncludeEmpty) {
-          this.render();
-          void this.refresh();
-        } else {
-          this.render();
-        }
-      },
-    });
+    searchWrap.append(searchIcon, searchInput);
 
     const gridBtn = createIconButton({
       icon: "grid",
       title: "Grid view",
-      className: `ml-btn ml-icon-btn is-sm ${this.viewMode === "grid" ? "is-active" : ""}`,
+      className: `ml-btn ml-icon-btn is-sm${this.viewMode === "grid" ? " is-active" : ""}`,
       size: 13,
       onClick: () => {
         this.viewMode = "grid";
@@ -653,7 +1031,7 @@ export class LibraryGalleryView {
     const listBtn = createIconButton({
       icon: "list",
       title: "List view",
-      className: `ml-btn ml-icon-btn is-sm ${this.viewMode === "list" ? "is-active" : ""}`,
+      className: `ml-btn ml-icon-btn is-sm${this.viewMode === "list" ? " is-active" : ""}`,
       size: 13,
       onClick: () => {
         this.viewMode = "list";
@@ -662,32 +1040,28 @@ export class LibraryGalleryView {
       },
     });
 
+    const viewSegmented = document.createElement("div");
+    viewSegmented.className = "ml-segmented";
+    viewSegmented.append(gridBtn, listBtn);
+
     const refreshBtn = createIconButton({
       icon: "refresh",
       title: "Refresh library media list",
-      className: `ml-btn ml-icon-btn is-sm ${this.loading ? "is-busy" : ""}`,
+      className: `ml-btn ml-icon-btn is-sm${this.loading ? " is-busy" : ""}`,
       size: 13,
       disabled: this.loading,
       onClick: () => void this.refresh(),
     });
+    this.refreshBtnEl = refreshBtn;
 
-    rightBtns.append(groupBtn, allCardsBtn, gridBtn, listBtn, refreshBtn);
-    row1.append(titleWrap, rightBtns);
+    const viewActions = document.createElement("div");
+    viewActions.className = "ml-header-actions";
+    viewActions.append(viewSegmented, refreshBtn);
+
+    row1.append(infoTip, searchWrap, viewActions);
 
     const row2 = document.createElement("div");
-    row2.className = "ml-gallery-controls";
-
-    const searchInput = document.createElement("input");
-    searchInput.type = "search";
-    searchInput.className = "ml-input-text";
-    searchInput.placeholder = "Search name, tag, tag:name, filename...";
-    searchInput.value = this.searchQuery;
-    searchInput.addEventListener("input", () => {
-      this.searchQuery = searchInput.value;
-      this.currentPage = 1;
-      this.emitStateChange();
-      this.rerenderContentSlot();
-    });
+    row2.className = "ml-header-bar";
 
     const sortGroup = document.createElement("div");
     sortGroup.className = "ml-sort-group";
@@ -700,14 +1074,14 @@ export class LibraryGalleryView {
       ...(isGroupedCards
         ? [
             { value: "name" as const, label: "Sort: Name" },
-            { value: "count" as const, label: "Sort: Media Count" },
-            { value: "size" as const, label: "Sort: File Size" },
+            { value: "count" as const, label: "Sort: Count" },
+            { value: "size" as const, label: "Sort: Size" },
             { value: "recent" as const, label: "Sort: Recent" },
           ]
         : [
             { value: "recent" as const, label: "Sort: Recent" },
             { value: "name" as const, label: "Sort: Name" },
-            { value: "size" as const, label: "Sort: File Size" },
+            { value: "size" as const, label: "Sort: Size" },
           ]),
       { value: "random", label: "Sort: Random" },
     ];
@@ -764,7 +1138,66 @@ export class LibraryGalleryView {
           });
 
     sortGroup.append(sortSelect, sortDirBtn);
-    row2.append(searchInput, sortGroup);
+
+    const modeBtns = document.createElement("div");
+    modeBtns.className = "ml-header-actions";
+
+    const groupBtn = createIconButton({
+      icon: "group",
+      label: "Group",
+      title: this.grouped
+        ? "Grouped by character card (click for flat media view)"
+        : "Flat media view (click to group by character card)",
+      className: `ml-btn is-sm ${this.grouped ? "is-active" : ""}`,
+      size: 12,
+      onClick: () => {
+        this.grouped = !this.grouped;
+        this.currentPage = 1;
+        if (!this.grouped) {
+          this.activeCharacterId = null;
+          if (this.sortMode === "count") {
+            this.sortMode = "recent";
+            this.sortDirection = defaultDirectionForSort("recent");
+          }
+        }
+        if (this.sortMode === "random") this.reshuffleRandomOrder();
+        this.emitStateChange();
+        this.render();
+      },
+    });
+
+    const allCardsBtn = createIconButton({
+      icon: "users",
+      label: "All Cards",
+      title: "Show all character cards in the library, even those without localized media yet",
+      className: `ml-btn is-sm ${this.includeEmptyCharacters ? "is-active" : ""}`,
+      size: 12,
+      onClick: () => {
+        this.includeEmptyCharacters = !this.includeEmptyCharacters;
+        this.currentPage = 1;
+        if (this.sortMode === "random") this.reshuffleRandomOrder();
+        this.emitStateChange();
+        if (this.includeEmptyCharacters && !this.loadedIncludeEmpty) {
+          this.render();
+          void this.refresh();
+        } else {
+          this.render();
+        }
+      },
+    });
+
+    const thumbSizeToggle = createThumbnailSizeSegmented(
+      this.thumbnailSize,
+      (nextSize) => {
+        this.thumbnailSize = nextSize;
+        this.syncWrapperThumbnailClass();
+        this.emitStateChange();
+        this.rerenderContentSlot();
+      },
+    );
+
+    modeBtns.append(thumbSizeToggle, groupBtn, allCardsBtn);
+    row2.append(sortGroup, modeBtns);
 
     const row3 = document.createElement("div");
     row3.className = "ml-pill-row ml-gallery-type-pills";
@@ -773,8 +1206,11 @@ export class LibraryGalleryView {
     const allPill = document.createElement("button");
     allPill.type = "button";
     allPill.className = `ml-pill ${allOn ? "is-selected" : ""}`;
-    allPill.textContent = "All Media";
     allPill.title = "Turn on all media types";
+    allPill.appendChild(createIcon("layers", 11));
+    const allPillLabel = document.createElement("span");
+    allPillLabel.textContent = "All Media";
+    allPill.appendChild(allPillLabel);
     allPill.addEventListener("click", () => {
       this.selectedMediaTypes = new Set(ALL_GALLERY_MEDIA_TYPES);
       this.currentPage = 1;
@@ -787,19 +1223,24 @@ export class LibraryGalleryView {
       type: GalleryMediaType;
       label: string;
       title: string;
+      icon: IconName;
+      pillClass: string;
     }> = [
-      { type: "image", label: "Images", title: "Toggle localized images" },
-      { type: "video", label: "Videos", title: "Toggle localized videos" },
-      { type: "expression", label: "Expressions", title: "Toggle character expressions" },
-      { type: "avatar", label: "Avatars", title: "Toggle character card avatars" },
+      { type: "image", label: "Images", title: "Toggle localized images", icon: "image", pillClass: "is-image" },
+      { type: "video", label: "Videos", title: "Toggle localized videos", icon: "video", pillClass: "is-video" },
+      { type: "expression", label: "Expressions", title: "Toggle character expressions", icon: "smile", pillClass: "is-expression" },
+      { type: "avatar", label: "Avatars", title: "Toggle character card avatars", icon: "user", pillClass: "is-avatar" },
     ];
     for (const def of typeToggles) {
       const isSelected = this.selectedMediaTypes.has(def.type);
       const pill = document.createElement("button");
       pill.type = "button";
-      pill.className = `ml-pill ${isSelected ? "is-selected" : ""}`;
-      pill.textContent = def.label;
+      pill.className = `ml-pill ${def.pillClass}${isSelected ? " is-selected" : ""}`;
       pill.title = def.title;
+      pill.appendChild(createIcon(def.icon, 11));
+      const pillLabel = document.createElement("span");
+      pillLabel.textContent = def.label;
+      pill.appendChild(pillLabel);
       pill.addEventListener("click", () => {
         if (this.selectedMediaTypes.has(def.type)) {
           this.selectedMediaTypes.delete(def.type);
@@ -825,6 +1266,7 @@ export class LibraryGalleryView {
     }
     const bodyOnly = this.root.querySelector<HTMLElement>(".ml-gallery-content-slot");
     if (bodyOnly) {
+      const savedScrollTop = this.readScrollTop();
       const selectedChar = this.activeCharacterId
         ? this.characters.find((c) => c.characterId === this.activeCharacterId)
         : undefined;
@@ -833,7 +1275,8 @@ export class LibraryGalleryView {
           ? this.renderCharacterDrilldown(selectedChar)
           : this.renderGroupedCharacters(this.characters)
         : this.renderFlatMedia(this.characters);
-      bodyOnly.replaceWith(nextContent);
+      updateContentSlotInPlace(bodyOnly, nextContent);
+      this.applyScrollTop(savedScrollTop);
     } else {
       this.render();
     }
@@ -866,9 +1309,16 @@ export class LibraryGalleryView {
         }
       : null;
 
+    let hasImage = false;
+    let videoCount = 0;
     const localizedEntries: Array<{ kind: MediaKind; entry: FlatMediaEntry }> =
       char.localizedAssets.map((asset) => {
         const kind = inferKind(asset.mimeType, asset.filename);
+        if (kind === "video") {
+          videoCount++;
+        } else {
+          hasImage = true;
+        }
         return {
           kind,
           entry: {
@@ -906,16 +1356,44 @@ export class LibraryGalleryView {
       searchBlob: `${lowerName} ${expr.label} ${expr.groupName ?? ""} expression`.toLowerCase(),
     }));
 
+    const fallbackAsset = !char.avatarUrl ? char.localizedAssets[0] : undefined;
+    const thumbUrl =
+      char.avatarUrl ??
+      fallbackAsset?.localUrl ??
+      char.expressions[0]?.localUrl ??
+      "";
+    const thumbKind: MediaKind = fallbackAsset
+      ? inferKind(fallbackAsset.mimeType, fallbackAsset.filename)
+      : "image";
+
     cached = {
       lowerName,
       lowerTags,
+      tagsSig: (char.tags ?? []).join("\u0000"),
+      summaryText: formatCharacterSummary(char),
       hasMedia: hasCharacterMedia(char),
+      hasAvatar: avatarEntry !== null,
+      hasImage,
+      hasVideo: videoCount > 0,
+      hasExpression: expressionEntries.length > 0,
+      videoCount,
+      thumbUrl,
+      thumbKind,
       avatarEntry,
       localizedEntries,
       expressionEntries,
     };
     this.precomputedCharCache.set(char, cached);
     return cached;
+  }
+
+  private hasAnySelectedEntry(pre: PrecomputedCharData): boolean {
+    return (
+      (pre.hasAvatar && this.selectedMediaTypes.has("avatar")) ||
+      (pre.hasImage && this.selectedMediaTypes.has("image")) ||
+      (pre.hasVideo && this.selectedMediaTypes.has("video")) ||
+      (pre.hasExpression && this.selectedMediaTypes.has("expression"))
+    );
   }
 
   private getCharEntries(char: LibraryMediaCharacter, includeAvatar: boolean): FlatMediaEntry[] {
@@ -1002,7 +1480,7 @@ export class LibraryGalleryView {
     const summary = document.createElement("span");
     summary.textContent =
       options.totalPages > 1
-        ? `Showing ${options.startIndex + 1}–${options.endIndex} of ${options.totalItems} ${options.unitLabel}`
+        ? `${options.startIndex + 1}–${options.endIndex} / ${options.totalItems} ${options.unitLabel}`
         : `${options.totalItems} ${options.unitLabel}`;
     info.appendChild(summary);
 
@@ -1013,7 +1491,7 @@ export class LibraryGalleryView {
       for (const size of GALLERY_PAGE_SIZE_OPTIONS) {
         const opt = document.createElement("option");
         opt.value = String(size);
-        opt.textContent = size === 0 ? "Show: All" : `${size} / page`;
+        opt.textContent = size === 0 ? "All" : `${size} / pg`;
         if (size === this.pageSize) opt.selected = true;
         sizeSelect.appendChild(opt);
       }
@@ -1089,6 +1567,11 @@ export class LibraryGalleryView {
     const pageItems =
       this.pageSize > 0 ? items.slice(startIndex, endIndex) : items;
 
+    const showPageSizeSelect =
+      totalItems > GALLERY_PAGE_SIZE_OPTIONS[0] ||
+      totalPages > 1 ||
+      this.pageSize !== DEFAULT_GALLERY_PAGE_SIZE;
+
     slot.appendChild(
       this.buildPaginationBar({
         totalItems,
@@ -1097,7 +1580,7 @@ export class LibraryGalleryView {
         page,
         totalPages,
         unitLabel,
-        includePageSizeSelect: true,
+        includePageSizeSelect: showPageSizeSelect,
       }),
     );
 
@@ -1129,11 +1612,11 @@ export class LibraryGalleryView {
       if (!this.includeEmptyCharacters && !pre.hasMedia) {
         return false;
       }
-      const entries = this.getCharEntries(char, true);
-      if (!this.includeEmptyCharacters && entries.length === 0) {
+      if (!this.includeEmptyCharacters && !this.hasAnySelectedEntry(pre)) {
         return false;
       }
       if (!parsedQuery.hasQuery) return true;
+      const entries = this.getCharEntries(char, true);
       const haystacks = [pre.lowerName, ...entries.map((e) => e.searchBlob)];
       return matchesSearchText(haystacks, pre.lowerTags, parsedQuery);
     });
@@ -1173,125 +1656,281 @@ export class LibraryGalleryView {
     }
 
     if (filtered.length === 0) {
-      const empty = document.createElement("div");
-      empty.className = "ml-empty";
-      empty.textContent =
-        this.selectedMediaTypes.size === 0 && !this.includeEmptyCharacters
-          ? "No media types selected. Click All Media or enable a media type."
-          : "No character cards match the current search/filter.";
-      slot.appendChild(empty);
+      slot.appendChild(
+        buildGalleryEmptyState({
+          icon: this.selectedMediaTypes.size === 0 && !this.includeEmptyCharacters ? "filter" : "search",
+          message:
+            this.selectedMediaTypes.size === 0 && !this.includeEmptyCharacters
+              ? "No media types selected. Click All Media or enable a media type."
+              : "No character cards match the current search/filter.",
+        }),
+      );
       return slot;
     }
 
     const openDrilldown = (characterId: string) => {
+      this.listScrollTop = this.readScrollTop();
+      this.listPageBeforeDrilldown = this.currentPage >= 1 ? this.currentPage : 1;
       this.activeCharacterId = characterId;
       this.currentPage = 1;
       if (this.sortMode === "random") this.reshuffleRandomOrder();
       this.emitStateChange();
-      this.render();
+      this.render({ scrollTop: 0 });
+    };
+
+    const thumbTier = getThumbnailImageTier(this.thumbnailSize);
+    const computeCharSig = (
+      char: LibraryMediaCharacter,
+      pre: PrecomputedCharData,
+    ): string => {
+      const thumbSrc = pre.thumbUrl
+        ? (toThumbnailMediaUrl(
+            sanitizeSafeMediaUrl(pre.thumbUrl),
+            pre.thumbKind,
+            thumbTier,
+          ) ?? pre.thumbUrl)
+        : "";
+      return [
+        char.characterName,
+        thumbSrc,
+        pre.thumbKind,
+        pre.videoCount,
+        char.localizedAssets.length,
+        char.expressions.length,
+        char.totalSizeBytes,
+        char.lastLocalizedAt,
+        pre.tagsSig,
+      ].join("\u0001");
     };
 
     this.appendPaginatedContent(slot, filtered, "cards", (pageChars) => {
+      const usedKeys = new Set<string>();
+      const eagerAllOnPage = pageChars.length <= EAGER_PAGE_ITEM_LIMIT;
+
       if (this.viewMode === "list") {
         const list = document.createElement("div");
         list.className = "ml-media-list";
-        for (const char of pageChars) {
-          const row = document.createElement("div");
-          row.className = "ml-media-list-row";
-          row.addEventListener("click", () => openDrilldown(char.characterId));
+        pageChars.forEach((char, idx) => {
+          const pre = this.getPrecomputedChar(char);
+          const sig = computeCharSig(char, pre);
+          const cacheKey = `char:${char.characterId}`;
+          usedKeys.add(cacheKey);
+          const cached = this.listRowCache.get(cacheKey);
 
-          const thumbUrl =
-            char.avatarUrl ??
-            char.localizedAssets[0]?.localUrl ??
-            char.expressions[0]?.localUrl;
-          if (thumbUrl) {
-            row.appendChild(
-              createLazyMediaElement({
-                src: thumbUrl,
-                mediaKind: "image",
-                alt: char.characterName,
-                className: "ml-media-list-thumb",
-              }),
-            );
+          let row: HTMLElement;
+          if (cached && cached.sig === sig) {
+            row = cached.el;
+            reobserveLazyMedia(row);
+            this.listRowCache.delete(cacheKey);
+            this.listRowCache.set(cacheKey, cached);
+          } else {
+            row = document.createElement("div");
+            row.className = "ml-media-list-row";
+            row.addEventListener("click", () => this.cardClickHandlers.get(row)?.());
+
+            const thumbWrap = document.createElement("div");
+            thumbWrap.className = "ml-media-list-thumb-wrap";
+            if (pre.thumbUrl) {
+              thumbWrap.appendChild(
+                createGalleryMediaElement({
+                  src: pre.thumbUrl,
+                  mediaKind: pre.thumbKind,
+                  alt: char.characterName,
+                  className: "ml-media-list-thumb",
+                  eager: eagerAllOnPage || idx < EAGER_LEADING_WINDOW,
+                  thumbTier,
+                }),
+              );
+              if (pre.thumbKind === "video" || pre.videoCount > 0) {
+                const kindBadge = document.createElement("span");
+                kindBadge.className = "ml-media-list-kind-badge";
+                kindBadge.appendChild(createIcon("video", 9));
+                thumbWrap.appendChild(kindBadge);
+              }
+            } else {
+              const placeholder = document.createElement("div");
+              placeholder.className = "ml-media-list-placeholder";
+              placeholder.appendChild(createIcon("user", 15));
+              thumbWrap.appendChild(placeholder);
+            }
+            row.appendChild(thumbWrap);
+
+            const meta = document.createElement("div");
+            meta.className = "ml-url-meta";
+            const name = document.createElement("div");
+            name.className = "ml-url-text";
+            name.textContent = char.characterName;
+            const sub = document.createElement("div");
+            sub.className = "ml-url-sources";
+            sub.textContent = pre.summaryText;
+            if (char.tags && char.tags.length > 0) {
+              row.title = `Tags: ${char.tags.join(", ")}`;
+            }
+            meta.append(name, sub);
+
+            const chevron = createIcon("chevron-right", 13);
+            row.appendChild(meta);
+            if (this.callbacks.onOpenCharacterEditor) {
+              const editBtn = createIconButton({
+                icon: "edit",
+                title: `Edit "${char.characterName}" in native Character Editor`,
+                className: "ml-btn ml-icon-btn is-sm",
+                size: 12,
+                onClick: (ev) => {
+                  ev.stopPropagation();
+                  this.cardEditHandlers.get(row)?.();
+                },
+              });
+              row.appendChild(editBtn);
+            }
+            row.appendChild(chevron);
+            this.listRowCache.set(cacheKey, { sig, el: row });
           }
 
-          const meta = document.createElement("div");
-          meta.className = "ml-url-meta";
-          const name = document.createElement("div");
-          name.className = "ml-url-text";
-          name.textContent = char.characterName;
-          const sub = document.createElement("div");
-          sub.className = "ml-url-sources";
-          sub.textContent = formatCharacterSummary(char);
-          if (char.tags && char.tags.length > 0) {
-            row.title = `Tags: ${char.tags.join(", ")}`;
+          this.cardClickHandlers.set(row, () => openDrilldown(char.characterId));
+          if (this.callbacks.onOpenCharacterEditor) {
+            const onOpenEdit = this.callbacks.onOpenCharacterEditor;
+            this.cardEditHandlers.set(row, () => onOpenEdit(char.characterId));
           }
-          meta.append(name, sub);
-
-          const chevron = createIcon("chevron-right", 14);
-          row.append(meta, chevron);
           list.appendChild(row);
-        }
+        });
+        this.pruneRenderCache(this.listRowCache, usedKeys);
         return list;
       }
 
       const grid = document.createElement("div");
       grid.className = "ml-char-card-grid";
 
-      for (const char of pageChars) {
-        const card = document.createElement("button");
-        card.type = "button";
-        card.className = "ml-char-card";
-        card.addEventListener("click", () => openDrilldown(char.characterId));
-        if (char.tags && char.tags.length > 0) {
-          card.title = `${char.characterName}\nTags: ${char.tags.join(", ")}`;
-        }
+      pageChars.forEach((char, idx) => {
+        const pre = this.getPrecomputedChar(char);
+        const sig = computeCharSig(char, pre);
+        const cacheKey = char.characterId;
+        usedKeys.add(cacheKey);
+        const cached = this.charCardCache.get(cacheKey);
 
-        const thumbUrl =
-          char.avatarUrl ??
-          char.localizedAssets[0]?.localUrl ??
-          char.expressions[0]?.localUrl;
+        let card: HTMLElement;
+        if (cached && cached.sig === sig) {
+          card = cached.el;
+          reobserveLazyMedia(card);
+          this.charCardCache.delete(cacheKey);
+          this.charCardCache.set(cacheKey, cached);
+        } else {
+          const cardEl = document.createElement("div");
+          cardEl.className = "ml-char-card";
+          cardEl.setAttribute("role", "button");
+          cardEl.tabIndex = 0;
+          cardEl.addEventListener("click", () => this.cardClickHandlers.get(cardEl)?.());
+          cardEl.addEventListener("keydown", (ev) => {
+            if (ev.target === cardEl && (ev.key === "Enter" || ev.key === " ")) {
+              ev.preventDefault();
+              this.cardClickHandlers.get(cardEl)?.();
+            }
+          });
+          if (char.tags && char.tags.length > 0) {
+            cardEl.title = `${char.characterName}\nTags: ${char.tags.join(", ")}`;
+          }
 
-        const mediaWrap = document.createElement("div");
-        mediaWrap.className = "ml-char-card-thumb-wrap";
-        if (thumbUrl) {
-          mediaWrap.appendChild(
-            createLazyMediaElement({
-              src: thumbUrl,
-              mediaKind: "image",
-              alt: char.characterName,
-              className: "ml-char-card-thumb",
+          const mediaWrap = document.createElement("div");
+          mediaWrap.className = "ml-char-card-thumb-wrap";
+          if (pre.thumbUrl) {
+            mediaWrap.appendChild(
+              createGalleryMediaElement({
+                src: pre.thumbUrl,
+                mediaKind: pre.thumbKind,
+                alt: char.characterName,
+                className: "ml-char-card-thumb",
+                eager: eagerAllOnPage || idx < EAGER_LEADING_WINDOW,
+                thumbTier,
+              }),
+            );
+          } else {
+            const placeholder = document.createElement("div");
+            placeholder.className = "ml-char-card-placeholder";
+            placeholder.appendChild(createIcon("user", 24));
+            mediaWrap.appendChild(placeholder);
+          }
+
+          const scrim = document.createElement("div");
+          scrim.className = "ml-char-card-scrim";
+          mediaWrap.appendChild(scrim);
+
+          const badgesWrap = document.createElement("div");
+          badgesWrap.className = "ml-char-card-badges";
+          const total = char.localizedAssets.length + char.expressions.length;
+          badgesWrap.appendChild(
+            buildTileKindBadge({
+              label: `${total}`,
+              title: `${total} total item(s)`,
             }),
           );
-        } else {
-          const placeholder = document.createElement("div");
-          placeholder.className = "ml-char-card-placeholder";
-          placeholder.appendChild(createIcon("image", 24));
-          mediaWrap.appendChild(placeholder);
+          if (pre.videoCount > 0) {
+            badgesWrap.appendChild(
+              buildTileKindBadge({
+                icon: "video",
+                label: `${pre.videoCount}`,
+                modifier: "is-video",
+                title: `${pre.videoCount} localized video(s)`,
+              }),
+            );
+          }
+          if (char.expressions.length > 0) {
+            badgesWrap.appendChild(
+              buildTileKindBadge({
+                icon: "smile",
+                label: `${char.expressions.length}`,
+                modifier: "is-expression",
+                title: `${char.expressions.length} character expression(s)`,
+              }),
+            );
+          }
+          mediaWrap.appendChild(badgesWrap);
+
+          if (this.callbacks.onOpenCharacterEditor) {
+            const editBtn = createIconButton({
+              icon: "edit",
+              title: `Edit "${char.characterName}" in native Character Editor`,
+              className: "ml-char-card-edit-btn",
+              size: 11,
+              onClick: (ev) => {
+                ev.stopPropagation();
+                this.cardEditHandlers.get(cardEl)?.();
+              },
+            });
+            editBtn.addEventListener("keydown", (ev) => {
+              if (ev.key === "Enter" || ev.key === " ") {
+                ev.stopPropagation();
+              }
+            });
+            mediaWrap.appendChild(editBtn);
+          }
+
+          const footer = document.createElement("div");
+          footer.className = "ml-char-card-footer";
+          const nameEl = document.createElement("div");
+          nameEl.className = "ml-char-card-name";
+          nameEl.textContent = char.characterName;
+          nameEl.title = char.characterName;
+
+          const statLine = document.createElement("div");
+          statLine.className = "ml-url-sources";
+          statLine.textContent = pre.summaryText;
+          statLine.title = pre.summaryText;
+
+          footer.append(nameEl, statLine);
+          cardEl.append(mediaWrap, footer);
+          card = cardEl;
+          this.charCardCache.set(cacheKey, { sig, el: card });
         }
 
-        const countPill = document.createElement("span");
-        countPill.className = "ml-tile-badge";
-        const total = char.localizedAssets.length + char.expressions.length;
-        countPill.textContent = `${total}`;
-        mediaWrap.appendChild(countPill);
-
-        const footer = document.createElement("div");
-        footer.className = "ml-char-card-footer";
-        const nameEl = document.createElement("div");
-        nameEl.className = "ml-char-card-name";
-        nameEl.textContent = char.characterName;
-        nameEl.title = char.characterName;
-
-        const statLine = document.createElement("div");
-        statLine.className = "ml-url-sources";
-        statLine.textContent = formatCharacterSummary(char);
-
-        footer.append(nameEl, statLine);
-        card.append(mediaWrap, footer);
+        this.cardClickHandlers.set(card, () => openDrilldown(char.characterId));
+        if (this.callbacks.onOpenCharacterEditor) {
+          const onOpenEdit = this.callbacks.onOpenCharacterEditor;
+          this.cardEditHandlers.set(card, () => onOpenEdit(char.characterId));
+        }
         grid.appendChild(card);
-      }
+      });
 
+      this.pruneRenderCache(this.charCardCache, usedKeys);
       return grid;
     });
 
@@ -1303,32 +1942,45 @@ export class LibraryGalleryView {
     slot.className = "ml-section ml-gallery-content-slot";
 
     const top = document.createElement("div");
-    top.className = "ml-header-bar";
+    top.className = "ml-gallery-drilldown-header";
 
     const backBtn = createIconButton({
       icon: "chevron-left",
       label: "All Characters",
       title: "Return to character library grid",
       className: "ml-btn is-sm",
-      size: 13,
+      size: 12,
       onClick: () => {
         this.activeCharacterId = null;
-        this.currentPage = 1;
-        if (this.sortMode === "random") this.reshuffleRandomOrder();
+        this.currentPage =
+          this.listPageBeforeDrilldown >= 1 ? this.listPageBeforeDrilldown : 1;
+        const restoredScrollTop = this.listScrollTop;
         this.emitStateChange();
-        this.render();
+        this.render({ scrollTop: restoredScrollTop });
       },
     });
 
     const charLabel = document.createElement("div");
-    charLabel.className = "ml-inline-title";
+    charLabel.className = "ml-gallery-drilldown-title";
+    if (char.avatarUrl) {
+      charLabel.appendChild(
+        createGalleryMediaElement({
+          src: char.avatarUrl,
+          mediaKind: "image",
+          alt: char.characterName,
+          className: "ml-gallery-drilldown-avatar",
+          eager: true,
+        }),
+      );
+    }
     const nameEl = document.createElement("span");
-    nameEl.className = "ml-title";
+    nameEl.className = "ml-gallery-drilldown-name";
     nameEl.textContent = char.characterName;
+    nameEl.title = char.characterName;
     charLabel.appendChild(nameEl);
     if (char.totalSizeBytes > 0) {
       const sizeBadge = document.createElement("span");
-      sizeBadge.className = "ml-badge";
+      sizeBadge.className = "ml-badge is-muted";
       sizeBadge.textContent = formatBytes(char.totalSizeBytes);
       charLabel.appendChild(sizeBadge);
     }
@@ -1346,6 +1998,17 @@ export class LibraryGalleryView {
       });
       actions.appendChild(manageBtn);
     }
+    if (this.callbacks.onOpenCharacterEditor) {
+      const editBtn = createIconButton({
+        icon: "edit",
+        label: "Edit",
+        title: "Open native Character Editor for this character",
+        className: "ml-btn is-sm",
+        size: 12,
+        onClick: () => this.callbacks.onOpenCharacterEditor!(char.characterId),
+      });
+      actions.appendChild(editBtn);
+    }
 
     top.append(backBtn, charLabel, actions);
     slot.appendChild(top);
@@ -1359,15 +2022,17 @@ export class LibraryGalleryView {
     );
 
     if (entries.length === 0) {
-      const empty = document.createElement("div");
-      empty.className = "ml-empty";
-      empty.textContent =
-        this.selectedMediaTypes.size === 0
-          ? "No media types selected. Click All Media or enable a media type."
-          : !hasCharacterMedia(char) && !parsedQuery.hasQuery
-            ? "No localized media yet. Click Manage to scan and localize this character."
-            : "No items match the current filter.";
-      slot.appendChild(empty);
+      slot.appendChild(
+        buildGalleryEmptyState({
+          icon: this.selectedMediaTypes.size === 0 ? "filter" : !hasCharacterMedia(char) && !parsedQuery.hasQuery ? "image" : "search",
+          message:
+            this.selectedMediaTypes.size === 0
+              ? "No media types selected. Click All Media or enable a media type."
+              : !hasCharacterMedia(char) && !parsedQuery.hasQuery
+                ? "No localized media yet. Click Manage to scan and localize this character."
+                : "No items match the current filter.",
+        }),
+      );
       return slot;
     }
 
@@ -1397,13 +2062,15 @@ export class LibraryGalleryView {
     this.sortFlatEntries(entries);
 
     if (entries.length === 0) {
-      const empty = document.createElement("div");
-      empty.className = "ml-empty";
-      empty.textContent =
-        this.selectedMediaTypes.size === 0
-          ? "No media types selected. Click All Media or enable a media type."
-          : "No media items match the current search/filter.";
-      slot.appendChild(empty);
+      slot.appendChild(
+        buildGalleryEmptyState({
+          icon: this.selectedMediaTypes.size === 0 ? "filter" : "search",
+          message:
+            this.selectedMediaTypes.size === 0
+              ? "No media types selected. Click All Media or enable a media type."
+              : "No media items match the current search/filter.",
+        }),
+      );
       return slot;
     }
 
@@ -1415,10 +2082,10 @@ export class LibraryGalleryView {
 
   private renderMediaEntries(entries: FlatMediaEntry[]): HTMLElement {
     if (entries.length === 0) {
-      const empty = document.createElement("div");
-      empty.className = "ml-empty";
-      empty.textContent = "No items match the current filter.";
-      return empty;
+      return buildGalleryEmptyState({
+        icon: "search",
+        message: "No items match the current filter.",
+      });
     }
 
     const lightboxItems: LightboxItem[] = entries.map((e) => ({
@@ -1430,93 +2097,209 @@ export class LibraryGalleryView {
       originalUrl: e.originalUrl,
       readOnly: e.isAvatar || e.isExpression,
       badgeText: e.badgeText,
+      onEditCharacter: this.callbacks.onOpenCharacterEditor
+        ? () => this.callbacks.onOpenCharacterEditor!(e.characterId)
+        : undefined,
       onRemove:
         !e.isAvatar && !e.isExpression && e.originalUrl
           ? async () => {
+              const safeSrc = sanitizeSafeMediaUrl(e.localUrl);
+              for (const tier of ["sm", "lg"] as const) {
+                const thumbSrc = toThumbnailMediaUrl(
+                  safeSrc,
+                  e.mediaKind,
+                  tier,
+                );
+                if (thumbSrc) clearWarmGalleryThumbs(thumbSrc);
+              }
               await this.callbacks.onPurgeAsset(e.characterId, e.originalUrl!);
             }
           : undefined,
     }));
 
     const onAfterRemove = () => void this.refresh({ reshuffleRandom: false });
+    const seenBaseKeys = new Map<string, number>();
+    const usedKeys = new Set<string>();
+    const eagerAllOnPage = entries.length <= EAGER_PAGE_ITEM_LIMIT;
+
+    const nextUniqueKey = (entry: FlatMediaEntry): string => {
+      const kindPrefix = entry.isAvatar ? "avatar" : entry.isExpression ? "expr" : "loc";
+      const baseKey = `${entry.characterId}:${kindPrefix}:${entry.localUrl}:${entry.title}`;
+      const occ = seenBaseKeys.get(baseKey) ?? 0;
+      seenBaseKeys.set(baseKey, occ + 1);
+      return occ === 0 ? baseKey : `${baseKey}#${occ}`;
+    };
+
+    const thumbTier = getThumbnailImageTier(this.thumbnailSize);
+    const computeEntrySig = (entry: FlatMediaEntry): string => {
+      const thumbSrc =
+        toThumbnailMediaUrl(
+          sanitizeSafeMediaUrl(entry.localUrl),
+          entry.mediaKind,
+          thumbTier,
+        ) ?? entry.localUrl;
+      return [
+        thumbSrc,
+        entry.mediaKind,
+        entry.title,
+        entry.subtitle,
+        entry.badgeText,
+        entry.isExpression ? "1" : "0",
+        entry.isAvatar ? "1" : "0",
+        entry.originalUrl ?? "",
+        entry.sizeBytes,
+      ].join("\u0001");
+    };
+
+    const getEntryTileBadgeSpec = (entry: FlatMediaEntry): {
+      icon?: IconName;
+      modifier: string;
+    } => {
+      if (entry.mediaKind === "video") {
+        return { icon: "play", modifier: "is-video" };
+      }
+      if (entry.isExpression) {
+        return { icon: "smile", modifier: "is-expression" };
+      }
+      if (entry.isAvatar) {
+        return { icon: "user", modifier: "is-avatar" };
+      }
+      return { modifier: "is-local" };
+    };
 
     if (this.viewMode === "list") {
       const list = document.createElement("div");
       list.className = "ml-media-list";
       entries.forEach((entry, index) => {
-        const row = document.createElement("div");
-        row.className = "ml-media-list-row";
-        row.addEventListener("click", () =>
+        const cacheKey = `media:${nextUniqueKey(entry)}`;
+        const sig = computeEntrySig(entry);
+        usedKeys.add(cacheKey);
+        const cached = this.listRowCache.get(cacheKey);
+
+        let row: HTMLElement;
+        if (cached && cached.sig === sig) {
+          row = cached.el;
+          reobserveLazyMedia(row);
+          this.listRowCache.delete(cacheKey);
+          this.listRowCache.set(cacheKey, cached);
+        } else {
+          row = document.createElement("div");
+          row.className = "ml-media-list-row";
+          row.addEventListener("click", () => this.cardClickHandlers.get(row)?.());
+
+          const thumbWrap = document.createElement("div");
+          thumbWrap.className = "ml-media-list-thumb-wrap";
+          thumbWrap.appendChild(
+            createGalleryMediaElement({
+              src: entry.localUrl,
+              mediaKind: entry.mediaKind,
+              alt: entry.title,
+              className: "ml-media-list-thumb",
+              eager: eagerAllOnPage || index < EAGER_LEADING_WINDOW,
+              thumbTier,
+            }),
+          );
+          if (entry.mediaKind === "video") {
+            const kindBadge = document.createElement("span");
+            kindBadge.className = "ml-media-list-kind-badge";
+            kindBadge.appendChild(createIcon("play", 8));
+            thumbWrap.appendChild(kindBadge);
+          }
+
+          const info = document.createElement("div");
+          info.className = "ml-url-meta";
+          const t = document.createElement("div");
+          t.className = "ml-url-text";
+          t.textContent = entry.title;
+          const s = document.createElement("div");
+          s.className = "ml-url-sources";
+          s.textContent = entry.subtitle;
+          info.append(t, s);
+
+          const badge = document.createElement("span");
+          const listBadgeClass =
+            entry.isExpression || entry.isAvatar
+              ? "is-info"
+              : entry.mediaKind === "video"
+                ? "is-type"
+                : "is-local";
+          badge.className = `ml-badge ${listBadgeClass}`;
+          badge.textContent = entry.badgeText;
+
+          row.append(thumbWrap, info, badge);
+          this.listRowCache.set(cacheKey, { sig, el: row });
+        }
+
+        this.cardClickHandlers.set(row, () =>
           openMediaLightbox(lightboxItems, index, onAfterRemove),
         );
-
-        row.appendChild(
-          createLazyMediaElement({
-            src: entry.localUrl,
-            mediaKind: entry.mediaKind,
-            alt: entry.title,
-            className: "ml-media-list-thumb",
-          }),
-        );
-
-        const info = document.createElement("div");
-        info.className = "ml-url-meta";
-        const t = document.createElement("div");
-        t.className = "ml-url-text";
-        t.textContent = entry.title;
-        const s = document.createElement("div");
-        s.className = "ml-url-sources";
-        s.textContent = entry.subtitle;
-        info.append(t, s);
-
-        const badge = document.createElement("span");
-        badge.className = `ml-badge ${entry.isExpression || entry.isAvatar ? "is-info" : ""}`;
-        badge.textContent = entry.badgeText;
-
-        row.append(info, badge);
         list.appendChild(row);
       });
+      this.pruneRenderCache(this.listRowCache, usedKeys);
       return list;
     }
 
     const grid = document.createElement("div");
     grid.className = "ml-asset-grid ml-gallery-grid";
     entries.forEach((entry, index) => {
-      const card = document.createElement("div");
-      card.className = "ml-asset-card";
+      const cacheKey = nextUniqueKey(entry);
+      const sig = computeEntrySig(entry);
+      usedKeys.add(cacheKey);
+      const cached = this.assetCardCache.get(cacheKey);
 
-      const wrap = document.createElement("div");
-      wrap.className = "ml-asset-thumb-wrap";
-      wrap.addEventListener("click", () =>
+      let card: HTMLElement;
+      if (cached && cached.sig === sig) {
+        card = cached.el;
+        reobserveLazyMedia(card);
+        this.assetCardCache.delete(cacheKey);
+        this.assetCardCache.set(cacheKey, cached);
+      } else {
+        card = document.createElement("div");
+        card.className = "ml-asset-card";
+
+        const wrap = document.createElement("div");
+        wrap.className = "ml-asset-thumb-wrap";
+        wrap.addEventListener("click", () => this.cardClickHandlers.get(card)?.());
+        wrap.appendChild(
+          createGalleryMediaElement({
+            src: entry.localUrl,
+            mediaKind: entry.mediaKind,
+            alt: entry.title,
+            className: "ml-asset-preview",
+            title: `${entry.title}\n${entry.subtitle}`,
+            eager: eagerAllOnPage || index < EAGER_LEADING_WINDOW,
+            thumbTier,
+          }),
+        );
+
+        const badgeSpec = getEntryTileBadgeSpec(entry);
+        wrap.appendChild(
+          buildTileKindBadge({
+            icon: badgeSpec.icon,
+            label: entry.badgeText,
+            modifier: badgeSpec.modifier,
+          }),
+        );
+
+        const footer = document.createElement("div");
+        footer.className = "ml-asset-footer";
+        const cap = document.createElement("div");
+        cap.className = "ml-url-sources";
+        cap.textContent = entry.isExpression || entry.isAvatar ? entry.title : entry.subtitle;
+        cap.title = `${entry.title}\n${entry.subtitle}`;
+        footer.appendChild(cap);
+
+        card.append(wrap, footer);
+        this.assetCardCache.set(cacheKey, { sig, el: card });
+      }
+
+      this.cardClickHandlers.set(card, () =>
         openMediaLightbox(lightboxItems, index, onAfterRemove),
       );
-      wrap.appendChild(
-        createLazyMediaElement({
-          src: entry.localUrl,
-          mediaKind: entry.mediaKind,
-          alt: entry.title,
-          className: "ml-asset-preview",
-          title: `${entry.title}\n${entry.subtitle}`,
-        }),
-      );
-
-      const badge = document.createElement("span");
-      badge.className = `ml-tile-badge ${entry.isExpression || entry.isAvatar ? "is-info" : ""}`;
-      badge.textContent = entry.badgeText;
-      wrap.appendChild(badge);
-
-      const footer = document.createElement("div");
-      footer.className = "ml-asset-footer";
-      const cap = document.createElement("div");
-      cap.className = "ml-url-sources";
-      cap.textContent = entry.isExpression || entry.isAvatar ? entry.title : entry.subtitle;
-      cap.title = `${entry.title}\n${entry.subtitle}`;
-      footer.appendChild(cap);
-
-      card.append(wrap, footer);
       grid.appendChild(card);
     });
 
+    this.pruneRenderCache(this.assetCardCache, usedKeys);
     return grid;
   }
 }

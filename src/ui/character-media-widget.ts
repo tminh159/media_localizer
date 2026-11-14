@@ -17,14 +17,22 @@ import {
   createIconButton,
   createInfoTip,
   createLazyMediaElement,
+  createThumbnailSizeSegmented,
+  DEFAULT_THUMBNAIL_SIZE,
+  getThumbnailImageTier,
+  getThumbnailSizeClass,
   isQueueActiveStatus,
   openMediaLightbox,
   renderFailedItemsPanel,
   renderQueueBanner,
   renderSharedDownloadConfigControls,
+  reobserveLazyMedia,
   safeOpenExternalUrl,
   sanitizeSafeMediaUrl,
+  sanitizeThumbnailSize,
+  toThumbnailMediaUrl,
   type LightboxItem,
+  type ThumbnailSize,
 } from "./ui-helpers.ts";
 
 export interface CharacterMediaWidgetCallbacks {
@@ -40,6 +48,7 @@ export interface CharacterMediaWidgetCallbacks {
     targetUrl?: string,
   ): Promise<void>;
   onPurgeCharacterCache(characterId: string, urls?: string[]): Promise<void>;
+  onOpenCharacterEditor?(characterId: string): void;
 }
 
 export type MediaGridFilter = "all" | "localized" | "expressions" | "video";
@@ -53,6 +62,7 @@ export interface CharacterWidgetPreferences {
   mediaViewMode: "grid" | "list";
   mediaFilter: MediaGridFilter;
   showDownloadedMedia: boolean;
+  thumbnailSize: ThumbnailSize;
 }
 
 export interface CharacterWidgetUiState extends CharacterWidgetPreferences {
@@ -78,6 +88,7 @@ export function getDefaultCharacterPreferences(
     mediaViewMode: "grid",
     mediaFilter: "all",
     showDownloadedMedia: defaultExpandDownloadedMedia,
+    thumbnailSize: DEFAULT_THUMBNAIL_SIZE,
   };
 }
 
@@ -121,6 +132,7 @@ export function sanitizeCharacterPreferences(
       typeof obj.showDownloadedMedia === "boolean"
         ? obj.showDownloadedMedia
         : defaults.showDownloadedMedia,
+    thumbnailSize: sanitizeThumbnailSize(obj.thumbnailSize),
   };
 }
 
@@ -148,6 +160,7 @@ export class CharacterMediaWidget {
   private mediaViewMode: "grid" | "list" = "grid";
   private mediaFilter: MediaGridFilter = "all";
   private showDownloadedMedia = true;
+  private thumbnailSize: ThumbnailSize = DEFAULT_THUMBNAIL_SIZE;
   private queueBannerEl: HTMLElement | null = null;
 
   // Effective filter state (defaults from global settings, overlaid by per-card override)
@@ -169,6 +182,8 @@ export class CharacterMediaWidget {
   } | null = null;
   private inFlightOverrideSaves = new Map<string, Promise<void>>();
   private refreshBtnEl: HTMLButtonElement | null = null;
+  private mediaTileCache = new Map<string, { sig: string; el: HTMLElement }>();
+  private tileClickHandlers = new WeakMap<HTMLElement, () => void>();
   private scanGeneration = 0;
   private destroyed = false;
 
@@ -209,6 +224,7 @@ export class CharacterMediaWidget {
       options.initialUiState?.showDownloadedMedia !== undefined
         ? prefs.showDownloadedMedia
         : defaultExpandDownloaded;
+    this.thumbnailSize = prefs.thumbnailSize;
     if (Array.isArray(options.initialUiState?.expandedUrls)) {
       this.expandedUrls = new Set(options.initialUiState.expandedUrls);
     }
@@ -228,6 +244,7 @@ export class CharacterMediaWidget {
       mediaViewMode: this.mediaViewMode,
       mediaFilter: this.mediaFilter,
       showDownloadedMedia: this.showDownloadedMedia,
+      thumbnailSize: this.thumbnailSize,
       expandedUrls: Array.from(this.expandedUrls),
     });
   }
@@ -277,6 +294,7 @@ export class CharacterMediaWidget {
     this.destroyed = true;
     this.scanGeneration++;
     this.refreshBtnEl = null;
+    this.mediaTileCache.clear();
     void this.flushPendingOverrideSave();
   }
 
@@ -299,6 +317,10 @@ export class CharacterMediaWidget {
     if (this.characterId === nextId && (this.scan || this.loading)) return;
     if (this.characterId !== nextId) {
       void this.flushPendingOverrideSave();
+      this.mediaTileCache.clear();
+      for (const el of this.root.querySelectorAll<HTMLElement>("[data-scroll-id]")) {
+        el.scrollTop = 0;
+      }
       if (this.expandedUrls.size > 0) {
         this.expandedUrls.clear();
         this.emitUiStateChange();
@@ -311,9 +333,83 @@ export class CharacterMediaWidget {
     void this.refreshScan(false);
   }
 
+  applySharedPreferences(prefs: Partial<CharacterWidgetPreferences>): void {
+    if (this.destroyed || !prefs || typeof prefs !== "object") return;
+    const sanitized = sanitizeCharacterPreferences({
+      showDownloadConfig: this.showDownloadConfig,
+      showGreetingSubfilter: this.showGreetingSubfilter,
+      showWorldBookSubfilter: this.showWorldBookSubfilter,
+      showUrlPicker: this.showUrlPicker,
+      showRemoteThumbnails: this.showRemoteThumbnails,
+      mediaViewMode: this.mediaViewMode,
+      mediaFilter: this.mediaFilter,
+      showDownloadedMedia: this.showDownloadedMedia,
+      thumbnailSize: this.thumbnailSize,
+      ...prefs,
+    });
+
+    let changed = false;
+    if (
+      prefs.showGreetingSubfilter !== undefined &&
+      sanitized.showGreetingSubfilter !== this.showGreetingSubfilter
+    ) {
+      this.showGreetingSubfilter = sanitized.showGreetingSubfilter;
+      changed = true;
+    }
+    if (
+      prefs.showWorldBookSubfilter !== undefined &&
+      sanitized.showWorldBookSubfilter !== this.showWorldBookSubfilter
+    ) {
+      this.showWorldBookSubfilter = sanitized.showWorldBookSubfilter;
+      changed = true;
+    }
+    if (
+      prefs.showUrlPicker !== undefined &&
+      sanitized.showUrlPicker !== this.showUrlPicker
+    ) {
+      this.showUrlPicker = sanitized.showUrlPicker;
+      changed = true;
+    }
+    if (
+      prefs.showRemoteThumbnails !== undefined &&
+      sanitized.showRemoteThumbnails !== this.showRemoteThumbnails
+    ) {
+      this.showRemoteThumbnails = sanitized.showRemoteThumbnails;
+      changed = true;
+    }
+    if (
+      prefs.mediaViewMode !== undefined &&
+      sanitized.mediaViewMode !== this.mediaViewMode
+    ) {
+      this.mediaViewMode = sanitized.mediaViewMode;
+      this.mediaTileCache.clear();
+      changed = true;
+    }
+    if (
+      prefs.mediaFilter !== undefined &&
+      sanitized.mediaFilter !== this.mediaFilter
+    ) {
+      this.mediaFilter = sanitized.mediaFilter;
+      changed = true;
+    }
+    if (
+      prefs.thumbnailSize !== undefined &&
+      sanitized.thumbnailSize !== this.thumbnailSize
+    ) {
+      this.thumbnailSize = sanitized.thumbnailSize;
+      this.mediaTileCache.clear();
+      changed = true;
+    }
+
+    if (changed) {
+      this.render();
+    }
+  }
+
   updateExternalState(
     settings: MediaLocalizerSettings,
     queueProgress: QueueJobProgress,
+    forceRefresh = false,
   ): void {
     if (this.destroyed) return;
     const prevSettings = this.settings;
@@ -338,8 +434,8 @@ export class CharacterMediaWidget {
     const wasActive = isQueueActiveStatus(prevStatus);
     const nowActive = isQueueActiveStatus(queueProgress.status);
 
-    if ((wasActive && !nowActive) || (scanSettingsChanged && this.scan)) {
-      void this.refreshScan(scanSettingsChanged);
+    if ((wasActive && !nowActive) || (scanSettingsChanged && this.scan) || forceRefresh) {
+      void this.refreshScan(scanSettingsChanged || forceRefresh);
       return;
     }
 
@@ -624,12 +720,24 @@ export class CharacterMediaWidget {
     this.refreshBtnEl = null;
 
     const wrap = document.createElement("div");
-    wrap.className = "ml-widget";
+    const thumbClass = getThumbnailSizeClass(this.thumbnailSize);
+    wrap.className =
+      this.options.inDrawer === true
+        ? `ml-widget is-drawer ${thumbClass}`
+        : this.options.inDrawer === false
+          ? `ml-widget is-embedded ${thumbClass}`
+          : `ml-widget ${thumbClass}`;
 
     if (!this.characterId) {
       const empty = document.createElement("div");
-      empty.className = "ml-section ml-empty";
-      empty.textContent = "Open a character chat or editor to manage its media.";
+      empty.className = "ml-section ml-empty ml-empty-card";
+      const iconWrap = document.createElement("div");
+      iconWrap.className = "ml-empty-icon";
+      iconWrap.appendChild(createIcon("image", 20));
+      const textEl = document.createElement("div");
+      textEl.className = "ml-empty-text";
+      textEl.textContent = "Open a character chat or editor to manage its media.";
+      empty.append(iconWrap, textEl);
       wrap.appendChild(empty);
       this.root.appendChild(wrap);
       return;
@@ -638,7 +746,9 @@ export class CharacterMediaWidget {
     if (this.error) {
       const err = document.createElement("div");
       err.className = "ml-error-banner";
-      err.textContent = this.error;
+      const errText = document.createElement("span");
+      errText.textContent = this.error;
+      err.append(createIcon("alert", 14), errText);
       wrap.appendChild(err);
     }
 
@@ -654,20 +764,35 @@ export class CharacterMediaWidget {
 
     if (this.loading && !this.scan) {
       const loadingEl = document.createElement("div");
-      loadingEl.className = "ml-section ml-empty";
-      loadingEl.textContent = "Scanning character media...";
+      loadingEl.className = "ml-section ml-empty ml-loading-card";
+      const iconWrap = document.createElement("div");
+      iconWrap.className = "ml-empty-icon";
+      iconWrap.appendChild(createIcon("refresh", 18));
+      const textEl = document.createElement("div");
+      textEl.className = "ml-empty-text";
+      textEl.textContent = "Scanning character media...";
+      loadingEl.append(iconWrap, textEl);
       wrap.appendChild(loadingEl);
       this.root.appendChild(wrap);
       return;
     }
 
     if (!this.scan) {
-      const retry = document.createElement("button");
-      retry.type = "button";
-      retry.className = "ml-btn is-primary";
-      retry.textContent = "Scan Character Media";
-      retry.addEventListener("click", () => void this.refreshScan(true));
-      wrap.appendChild(retry);
+      const retryCard = document.createElement("div");
+      retryCard.className = "ml-section ml-empty ml-empty-card";
+      const iconWrap = document.createElement("div");
+      iconWrap.className = "ml-empty-icon";
+      iconWrap.appendChild(createIcon("search", 18));
+      const retry = createIconButton({
+        icon: "refresh",
+        label: "Scan Character Media",
+        title: "Scan character fields, linked World Books, and Regex scripts",
+        className: "ml-btn is-primary",
+        size: 13,
+        onClick: () => void this.refreshScan(true),
+      });
+      retryCard.append(iconWrap, retry);
+      wrap.appendChild(retryCard);
       this.root.appendChild(wrap);
       return;
     }
@@ -682,17 +807,10 @@ export class CharacterMediaWidget {
         ? Math.min(selectedPending.length, this.batchCap)
         : selectedPending.length;
 
-    // 1. Header Card
+    // 1. Header
     wrap.appendChild(this.renderHeaderSection(scan, effectivePendingCount, selectedPending.length));
 
-    // 2. Collapsible Per-Card Download Options (expanded only when user clicks gear)
-    if (this.showDownloadConfig) {
-      wrap.appendChild(
-        this.renderOptionsSection(scan, candidateItems, selectedPending, effectivePendingCount),
-      );
-    }
-
-    // 3. Grouped Failed Items Panel (actionable Recovery UI)
+    // 2. Grouped Failed Items Panel (actionable Recovery UI)
     const failedEntries = scan.items
       .filter((i) => i.status === "failed" && !this.excludedUrls.has(i.normalizedUrl))
       .map((i) => ({
@@ -727,8 +845,15 @@ export class CharacterMediaWidget {
       wrap.appendChild(failedPanel);
     }
 
-    // 4. Always-visible Downloaded Media & Expressions Section
-    wrap.appendChild(this.renderMediaGallerySection(scan));
+    // 3. Combined Collapsible Section: Downloaded Media & Per-Card Download Options
+    wrap.appendChild(
+      this.renderCombinedOptionsAndMediaSection(
+        scan,
+        candidateItems,
+        selectedPending,
+        effectivePendingCount,
+      ),
+    );
 
     this.root.appendChild(wrap);
     this.restoreScrollState(scrollState);
@@ -751,13 +876,22 @@ export class CharacterMediaWidget {
     const identityRow = document.createElement("div");
     identityRow.className = "ml-char-identity";
 
-    const safeAvatarUrl = sanitizeSafeMediaUrl(scan.media?.avatarUrl);
+    const safeAvatarUrl =
+      this.options.inDrawer !== false
+        ? sanitizeSafeMediaUrl(scan.media?.avatarUrl)
+        : null;
     if (safeAvatarUrl) {
       const avatar = document.createElement("img");
       avatar.className = "ml-char-avatar";
       avatar.src = safeAvatarUrl;
       avatar.alt = scan.characterName;
       identityRow.appendChild(avatar);
+    } else if (this.options.inDrawer !== false) {
+      const avatarFallback = document.createElement("div");
+      avatarFallback.className = "ml-char-avatar-fallback";
+      avatarFallback.setAttribute("aria-hidden", "true");
+      avatarFallback.appendChild(createIcon("user", 18));
+      identityRow.appendChild(avatarFallback);
     }
 
     const titleCol = document.createElement("div");
@@ -769,8 +903,9 @@ export class CharacterMediaWidget {
     const titleGroup = document.createElement("div");
     titleGroup.className = "ml-inline-title";
     const nameEl = document.createElement("span");
-    nameEl.className = "ml-title";
+    nameEl.className = "ml-title ml-char-name";
     nameEl.textContent = scan.characterName;
+    nameEl.title = scan.characterName;
     titleGroup.append(
       nameEl,
       createInfoTip(
@@ -800,31 +935,17 @@ export class CharacterMediaWidget {
         effectivePendingCount > 0
           ? `Download ${effectivePendingCount} remote media file(s) using ${this.hasCustomOverride ? "custom card options" : "global download defaults"}`
           : "No pending remote media matches the current filter options",
-      className: `ml-btn ${effectivePendingCount > 0 ? "is-primary" : ""}`,
-      size: 14,
+      className: `ml-btn is-sm ${effectivePendingCount > 0 ? "is-primary" : ""}`,
+      size: 13,
       disabled: effectivePendingCount === 0,
       onClick: () => void this.triggerOneClickLocalize(),
-    });
-
-    const gearBtn = createIconButton({
-      icon: "settings",
-      title: this.showDownloadConfig
-        ? "Hide download options & URL inspector"
-        : "Customize per-card download options & inspect individual URLs",
-      className: `ml-btn ml-icon-btn ${this.showDownloadConfig ? "is-active" : ""}`,
-      size: 14,
-      onClick: () => {
-        this.showDownloadConfig = !this.showDownloadConfig;
-        this.emitUiStateChange();
-        this.render();
-      },
     });
 
     const refreshBtn = createIconButton({
       icon: "refresh",
       title: "Rescan character fields, linked World Books, and Regex scripts",
-      className: `ml-btn ml-icon-btn ${this.loading ? "is-busy" : ""}`,
-      size: 14,
+      className: `ml-btn ml-icon-btn is-sm ${this.loading ? "is-busy" : ""}`,
+      size: 13,
       disabled: this.loading,
       onClick: () => {
         if (this.loading) return;
@@ -833,28 +954,70 @@ export class CharacterMediaWidget {
     });
     this.refreshBtnEl = refreshBtn;
 
-    actions.append(localizeBtn, gearBtn, refreshBtn);
+    actions.appendChild(localizeBtn);
+    if (this.callbacks.onOpenCharacterEditor) {
+      const editBtn = createIconButton({
+        icon: "edit",
+        label: "Edit",
+        title: "Open native Character Editor for this character",
+        className: "ml-btn is-sm",
+        size: 13,
+        onClick: () => this.callbacks.onOpenCharacterEditor?.(scan.characterId),
+      });
+      actions.appendChild(editBtn);
+    }
+    actions.appendChild(refreshBtn);
     titleLine.append(titleGroup, actions);
 
     const statusLine = document.createElement("div");
     statusLine.className = "ml-status-row";
 
-    const addBadge = (text: string, variant = "") => {
+    const addBadge = (
+      text: string,
+      variant = "",
+      icon?: "check" | "download" | "alert" | "sparkles",
+    ) => {
       const b = document.createElement("span");
       b.className = `ml-badge ${variant}`.trim();
-      b.textContent = text;
+      const textSpan = document.createElement("span");
+      textSpan.textContent = text;
+      if (icon) {
+        b.append(createIcon(icon, 11), textSpan);
+      } else {
+        b.appendChild(textSpan);
+      }
       statusLine.appendChild(b);
     };
 
     addBadge(
       `${localizedItems.length} localized${totalBytes > 0 ? ` (${formatBytes(totalBytes)})` : ""}`,
-      localizedItems.length > 0 ? "is-success" : "",
+      localizedItems.length > 0 ? "is-local" : "is-muted",
+      localizedItems.length > 0 ? "check" : undefined,
     );
-    addBadge(`${remoteCount} remote`, remoteCount > 0 ? "is-warn" : "");
-    if (failedCount > 0) addBadge(`${failedCount} failed`, "is-danger");
-    if (exprCount > 0) addBadge(`${exprCount} expressions`, "is-info");
+    if (remoteCount > 0 || (localizedItems.length === 0 && failedCount === 0)) {
+      addBadge(
+        `${remoteCount} remote`,
+        remoteCount > 0 ? "is-remote" : "is-muted",
+        remoteCount > 0 ? "download" : undefined,
+      );
+    }
+    if (failedCount > 0) addBadge(`${failedCount} failed`, "is-failed", "alert");
+    if (exprCount > 0) addBadge(`${exprCount} expr`, "is-info", "sparkles");
 
     titleCol.append(titleLine, statusLine);
+
+    if (scan.items.length > 0) {
+      const pct = Math.min(100, Math.round((localizedItems.length / scan.items.length) * 100));
+      const progress = document.createElement("div");
+      progress.className = "ml-mini-progress";
+      progress.title = `${localizedItems.length} of ${scan.items.length} scanned URLs localized (${pct}%)`;
+      const fill = document.createElement("div");
+      fill.className = "ml-mini-progress-fill";
+      fill.style.width = `${pct}%`;
+      progress.appendChild(fill);
+      titleCol.appendChild(progress);
+    }
+
     identityRow.appendChild(titleCol);
     header.appendChild(identityRow);
     return header;
@@ -867,7 +1030,7 @@ export class CharacterMediaWidget {
     effectivePendingCount: number,
   ): HTMLElement {
     const container = document.createElement("div");
-    container.className = "ml-section ml-options-panel";
+    container.className = "ml-combined-pane ml-options-panel";
 
     const top = document.createElement("div");
     top.className = "ml-section-title";
@@ -878,8 +1041,9 @@ export class CharacterMediaWidget {
     heading.textContent = "Per-Card Download Options";
     const statusPill = document.createElement("span");
     statusPill.className = `ml-badge ${this.hasCustomOverride ? "is-info" : ""}`;
-    statusPill.textContent = this.hasCustomOverride ? "Custom" : "Using global defaults";
+    statusPill.textContent = this.hasCustomOverride ? "Custom" : "Global defaults";
     titleGroup.append(
+      createIcon("sliders", 13),
       heading,
       statusPill,
       createInfoTip(
@@ -889,10 +1053,10 @@ export class CharacterMediaWidget {
 
     const resetBtn = createIconButton({
       icon: "rotate-ccw",
-      label: "Reset to global",
+      label: "Reset",
       title: "Clear per-card customizations and use Settings global defaults",
-      className: "ml-btn is-sm",
-      size: 12,
+      className: "ml-btn is-xs",
+      size: 11,
       disabled: !this.hasCustomOverride,
       onClick: () => void this.runAction(() => this.resetToGlobalDefaults()),
     });
@@ -911,181 +1075,31 @@ export class CharacterMediaWidget {
         },
         sectionCounts: scan.sectionCounts,
         sectionTip: "Unchecking sections skips them for one-click localization on this character.",
-        onChange: () => {
+        onChange: (nextState) => {
+          this.selectedSections = nextState.sections;
+          this.selectedKinds = nextState.mediaKinds;
+          this.includeFailed = nextState.includeFailed;
+          this.batchCap = nextState.batchCap;
           this.scheduleSaveOverride();
           this.render();
         },
       }),
     );
 
-    // Greeting Sub-Selector
-    if (
-      this.selectedSections.has("alternate_greetings") &&
-      scan.greetingBreakdown.length > 1
-    ) {
-      const subBar = document.createElement("div");
-      subBar.className = "ml-header-bar";
-      const subBtn = document.createElement("button");
-      subBtn.type = "button";
-      subBtn.className = "ml-btn is-sm";
-      subBtn.textContent = this.showGreetingSubfilter
-        ? "Hide Greeting Picker"
-        : `Filter Greetings (${scan.greetingBreakdown.length})...`;
-      subBtn.addEventListener("click", () => {
-        this.showGreetingSubfilter = !this.showGreetingSubfilter;
-        this.emitUiStateChange();
-        this.render();
-      });
-      subBar.appendChild(subBtn);
-      container.appendChild(subBar);
-
-      if (this.showGreetingSubfilter) {
-        const subBox = document.createElement("div");
-        subBox.className = "ml-subfilter-box";
-        const subList = document.createElement("div");
-        subList.className = "ml-subfilter-list";
-        subList.dataset.scrollId = "greetings-subfilter";
-        for (const g of scan.greetingBreakdown) {
-          const gLabel = document.createElement("label");
-          gLabel.className = "ml-checkbox-item";
-          const gCb = document.createElement("input");
-          gCb.type = "checkbox";
-          gCb.checked =
-            this.selectedGreetings === null ||
-            this.selectedGreetings.has(g.greetingIndex);
-          gCb.addEventListener("change", () => {
-            if (this.selectedGreetings === null) {
-              this.selectedGreetings = new Set(
-                scan.greetingBreakdown.map((item) => item.greetingIndex),
-              );
-            }
-            if (gCb.checked) {
-              this.selectedGreetings.add(g.greetingIndex);
-            } else {
-              const remaining = scan.greetingBreakdown.filter(
-                (item) =>
-                  item.greetingIndex !== g.greetingIndex &&
-                  this.selectedGreetings!.has(item.greetingIndex),
-              );
-              if (remaining.length === 0) {
-                gCb.checked = true;
-                return;
-              }
-              this.selectedGreetings.delete(g.greetingIndex);
-            }
-            if (
-              scan.greetingBreakdown.every((item) =>
-                this.selectedGreetings!.has(item.greetingIndex),
-              )
-            ) {
-              this.selectedGreetings = null;
-            }
-            this.scheduleSaveOverride();
-            this.render();
-          });
-          const gFailed =
-            (g as typeof g & { failedCount?: number }).failedCount ?? 0;
-          const gSummary =
-            gFailed > 0
-              ? `${g.remoteCount} remote, ${gFailed} failed`
-              : `${g.remoteCount} remote`;
-          gLabel.append(gCb, document.createTextNode(`${g.label} (${gSummary})`));
-          subList.appendChild(gLabel);
-        }
-        subBox.appendChild(subList);
-        container.appendChild(subBox);
-      }
-    }
-
-    // World Book Sub-Selector
-    if (this.selectedSections.has("world_books") && scan.worldBookBreakdown.length > 1) {
-      const wbRow = document.createElement("div");
-      wbRow.className = "ml-header-bar";
-      const wbBtn = document.createElement("button");
-      wbBtn.type = "button";
-      wbBtn.className = "ml-btn is-sm";
-      wbBtn.textContent = this.showWorldBookSubfilter
-        ? "Hide World Book Picker"
-        : `Filter World Books (${scan.worldBookBreakdown.length})...`;
-      wbBtn.addEventListener("click", () => {
-        this.showWorldBookSubfilter = !this.showWorldBookSubfilter;
-        this.emitUiStateChange();
-        this.render();
-      });
-      wbRow.appendChild(wbBtn);
-      container.appendChild(wbRow);
-
-      if (this.showWorldBookSubfilter) {
-        const wbBox = document.createElement("div");
-        wbBox.className = "ml-subfilter-box";
-        wbBox.dataset.scrollId = "worldbooks-subfilter";
-        for (const wb of scan.worldBookBreakdown) {
-          const wbLabel = document.createElement("label");
-          wbLabel.className = "ml-checkbox-item";
-          const wbCb = document.createElement("input");
-          wbCb.type = "checkbox";
-          wbCb.checked =
-            this.selectedWorldBooks === null ||
-            this.selectedWorldBooks.has(wb.worldBookId);
-          wbCb.addEventListener("change", () => {
-            if (this.selectedWorldBooks === null) {
-              this.selectedWorldBooks = new Set(
-                scan.worldBookBreakdown.map((item) => item.worldBookId),
-              );
-            }
-            if (wbCb.checked) {
-              this.selectedWorldBooks.add(wb.worldBookId);
-            } else {
-              const remaining = scan.worldBookBreakdown.filter(
-                (item) =>
-                  item.worldBookId !== wb.worldBookId &&
-                  this.selectedWorldBooks!.has(item.worldBookId),
-              );
-              if (remaining.length === 0) {
-                wbCb.checked = true;
-                return;
-              }
-              this.selectedWorldBooks.delete(wb.worldBookId);
-            }
-            if (
-              scan.worldBookBreakdown.every((item) =>
-                this.selectedWorldBooks!.has(item.worldBookId),
-              )
-            ) {
-              this.selectedWorldBooks = null;
-            }
-            this.scheduleSaveOverride();
-            this.render();
-          });
-          const wbFailed =
-            (wb as typeof wb & { failedCount?: number }).failedCount ?? 0;
-          const wbSummary =
-            wbFailed > 0
-              ? `${wb.remoteCount} remote, ${wbFailed} failed`
-              : `${wb.remoteCount} remote`;
-          wbLabel.append(
-            wbCb,
-            document.createTextNode(`${wb.worldBookName} (${wbSummary})`),
-          );
-          wbBox.appendChild(wbLabel);
-        }
-        container.appendChild(wbBox);
-      }
-    }
-
-    // Domain pills
+    // Domain pills (inline label + pills to save a vertical row)
     const remoteDomains = scan.domainBreakdown.filter((d) => {
       const failed = (d as typeof d & { failedCount?: number }).failedCount ?? 0;
       return d.remoteCount + failed > 0;
     });
     if (remoteDomains.length > 1) {
-      const domLabel = document.createElement("div");
-      domLabel.className = "ml-config-label";
-      domLabel.textContent = "Host Domains";
-      container.appendChild(domLabel);
-
       const pillRow = document.createElement("div");
       pillRow.className = "ml-pill-row";
+      pillRow.style.alignItems = "center";
+      const domLabel = document.createElement("span");
+      domLabel.className = "ml-config-label";
+      domLabel.textContent = "Domains";
+      pillRow.appendChild(domLabel);
+
       for (const dom of remoteDomains) {
         const isSelected =
           this.selectedDomains === null || this.selectedDomains.has(dom.domain);
@@ -1121,21 +1135,70 @@ export class CharacterMediaWidget {
       container.appendChild(pillRow);
     }
 
-    // Expandable Individual URL Inspector & Picker
-    const pickerBar = document.createElement("div");
-    pickerBar.className = "ml-header-bar";
-    const togglePickerBtn = document.createElement("button");
-    togglePickerBtn.type = "button";
-    togglePickerBtn.className = "ml-btn is-sm";
-    togglePickerBtn.textContent = this.showUrlPicker
-      ? `Hide URL List (${selectedPending.length}/${candidateItems.length})`
-      : `Inspect & Pick URLs (${selectedPending.length}/${candidateItems.length})...`;
-    togglePickerBtn.addEventListener("click", () => {
-      this.showUrlPicker = !this.showUrlPicker;
-      this.emitUiStateChange();
-      this.render();
-    });
-    pickerBar.appendChild(togglePickerBtn);
+    // Consolidated row for Greeting sub-filter, World Book sub-filter, and URL Inspector triggers
+    const hasGreetingSubfilter =
+      this.selectedSections.has("alternate_greetings") &&
+      scan.greetingBreakdown.length > 1;
+    const hasWorldBookSubfilter =
+      this.selectedSections.has("world_books") && scan.worldBookBreakdown.length > 1;
+
+    const triggerRow = document.createElement("div");
+    triggerRow.className = "ml-compact-row";
+
+    if (hasGreetingSubfilter) {
+      triggerRow.appendChild(
+        createIconButton({
+          icon: "filter",
+          label: this.showGreetingSubfilter
+            ? `Hide Greetings (${scan.greetingBreakdown.length})`
+            : `Filter Greetings (${scan.greetingBreakdown.length})`,
+          title: "Toggle per-greeting filter",
+          className: `ml-btn is-xs ${this.showGreetingSubfilter ? "is-active" : ""}`,
+          size: 11,
+          onClick: () => {
+            this.showGreetingSubfilter = !this.showGreetingSubfilter;
+            this.emitUiStateChange();
+            this.render();
+          },
+        }),
+      );
+    }
+
+    if (hasWorldBookSubfilter) {
+      triggerRow.appendChild(
+        createIconButton({
+          icon: "filter",
+          label: this.showWorldBookSubfilter
+            ? `Hide World Books (${scan.worldBookBreakdown.length})`
+            : `Filter World Books (${scan.worldBookBreakdown.length})`,
+          title: "Toggle per-World Book filter",
+          className: `ml-btn is-xs ${this.showWorldBookSubfilter ? "is-active" : ""}`,
+          size: 11,
+          onClick: () => {
+            this.showWorldBookSubfilter = !this.showWorldBookSubfilter;
+            this.emitUiStateChange();
+            this.render();
+          },
+        }),
+      );
+    }
+
+    triggerRow.appendChild(
+      createIconButton({
+        icon: "list",
+        label: this.showUrlPicker
+          ? `Hide URL List (${selectedPending.length}/${candidateItems.length})`
+          : `Inspect & Pick URLs (${selectedPending.length}/${candidateItems.length})`,
+        title: "Inspect individual candidate URLs and toggle them",
+        className: `ml-btn is-xs ${this.showUrlPicker ? "is-active" : ""}`,
+        size: 11,
+        onClick: () => {
+          this.showUrlPicker = !this.showUrlPicker;
+          this.emitUiStateChange();
+          this.render();
+        },
+      }),
+    );
 
     if (this.showUrlPicker && candidateItems.length > 0) {
       const thumbToggle = document.createElement("label");
@@ -1148,10 +1211,49 @@ export class CharacterMediaWidget {
         this.emitUiStateChange();
         this.render();
       });
-      thumbToggle.append(thumbCb, document.createTextNode("Remote Previews"));
-      pickerBar.appendChild(thumbToggle);
+      thumbToggle.append(thumbCb, document.createTextNode("Previews"));
+      triggerRow.appendChild(thumbToggle);
     }
-    container.appendChild(pickerBar);
+    container.appendChild(triggerRow);
+
+    // Greeting & World Book Sub-Selector Panels
+    if (hasGreetingSubfilter && this.showGreetingSubfilter) {
+      container.appendChild(
+        this.renderSubfilterBox({
+          title: hasWorldBookSubfilter && this.showWorldBookSubfilter ? "Greetings" : undefined,
+          scrollId: "greetings-subfilter",
+          entries: scan.greetingBreakdown.map((g) => ({
+            key: g.greetingIndex,
+            label: g.label,
+            remoteCount: g.remoteCount,
+            failedCount: (g as typeof g & { failedCount?: number }).failedCount ?? 0,
+          })),
+          getSelected: () => this.selectedGreetings,
+          setSelected: (next) => {
+            this.selectedGreetings = next;
+          },
+        }),
+      );
+    }
+
+    if (hasWorldBookSubfilter && this.showWorldBookSubfilter) {
+      container.appendChild(
+        this.renderSubfilterBox({
+          title: hasGreetingSubfilter && this.showGreetingSubfilter ? "World Books" : undefined,
+          scrollId: "worldbooks-subfilter",
+          entries: scan.worldBookBreakdown.map((wb) => ({
+            key: wb.worldBookId,
+            label: wb.worldBookName,
+            remoteCount: wb.remoteCount,
+            failedCount: (wb as typeof wb & { failedCount?: number }).failedCount ?? 0,
+          })),
+          getSelected: () => this.selectedWorldBooks,
+          setSelected: (next) => {
+            this.selectedWorldBooks = next;
+          },
+        }),
+      );
+    }
 
     if (this.showUrlPicker && candidateItems.length > 0) {
       container.appendChild(this.renderUrlPicker(scan, candidateItems));
@@ -1163,14 +1265,14 @@ export class CharacterMediaWidget {
     countNote.className = "ml-subtitle";
     countNote.textContent =
       effectivePendingCount < selectedPending.length
-        ? `${effectivePendingCount} of ${selectedPending.length} selected files will download (limit ${this.batchCap}).`
-        : `${selectedPending.length} matching file(s) ready.`;
+        ? `${effectivePendingCount} of ${selectedPending.length} selected (limit ${this.batchCap})`
+        : `${selectedPending.length} selected`;
     const applyBtn = createIconButton({
       icon: "download",
       label: `Localize (${effectivePendingCount})`,
       title: "Start downloading selected items now",
-      className: "ml-btn is-primary is-sm",
-      size: 13,
+      className: "ml-btn is-primary is-xs",
+      size: 12,
       disabled: effectivePendingCount === 0,
       onClick: () => void this.triggerOneClickLocalize(),
     });
@@ -1178,6 +1280,73 @@ export class CharacterMediaWidget {
     container.appendChild(summaryBar);
 
     return container;
+  }
+
+  private renderSubfilterBox<K>(opts: {
+    title?: string;
+    scrollId: string;
+    entries: Array<{
+      key: K;
+      label: string;
+      remoteCount: number;
+      failedCount: number;
+    }>;
+    getSelected: () => Set<K> | null;
+    setSelected: (next: Set<K> | null) => void;
+  }): HTMLElement {
+    const box = document.createElement("div");
+    box.className = "ml-subfilter-box";
+    if (opts.title) {
+      const titleEl = document.createElement("div");
+      titleEl.className = "ml-config-label";
+      titleEl.textContent = opts.title;
+      box.appendChild(titleEl);
+    }
+    const list = document.createElement("div");
+    list.className = "ml-subfilter-list";
+    list.dataset.scrollId = opts.scrollId;
+
+    for (const entry of opts.entries) {
+      const lbl = document.createElement("label");
+      lbl.className = "ml-checkbox-item";
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      const current = opts.getSelected();
+      cb.checked = current === null || current.has(entry.key);
+      cb.addEventListener("change", () => {
+        let next = opts.getSelected();
+        if (next === null) {
+          next = new Set(opts.entries.map((item) => item.key));
+        }
+        if (cb.checked) {
+          next.add(entry.key);
+        } else {
+          const remaining = opts.entries.filter(
+            (item) => item.key !== entry.key && next!.has(item.key),
+          );
+          if (remaining.length === 0) {
+            cb.checked = true;
+            return;
+          }
+          next.delete(entry.key);
+        }
+        if (opts.entries.every((item) => next!.has(item.key))) {
+          next = null;
+        }
+        opts.setSelected(next);
+        this.scheduleSaveOverride();
+        this.render();
+      });
+      const summary =
+        entry.failedCount > 0
+          ? `${entry.remoteCount} rem, ${entry.failedCount} err`
+          : `${entry.remoteCount}`;
+      lbl.append(cb, document.createTextNode(`${entry.label} (${summary})`));
+      list.appendChild(lbl);
+    }
+
+    box.appendChild(list);
+    return box;
   }
 
   private renderUrlPicker(
@@ -1194,7 +1363,7 @@ export class CharacterMediaWidget {
 
     const checkAllBtn = document.createElement("button");
     checkAllBtn.type = "button";
-    checkAllBtn.className = "ml-btn is-sm";
+    checkAllBtn.className = "ml-btn is-xs";
     checkAllBtn.textContent = "Check All";
     checkAllBtn.addEventListener("click", () => {
       for (const item of candidateItems) this.excludedUrls.delete(item.normalizedUrl);
@@ -1204,7 +1373,7 @@ export class CharacterMediaWidget {
 
     const uncheckAllBtn = document.createElement("button");
     uncheckAllBtn.type = "button";
-    uncheckAllBtn.className = "ml-btn is-sm";
+    uncheckAllBtn.className = "ml-btn is-xs";
     uncheckAllBtn.textContent = "Uncheck All";
     uncheckAllBtn.addEventListener("click", () => {
       for (const item of candidateItems) this.excludedUrls.add(item.normalizedUrl);
@@ -1216,7 +1385,7 @@ export class CharacterMediaWidget {
     if (this.expandedUrls.size > 0) {
       const collapseAllBtn = document.createElement("button");
       collapseAllBtn.type = "button";
-      collapseAllBtn.className = "ml-btn is-sm";
+      collapseAllBtn.className = "ml-btn is-xs";
       collapseAllBtn.textContent = `Collapse (${this.expandedUrls.size})`;
       collapseAllBtn.addEventListener("click", () => {
         this.expandedUrls.clear();
@@ -1273,29 +1442,51 @@ export class CharacterMediaWidget {
       urlText.textContent = item.normalizedUrl;
       const sourcesText = document.createElement("div");
       sourcesText.className = "ml-url-sources";
-      sourcesText.textContent = `${item.mediaKind.toUpperCase()} · ${item.domain} · ${item.occurrenceCount} ref${item.occurrenceCount === 1 ? "" : "s"} · ${item.sources[0]?.label ?? ""}`;
+      const kindChip = document.createElement("span");
+      const kindClass =
+        item.status === "failed"
+          ? "is-failed"
+          : item.mediaKind === "video"
+            ? "is-video"
+            : "is-image";
+      kindChip.className = `ml-kind-chip ${kindClass}`;
+      kindChip.textContent =
+        item.status === "failed"
+          ? "FAILED"
+          : item.mediaKind === "video"
+            ? "VID"
+            : "IMG";
+      const refTag = item.occurrenceCount > 1 ? ` ×${item.occurrenceCount}` : "";
+      const srcLabel = item.sources[0]?.label ?? "";
+      sourcesText.append(
+        kindChip,
+        document.createTextNode(` · ${item.domain}${refTag}${srcLabel ? ` · ${srcLabel}` : ""}`),
+      );
       meta.append(urlText, sourcesText);
 
       const expandHint = document.createElement("span");
       expandHint.className = "ml-expand-hint";
-      expandHint.textContent = isExpanded ? "Hide ▴" : "Info ▾";
+      expandHint.textContent = isExpanded ? "▴" : "▾";
+      expandHint.title = isExpanded ? "Hide URL details" : "Inspect preview & sources";
 
-      const singleBtn = document.createElement("button");
-      singleBtn.type = "button";
-      singleBtn.className = "ml-btn is-sm";
-      singleBtn.textContent = item.status === "failed" ? "Retry" : "Localize";
-      singleBtn.addEventListener("click", (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        singleBtn.disabled = true;
-        void this.runAction(() =>
-          this.callbacks.onStartDownload({
-            characterIds: [scan.characterId],
-            explicitUrls: [item.normalizedUrl],
-            includeFailed: true,
-            maxItems: 1,
-          }),
-        );
+      const singleBtn = createIconButton({
+        icon: item.status === "failed" ? "refresh" : "download",
+        title: item.status === "failed" ? "Retry this URL" : "Localize this URL",
+        className: "ml-btn ml-icon-btn is-xs",
+        size: 11,
+        onClick: (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          singleBtn.disabled = true;
+          void this.runAction(() =>
+            this.callbacks.onStartDownload({
+              characterIds: [scan.characterId],
+              explicitUrls: [item.normalizedUrl],
+              includeFailed: true,
+              maxItems: 1,
+            }),
+          );
+        },
       });
 
       row.append(meta, expandHint, singleBtn);
@@ -1389,10 +1580,10 @@ export class CharacterMediaWidget {
 
     const copyBtn = createIconButton({
       icon: "copy",
-      label: "Copy URL",
+      label: "Copy",
       title: "Copy URL",
-      className: "ml-btn is-sm",
-      size: 12,
+      className: "ml-btn is-xs",
+      size: 11,
       onClick: (e) => {
         e.stopPropagation();
         void navigator.clipboard?.writeText?.(item.normalizedUrl);
@@ -1405,8 +1596,8 @@ export class CharacterMediaWidget {
       icon: "external-link",
       label: "Open",
       title: safeUrl ? "Open original URL in new tab" : "Blocked unsafe media URL",
-      className: "ml-btn is-sm",
-      size: 12,
+      className: "ml-btn is-xs",
+      size: 11,
       disabled: !safeUrl,
       onClick: (e) => {
         e.stopPropagation();
@@ -1418,8 +1609,8 @@ export class CharacterMediaWidget {
       icon: "download",
       label: item.status === "failed" ? "Retry" : "Localize",
       title: "Queue this single media item",
-      className: "ml-btn is-primary is-sm",
-      size: 12,
+      className: "ml-btn is-primary is-xs",
+      size: 11,
       onClick: (e) => {
         e.stopPropagation();
         void this.runAction(() =>
@@ -1458,9 +1649,14 @@ export class CharacterMediaWidget {
     return details;
   }
 
-  private renderMediaGallerySection(scan: CharacterMediaScanResult): HTMLElement {
-    const box = document.createElement("div");
-    box.className = "ml-section";
+  private renderCombinedOptionsAndMediaSection(
+    scan: CharacterMediaScanResult,
+    candidateItems: DiscoveredMediaItem[],
+    selectedPending: DiscoveredMediaItem[],
+    effectivePendingCount: number,
+  ): HTMLElement {
+    const section = document.createElement("div");
+    section.className = "ml-section ml-combined-drawer";
 
     const expressions = scan.media?.expressions ?? [];
     const exprImageIds = new Set(expressions.map((e) => e.imageId));
@@ -1472,8 +1668,81 @@ export class CharacterMediaWidget {
     );
     const hasAvatar = Boolean(scan.media?.avatarUrl);
 
+    // Unified compact trigger strip for both Downloaded Media and Per-Card Options
+    const bar = document.createElement("div");
+    bar.className = "ml-combined-bar";
+
+    const mediaBtn = document.createElement("button");
+    mediaBtn.type = "button";
+    mediaBtn.className = `ml-combined-trigger ${this.showDownloadedMedia ? "is-active" : ""}`.trim();
+    const mediaTitle = this.showDownloadedMedia
+      ? "Collapse Downloaded Media"
+      : "Expand Downloaded Media";
+    mediaBtn.title = mediaTitle;
+    mediaBtn.setAttribute("aria-label", mediaTitle);
+    mediaBtn.setAttribute("aria-expanded", String(this.showDownloadedMedia));
+    mediaBtn.appendChild(createIcon("image", 13));
+    const mediaLabel = document.createElement("span");
+    mediaLabel.textContent = `Downloaded Media (${localizedItems.length}${expressions.length > 0 ? ` + ${expressions.length} expr` : ""})`;
+    mediaBtn.append(
+      mediaLabel,
+      createIcon(this.showDownloadedMedia ? "chevron-down" : "chevron-right", 12),
+    );
+    mediaBtn.addEventListener("click", () => {
+      this.showDownloadedMedia = !this.showDownloadedMedia;
+      this.emitUiStateChange();
+      this.render();
+    });
+
+    const mediaTip = createInfoTip(
+      "Click any tile to open the lightbox. Character Avatar and native Expressions are read-only; localized assets can be removed individually or in bulk.",
+    );
+
+    const optionsBtn = document.createElement("button");
+    optionsBtn.type = "button";
+    optionsBtn.className = `ml-combined-trigger ${this.showDownloadConfig ? "is-active" : ""}`.trim();
+    const optionsTitle = this.showDownloadConfig
+      ? "Hide download options & URL inspector"
+      : "Customize per-card download options & inspect individual URLs";
+    optionsBtn.title = optionsTitle;
+    optionsBtn.setAttribute("aria-label", optionsTitle);
+    optionsBtn.setAttribute("aria-expanded", String(this.showDownloadConfig));
+    optionsBtn.appendChild(createIcon("sliders", 13));
+    const optionsLabel = document.createElement("span");
+    optionsLabel.textContent = "Options";
+    optionsBtn.appendChild(optionsLabel);
+    if (this.hasCustomOverride) {
+      const customBadge = document.createElement("span");
+      customBadge.className = "ml-badge is-info";
+      customBadge.textContent = "Custom";
+      optionsBtn.appendChild(customBadge);
+    }
+    optionsBtn.appendChild(
+      createIcon(this.showDownloadConfig ? "chevron-down" : "chevron-right", 12),
+    );
+    optionsBtn.addEventListener("click", () => {
+      this.showDownloadConfig = !this.showDownloadConfig;
+      this.emitUiStateChange();
+      this.render();
+    });
+
+    bar.append(mediaBtn, mediaTip, optionsBtn);
+    section.appendChild(bar);
+
+    if (this.showDownloadConfig) {
+      section.appendChild(
+        this.renderOptionsSection(scan, candidateItems, selectedPending, effectivePendingCount),
+      );
+    }
+
+    if (!this.showDownloadedMedia) {
+      this.mediaTileCache.clear();
+      return section;
+    }
+
     // Build unified tiles list: Avatar first -> Localized Media -> Native Expressions (read-only)
     type CharacterTile = {
+      cacheKey: string;
       lightbox: LightboxItem;
       badge: string;
       badgeVariant?: string;
@@ -1486,8 +1755,13 @@ export class CharacterMediaWidget {
 
     const allTiles: CharacterTile[] = [];
 
+    const onEditCharacter = this.callbacks.onOpenCharacterEditor
+      ? () => this.callbacks.onOpenCharacterEditor!(scan.characterId)
+      : undefined;
+
     if (hasAvatar && scan.media?.avatarUrl) {
       allTiles.push({
+        cacheKey: `avatar:${scan.characterId}`,
         lightbox: {
           id: `avatar:${scan.characterId}`,
           localUrl: scan.media.avatarUrl,
@@ -1496,6 +1770,7 @@ export class CharacterMediaWidget {
           subtitle: "Character card avatar",
           readOnly: true,
           badgeText: "Avatar",
+          onEditCharacter,
         },
         badge: "Avatar",
         badgeVariant: "is-info",
@@ -1509,6 +1784,7 @@ export class CharacterMediaWidget {
     for (const item of localizedItems) {
       const entry = item.localizedEntry;
       allTiles.push({
+        cacheKey: `loc:${entry.imageId}:${item.normalizedUrl}`,
         lightbox: {
           id: entry.imageId,
           localUrl: entry.localUrl,
@@ -1518,12 +1794,12 @@ export class CharacterMediaWidget {
           originalUrl: item.normalizedUrl,
           readOnly: false,
           badgeText: item.mediaKind === "video" ? "Video" : "Localized",
+          onEditCharacter,
           onRemove: async () => {
             await this.callbacks.onPurgeCharacterCache(scan.characterId, [item.normalizedUrl]);
-            await this.refreshScan(false);
           },
         },
-        badge: item.mediaKind === "video" ? "Video" : "Localized",
+        badge: item.mediaKind === "video" ? "Vid" : "Local",
         caption: entry.filename,
         subcaption: `${formatBytes(entry.sizeBytes)} · ${item.sources[0]?.label ?? item.domain}`,
         isExpression: false,
@@ -1534,6 +1810,7 @@ export class CharacterMediaWidget {
 
     for (const expr of expressions) {
       allTiles.push({
+        cacheKey: `expr:${expr.imageId}:${expr.label}`,
         lightbox: {
           id: `expr:${expr.imageId}:${expr.label}`,
           localUrl: expr.localUrl,
@@ -1544,6 +1821,7 @@ export class CharacterMediaWidget {
             : "Native expression · read-only",
           readOnly: true,
           badgeText: "Expression",
+          onEditCharacter,
         },
         badge: "Expr",
         badgeVariant: "is-info",
@@ -1561,57 +1839,19 @@ export class CharacterMediaWidget {
       return true;
     });
 
-    const topBar = document.createElement("div");
-    topBar.className = "ml-section-title";
+    const mediaPane = document.createElement("div");
+    mediaPane.className = "ml-combined-pane ml-media-pane";
 
-    const titleWrap = document.createElement("div");
-    titleWrap.className = "ml-inline-title";
-    const collapseBtn = createIconButton({
-      icon: this.showDownloadedMedia ? "chevron-down" : "chevron-right",
-      title: this.showDownloadedMedia
-        ? "Collapse Downloaded Media"
-        : "Expand Downloaded Media",
-      className: "ml-btn ml-icon-btn is-sm ml-collapse-btn",
-      size: 13,
-      onClick: () => {
-        this.showDownloadedMedia = !this.showDownloadedMedia;
-        this.emitUiStateChange();
-        this.render();
-      },
-    });
-    collapseBtn.setAttribute("aria-expanded", String(this.showDownloadedMedia));
-    collapseBtn.setAttribute(
-      "aria-label",
-      this.showDownloadedMedia
-        ? "Collapse Downloaded Media"
-        : "Expand Downloaded Media",
-    );
-    const titleSpan = document.createElement("span");
-    titleSpan.textContent = `Downloaded Media (${localizedItems.length}${expressions.length > 0 ? ` + ${expressions.length} expr` : ""})`;
-    titleWrap.append(
-      collapseBtn,
-      titleSpan,
-      createInfoTip(
-        "Click any tile to open the lightbox. Character Avatar and native Expressions are read-only; localized assets can be removed individually or in bulk.",
-      ),
-    );
-
-    if (!this.showDownloadedMedia) {
-      topBar.appendChild(titleWrap);
-      box.appendChild(topBar);
-      return box;
-    }
-
-    const toolbar = document.createElement("div");
-    toolbar.className = "ml-header-actions";
+    const mediaToolbar = document.createElement("div");
+    mediaToolbar.className = "ml-header-bar ml-media-toolbar";
 
     const filterSelect = document.createElement("select");
     filterSelect.className = "ml-select is-sm";
     filterSelect.title = "Filter shown media tiles";
     const filterChoices: Array<{ val: MediaGridFilter; label: string }> = [
       { val: "all", label: `All (${allTiles.length})` },
-      { val: "localized", label: `Localized (${localizedItems.length})` },
-      { val: "expressions", label: `Expressions (${expressions.length})` },
+      { val: "localized", label: `Local (${localizedItems.length})` },
+      { val: "expressions", label: `Expr (${expressions.length})` },
       { val: "video", label: "Videos" },
     ];
     for (const c of filterChoices) {
@@ -1627,9 +1867,13 @@ export class CharacterMediaWidget {
       this.emitUiStateChange();
       this.render();
     });
-    toolbar.appendChild(filterSelect);
 
-    toolbar.appendChild(
+    const toolbar = document.createElement("div");
+    toolbar.className = "ml-header-actions";
+
+    const seg = document.createElement("div");
+    seg.className = "ml-segmented";
+    seg.appendChild(
       createIconButton({
         icon: "grid",
         title: "Grid view",
@@ -1642,7 +1886,7 @@ export class CharacterMediaWidget {
         },
       }),
     );
-    toolbar.appendChild(
+    seg.appendChild(
       createIconButton({
         icon: "list",
         title: "List view",
@@ -1653,6 +1897,15 @@ export class CharacterMediaWidget {
           this.emitUiStateChange();
           this.render();
         },
+      }),
+    );
+    toolbar.appendChild(seg);
+    toolbar.appendChild(
+      createThumbnailSizeSegmented(this.thumbnailSize, (nextSize) => {
+        if (nextSize === this.thumbnailSize) return;
+        this.thumbnailSize = nextSize;
+        this.emitUiStateChange();
+        this.render();
       }),
     );
 
@@ -1688,21 +1941,59 @@ export class CharacterMediaWidget {
       );
     }
 
-    topBar.append(titleWrap, toolbar);
-    box.appendChild(topBar);
+    mediaToolbar.append(filterSelect, toolbar);
+    mediaPane.appendChild(mediaToolbar);
 
     if (filteredTiles.length === 0) {
+      this.mediaTileCache.clear();
       const empty = document.createElement("div");
-      empty.className = "ml-empty";
-      empty.textContent =
+      empty.className = "ml-empty ml-empty-card";
+      const iconWrap = document.createElement("div");
+      iconWrap.className = "ml-empty-icon";
+      iconWrap.appendChild(createIcon(allTiles.length === 0 ? "image" : "filter", 18));
+      const textEl = document.createElement("div");
+      textEl.className = "ml-empty-text";
+      textEl.textContent =
         allTiles.length === 0
-          ? "No downloaded media or expressions yet. Click Localize above to fetch remote media."
+          ? "No downloaded media or expressions yet."
           : "No items match this filter.";
-      box.appendChild(empty);
-      return box;
+      empty.append(iconWrap, textEl);
+      mediaPane.appendChild(empty);
+      section.appendChild(mediaPane);
+      return section;
     }
 
     const lightboxItems = filteredTiles.map((t) => t.lightbox);
+    const seenKeys = new Map<string, number>();
+    const usedKeys = new Set<string>();
+
+    const nextTileCacheKey = (tile: CharacterTile): string => {
+      const base = `${this.mediaViewMode}:${tile.cacheKey}`;
+      const occ = seenKeys.get(base) ?? 0;
+      seenKeys.set(base, occ + 1);
+      return occ === 0 ? base : `${base}#${occ}`;
+    };
+
+    const thumbTier = getThumbnailImageTier(this.thumbnailSize);
+    const computeTileSig = (tile: CharacterTile): string => {
+      const thumbSrc =
+        toThumbnailMediaUrl(
+          sanitizeSafeMediaUrl(tile.lightbox.localUrl),
+          tile.mediaKind,
+          thumbTier,
+        ) ?? tile.lightbox.localUrl;
+      return [
+        scan.characterId,
+        thumbSrc,
+        tile.mediaKind,
+        tile.caption,
+        tile.subcaption,
+        tile.badge,
+        tile.badgeVariant ?? "",
+        tile.isExpression ? "1" : "0",
+        tile.urlToRemove ?? "",
+      ].join("\u0001");
+    };
 
     if (this.mediaViewMode === "list") {
       const list = document.createElement("div");
@@ -1710,58 +2001,101 @@ export class CharacterMediaWidget {
       list.dataset.scrollId = "localized-asset-grid";
 
       filteredTiles.forEach((tile, index) => {
-        const row = document.createElement("div");
-        row.className = "ml-media-list-row";
-        row.addEventListener("click", () => openMediaLightbox(lightboxItems, index));
+        const key = nextTileCacheKey(tile);
+        const sig = computeTileSig(tile);
+        usedKeys.add(key);
+        const cached = this.mediaTileCache.get(key);
 
-        const thumb = createLazyMediaElement({
-          src: tile.lightbox.localUrl,
-          mediaKind: tile.mediaKind,
-          alt: tile.caption,
-          className: "ml-media-list-thumb",
-        });
+        let row: HTMLElement;
+        if (cached && cached.sig === sig) {
+          row = cached.el;
+          reobserveLazyMedia(row);
+          const rmBtn = row.querySelector<HTMLButtonElement>("button.is-danger");
+          if (rmBtn) rmBtn.disabled = false;
+        } else {
+          row = document.createElement("div");
+          row.className = "ml-media-list-row";
+          row.addEventListener("click", () => this.tileClickHandlers.get(row)?.());
 
-        const info = document.createElement("div");
-        info.className = "ml-url-meta";
-        const cap = document.createElement("div");
-        cap.className = "ml-url-text";
-        cap.textContent = tile.caption;
-        const sub = document.createElement("div");
-        sub.className = "ml-url-sources";
-        sub.textContent = tile.subcaption;
-        info.append(cap, sub);
-
-        const badge = document.createElement("span");
-        badge.className = `ml-badge ${tile.badgeVariant ?? ""}`.trim();
-        badge.textContent = tile.badge;
-
-        row.append(thumb, info, badge);
-
-        if (tile.urlToRemove) {
-          const rmBtn = createIconButton({
-            icon: "trash",
-            title: "Remove localized asset",
-            className: "ml-btn ml-icon-btn is-danger is-sm",
-            size: 12,
-            onClick: async (ev) => {
-              ev.stopPropagation();
-              rmBtn.disabled = true;
-              await this.runAction(async () => {
-                await this.callbacks.onPurgeCharacterCache(scan.characterId, [
-                  tile.urlToRemove!,
-                ]);
-                await this.refreshScan(false);
-              });
-            },
+          const thumbWrap = document.createElement("div");
+          thumbWrap.className = "ml-media-list-thumb-wrap";
+          const thumb = createLazyMediaElement({
+            src: tile.lightbox.localUrl,
+            mediaKind: tile.mediaKind,
+            alt: tile.caption,
+            className: "ml-media-list-thumb",
+            thumbTier,
           });
-          row.appendChild(rmBtn);
+          thumbWrap.appendChild(thumb);
+          if (tile.mediaKind === "video") {
+            const kindIndicator = document.createElement("span");
+            kindIndicator.className = "ml-media-list-kind-badge";
+            kindIndicator.setAttribute("aria-hidden", "true");
+            kindIndicator.appendChild(createIcon("play", 9));
+            thumbWrap.appendChild(kindIndicator);
+          }
+
+          const info = document.createElement("div");
+          info.className = "ml-url-meta";
+          const cap = document.createElement("div");
+          cap.className = "ml-url-text";
+          cap.textContent = tile.caption;
+          const sub = document.createElement("div");
+          sub.className = "ml-url-sources";
+          sub.textContent = tile.subcaption;
+          info.append(cap, sub);
+
+          const badgeVariant =
+            tile.badgeVariant ?? (tile.mediaKind === "video" ? "is-info" : "is-success");
+          const badge = document.createElement("span");
+          badge.className = `ml-badge ${badgeVariant}`.trim();
+          badge.textContent = tile.badge;
+
+          row.append(thumbWrap, info, badge);
+
+          if (tile.urlToRemove) {
+            const urlToRemove = tile.urlToRemove;
+            const rmBtn = createIconButton({
+              icon: "trash",
+              title: "Remove localized asset",
+              className: "ml-btn ml-icon-btn is-danger is-sm",
+              size: 12,
+              onClick: async (ev) => {
+                ev.stopPropagation();
+                rmBtn.disabled = true;
+                try {
+                  await this.runAction(async () => {
+                    await this.callbacks.onPurgeCharacterCache(scan.characterId, [
+                      urlToRemove,
+                    ]);
+                    await this.refreshScan(false);
+                  });
+                } finally {
+                  if (!this.destroyed) {
+                    rmBtn.disabled = false;
+                  }
+                }
+              },
+            });
+            row.appendChild(rmBtn);
+          }
+
+          this.mediaTileCache.set(key, { sig, el: row });
         }
 
+        this.tileClickHandlers.set(row, () =>
+          openMediaLightbox(lightboxItems, index, () => void this.refreshScan(false)),
+        );
         list.appendChild(row);
       });
 
-      box.appendChild(list);
-      return box;
+      for (const key of this.mediaTileCache.keys()) {
+        if (!usedKeys.has(key)) this.mediaTileCache.delete(key);
+      }
+
+      mediaPane.appendChild(list);
+      section.appendChild(mediaPane);
+      return section;
     }
 
     const grid = document.createElement("div");
@@ -1769,62 +2103,101 @@ export class CharacterMediaWidget {
     grid.dataset.scrollId = "localized-asset-grid";
 
     filteredTiles.forEach((tile, index) => {
-      const card = document.createElement("div");
-      card.className = "ml-asset-card";
+      const key = nextTileCacheKey(tile);
+      const sig = computeTileSig(tile);
+      usedKeys.add(key);
+      const cached = this.mediaTileCache.get(key);
 
-      const mediaWrap = document.createElement("div");
-      mediaWrap.className = "ml-asset-thumb-wrap";
-      const thumb = createLazyMediaElement({
-        src: tile.lightbox.localUrl,
-        mediaKind: tile.mediaKind,
-        alt: tile.caption,
-        className: "ml-asset-preview",
-        title: `${tile.caption} — Click to preview`,
-      });
-      mediaWrap.addEventListener("click", () => openMediaLightbox(lightboxItems, index));
+      let card: HTMLElement;
+      if (cached && cached.sig === sig) {
+        card = cached.el;
+        reobserveLazyMedia(card);
+        const rmBtn = card.querySelector<HTMLButtonElement>("button.is-danger");
+        if (rmBtn) rmBtn.disabled = false;
+      } else {
+        card = document.createElement("div");
+        card.className = "ml-asset-card";
 
-      const cornerBadge = document.createElement("span");
-      cornerBadge.className = `ml-tile-badge ${tile.badgeVariant ?? ""}`.trim();
-      cornerBadge.textContent = tile.badge;
-      mediaWrap.append(thumb, cornerBadge);
-
-      const footer = document.createElement("div");
-      footer.className = "ml-asset-footer";
-
-      const capRow = document.createElement("div");
-      capRow.className = "ml-asset-cap-row";
-      const metaLine = document.createElement("div");
-      metaLine.className = "ml-url-sources";
-      metaLine.textContent = tile.isExpression ? tile.caption : tile.subcaption;
-      metaLine.title = `${tile.caption}\n${tile.subcaption}`;
-      capRow.appendChild(metaLine);
-
-      if (tile.urlToRemove) {
-        const rmBtn = createIconButton({
-          icon: "trash",
-          title: "Remove from cache & Character Gallery",
-          className: "ml-btn ml-icon-btn is-danger is-xs",
-          size: 11,
-          onClick: async (ev) => {
-            ev.stopPropagation();
-            rmBtn.disabled = true;
-            await this.runAction(async () => {
-              await this.callbacks.onPurgeCharacterCache(scan.characterId, [
-                tile.urlToRemove!,
-              ]);
-              await this.refreshScan(false);
-            });
-          },
+        const mediaWrap = document.createElement("div");
+        mediaWrap.className = "ml-asset-thumb-wrap";
+        const thumb = createLazyMediaElement({
+          src: tile.lightbox.localUrl,
+          mediaKind: tile.mediaKind,
+          alt: tile.caption,
+          className: "ml-asset-preview",
+          title: `${tile.caption} — Click to preview`,
+          thumbTier,
         });
-        capRow.appendChild(rmBtn);
+        mediaWrap.addEventListener("click", () => this.tileClickHandlers.get(card)?.());
+
+        const tileBadgeVariant =
+          tile.badge === "Avatar"
+            ? "is-avatar"
+            : tile.isExpression
+              ? "is-expression"
+              : tile.mediaKind === "video"
+                ? "is-video"
+                : "is-local";
+        const cornerBadge = document.createElement("span");
+        cornerBadge.className = `ml-tile-badge ${tileBadgeVariant}`;
+        cornerBadge.textContent = tile.badge;
+        mediaWrap.append(thumb, cornerBadge);
+
+        const footer = document.createElement("div");
+        footer.className = "ml-asset-footer";
+
+        const capRow = document.createElement("div");
+        capRow.className = "ml-asset-cap-row";
+        const metaLine = document.createElement("div");
+        metaLine.className = "ml-url-sources";
+        metaLine.textContent = tile.isExpression ? tile.caption : tile.subcaption;
+        metaLine.title = `${tile.caption}\n${tile.subcaption}`;
+        capRow.appendChild(metaLine);
+
+        if (tile.urlToRemove) {
+          const urlToRemove = tile.urlToRemove;
+          const rmBtn = createIconButton({
+            icon: "trash",
+            title: "Remove from cache & Character Gallery",
+            className: "ml-btn ml-icon-btn is-danger is-xs",
+            size: 11,
+            onClick: async (ev) => {
+              ev.stopPropagation();
+              rmBtn.disabled = true;
+              try {
+                await this.runAction(async () => {
+                  await this.callbacks.onPurgeCharacterCache(scan.characterId, [
+                    urlToRemove,
+                  ]);
+                  await this.refreshScan(false);
+                });
+              } finally {
+                if (!this.destroyed) {
+                  rmBtn.disabled = false;
+                }
+              }
+            },
+          });
+          capRow.appendChild(rmBtn);
+        }
+
+        footer.appendChild(capRow);
+        card.append(mediaWrap, footer);
+        this.mediaTileCache.set(key, { sig, el: card });
       }
 
-      footer.appendChild(capRow);
-      card.append(mediaWrap, footer);
+      this.tileClickHandlers.set(card, () =>
+        openMediaLightbox(lightboxItems, index, () => void this.refreshScan(false)),
+      );
       grid.appendChild(card);
     });
 
-    box.appendChild(grid);
-    return box;
+    for (const key of this.mediaTileCache.keys()) {
+      if (!usedKeys.has(key)) this.mediaTileCache.delete(key);
+    }
+
+    mediaPane.appendChild(grid);
+    section.appendChild(mediaPane);
+    return section;
   }
 }

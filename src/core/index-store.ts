@@ -264,7 +264,7 @@ function sanitizeAssetEntry(
     localUrl:
       typeof e.localUrl === "string" && e.localUrl
         ? e.localUrl
-        : `/api/v1/images/${e.imageId}`,
+        : `/api/v1/images/${encodeURIComponent(e.imageId)}`,
     mimeType: typeof e.mimeType === "string" ? e.mimeType : "image/png",
     sizeBytes: typeof e.sizeBytes === "number" ? e.sizeBytes : 0,
     filename: typeof e.filename === "string" ? e.filename : "media",
@@ -502,11 +502,47 @@ export interface MediaIndexBatchTransaction {
 }
 
 const MAX_CACHED_USERS = 500;
+const MAX_FAILED_URLS = 2000;
+
+function capFailedUrlsRecord(
+  failedUrls: Record<string, FailedUrlRecord>,
+): Record<string, FailedUrlRecord> {
+  const entries = Object.entries(failedUrls);
+  if (entries.length <= MAX_FAILED_URLS) {
+    return failedUrls;
+  }
+  entries.sort((a, b) => (b[1].lastAttemptAt || 0) - (a[1].lastAttemptAt || 0));
+  const capped = createNullProtoRecord<FailedUrlRecord>();
+  for (let i = 0; i < MAX_FAILED_URLS; i++) {
+    const [k, v] = entries[i]!;
+    capped[k] = v;
+  }
+  return capped;
+}
+
+function computeStorageStats(state: PersistedUserMediaState): StorageStatsSummary {
+  const entries = Object.values(state.assets);
+  const seenImageIds = new Set<string>();
+  let totalSizeBytes = 0;
+  for (const entry of entries) {
+    if (!seenImageIds.has(entry.imageId)) {
+      seenImageIds.add(entry.imageId);
+      totalSizeBytes += entry.sizeBytes || 0;
+    }
+  }
+  return {
+    totalAssets: entries.length,
+    totalSizeBytes,
+    totalFailedUrls: Object.keys(state.failedUrls).length,
+    settings: state.settings,
+  };
+}
 
 export class MediaIndexStore {
   private readonly cache = new Map<string, PersistedUserMediaState>();
   private readonly loading = new Map<string, Promise<PersistedUserMediaState>>();
   private readonly writeLocks = new Map<string, Promise<void>>();
+  private readonly corruptBackedUpUsers = new Set<string>();
   private tmpSeq = 0;
 
   constructor(private readonly userStorage: UserStorageAPI) {}
@@ -584,14 +620,20 @@ export class MediaIndexStore {
         "[media_localizer] Corrupt media_index.json; preserving a backup and starting fresh:",
         err,
       );
-      // Never silently overwrite a corrupt index: keep a copy so mappings can be recovered.
-      if (text) {
+      // Never silently overwrite a corrupt index: keep a copy so mappings can be recovered,
+      // at most once per user per session (including missing userId -> "__default__").
+      const backupKey =
+        typeof userId === "string" && userId.trim().length > 0
+          ? userId
+          : "__default__";
+      if (text && !this.corruptBackedUpUsers.has(backupKey)) {
         try {
           await this.userStorage.write(
             `media_index.corrupt-${Date.now()}.json`,
             text,
             userId,
           );
+          this.corruptBackedUpUsers.add(backupKey);
         } catch {
           // ignore backup failure
         }
@@ -610,13 +652,14 @@ export class MediaIndexStore {
       }
     }
 
-    const failedUrls = createNullProtoRecord<FailedUrlRecord>();
+    let failedUrls = createNullProtoRecord<FailedUrlRecord>();
     if (parsed.failedUrls && typeof parsed.failedUrls === "object") {
       for (const [key, raw] of Object.entries(parsed.failedUrls)) {
         if (!isSafeRecordKey(key)) continue;
         const rec = sanitizeFailedRecord(raw);
         if (rec) failedUrls[key] = rec;
       }
+      failedUrls = capFailedUrlsRecord(failedUrls);
     }
 
     const characterOverrides = createNullProtoRecord<CharacterDownloadOverride>();
@@ -874,6 +917,9 @@ export class MediaIndexStore {
         error,
         lastAttemptAt: Date.now(),
       });
+      if (Object.keys(draft.failedUrls).length > MAX_FAILED_URLS) {
+        draft.failedUrls = capFailedUrlsRecord(draft.failedUrls);
+      }
       return { changed: true, result: undefined };
     });
   }
@@ -999,23 +1045,14 @@ export class MediaIndexStore {
     );
   }
 
+  peekStorageStats(userId: string): StorageStatsSummary | null {
+    const cached = this.cache.get(userId);
+    return cached ? computeStorageStats(cached) : null;
+  }
+
   async getStorageStats(userId: string): Promise<StorageStatsSummary> {
     const state = await this.getState(userId);
-    const entries = Object.values(state.assets);
-    const seenImageIds = new Set<string>();
-    let totalSizeBytes = 0;
-    for (const entry of entries) {
-      if (!seenImageIds.has(entry.imageId)) {
-        seenImageIds.add(entry.imageId);
-        totalSizeBytes += entry.sizeBytes || 0;
-      }
-    }
-    return {
-      totalAssets: entries.length,
-      totalSizeBytes,
-      totalFailedUrls: Object.keys(state.failedUrls).length,
-      settings: state.settings,
-    };
+    return computeStorageStats(state);
   }
 
   async buildActiveDisplayUrlMap(userId?: string): Promise<ActiveDisplayUrlMapPayload> {

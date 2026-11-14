@@ -4,6 +4,34 @@ import { decodeHtmlEntities, parseSrcsetCandidates } from "../shared/url-scanner
 import { sanitizeSafeMediaUrl } from "./ui-helpers.ts";
 
 const CSS_URL_RE = /\burl\(\s*(?:"([^"]+)"|'([^']+)'|([^)"'\s]+))\s*\)/gi;
+const SWAPPABLE_MEDIA_TAGS = new Set([
+  "img",
+  "video",
+  "audio",
+  "source",
+  "image",
+]);
+
+function isElementNode(
+  node: Node | EventTarget | null | undefined,
+): node is Element {
+  return Boolean(node && (node as Node).nodeType === 1);
+}
+
+function isSwappableMediaElement(
+  target: EventTarget | null | undefined,
+): target is Element {
+  if (!isElementNode(target)) return false;
+  const tag =
+    typeof target.tagName === "string" ? target.tagName.toLowerCase() : "";
+  return SWAPPABLE_MEDIA_TAGS.has(tag);
+}
+
+interface TrackedIframeDoc {
+  doc: Document;
+  observer: MutationObserver | null;
+  errorListener: ((e: Event) => void) | null;
+}
 
 export class NonDestructiveDisplaySwapper {
   private payload: ActiveDisplayUrlMapPayload = {
@@ -19,6 +47,10 @@ export class NonDestructiveDisplaySwapper {
   private timeoutId: ReturnType<typeof setTimeout> | null = null;
   private stopped = false;
   private readonly iframeLoadListeners = new Map<HTMLIFrameElement, () => void>();
+  private readonly iframeDocTrackers = new Map<
+    HTMLIFrameElement,
+    TrackedIframeDoc
+  >();
 
   constructor(private readonly ctx: SpindleFrontendContext) {}
 
@@ -44,15 +76,8 @@ export class NonDestructiveDisplaySwapper {
 
     if (typeof document !== "undefined") {
       this.errorListener = (event: Event) => {
-        const target = event.target;
-        if (
-          target instanceof HTMLImageElement ||
-          target instanceof HTMLVideoElement ||
-          (typeof HTMLAudioElement !== "undefined" && target instanceof HTMLAudioElement) ||
-          target instanceof HTMLSourceElement ||
-          (typeof SVGImageElement !== "undefined" && target instanceof SVGImageElement)
-        ) {
-          this.decorateMediaElement(target, this.getActiveCharacterIds());
+        if (isSwappableMediaElement(event.target)) {
+          this.decorateMediaElement(event.target, this.getActiveCharacterIds());
         }
       };
       document.addEventListener("error", this.errorListener, true);
@@ -62,11 +87,12 @@ export class NonDestructiveDisplaySwapper {
   /** Filters out mutations caused by our own writes or that cannot affect swappable media. */
   private isRelevantMutation(r: MutationRecord): boolean {
     const target = r.target;
-    const targetEl =
-      target instanceof Element ? target : (target.parentElement ?? null);
-    if (targetEl?.closest(".ml-gallery-host, .ml-drawer-root")) return false;
+    const targetEl = isElementNode(target)
+      ? target
+      : (target?.parentElement ?? null);
+    if (targetEl?.closest?.(".ml-gallery-host, .ml-drawer-root")) return false;
 
-    if (r.type === "attributes" && target instanceof Element) {
+    if (r.type === "attributes" && isElementNode(target)) {
       const name = r.attributeName ?? "";
       if (name === "style") {
         const style = target.getAttribute("style") ?? "";
@@ -96,7 +122,7 @@ export class NonDestructiveDisplaySwapper {
         if (n.nodeType === 1) return true;
       }
       // Text changes inside <style> tags can introduce url(...) references
-      return targetEl?.tagName === "STYLE";
+      return targetEl?.tagName?.toLowerCase() === "style";
     }
     return true;
   }
@@ -124,6 +150,9 @@ export class NonDestructiveDisplaySwapper {
       iframe.removeEventListener("load", listener);
     }
     this.iframeLoadListeners.clear();
+    for (const iframe of Array.from(this.iframeDocTrackers.keys())) {
+      this.cleanupIframeDocTracker(iframe);
+    }
     if (typeof document !== "undefined" && document.body) {
       this.revertContainer(document.body);
       this.processSameOriginIframes([], true);
@@ -231,6 +260,71 @@ export class NonDestructiveDisplaySwapper {
     this.processSameOriginIframes(activeCharIds, false);
   }
 
+  private cleanupIframeDocTracker(iframe: HTMLIFrameElement): void {
+    const tracked = this.iframeDocTrackers.get(iframe);
+    if (!tracked) return;
+    tracked.observer?.disconnect();
+    if (tracked.errorListener) {
+      try {
+        tracked.doc.removeEventListener?.("error", tracked.errorListener, true);
+      } catch {
+        // Ignore inaccessible or torn-down iframe document
+      }
+    }
+    this.iframeDocTrackers.delete(iframe);
+  }
+
+  private ensureIframeDocListeners(
+    iframe: HTMLIFrameElement,
+    doc: Document,
+  ): void {
+    const existing = this.iframeDocTrackers.get(iframe);
+    if (existing && existing.doc === doc) {
+      return;
+    }
+    if (existing) {
+      this.cleanupIframeDocTracker(iframe);
+    }
+
+    let observer: MutationObserver | null = null;
+    const observeRoot = doc.documentElement ?? doc.body;
+    if (typeof MutationObserver !== "undefined" && observeRoot) {
+      observer = new MutationObserver((records) => {
+        if (!this.stopped && records.some((r) => this.isRelevantMutation(r))) {
+          this.schedulePass();
+        }
+      });
+      observer.observe(observeRoot, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: [
+          "src",
+          "data-src",
+          "srcset",
+          "href",
+          "xlink:href",
+          "poster",
+          "style",
+          "srcdoc",
+        ],
+      });
+    }
+
+    let errorListener: ((e: Event) => void) | null = null;
+    if (typeof doc.addEventListener === "function") {
+      errorListener = (event: Event) => {
+        if (this.stopped) return;
+        if (isSwappableMediaElement(event.target)) {
+          this.decorateMediaElement(event.target, this.getActiveCharacterIds());
+        }
+      };
+      doc.addEventListener("error", errorListener, true);
+    }
+
+    this.iframeDocTrackers.set(iframe, { doc, observer, errorListener });
+  }
+
   private processSameOriginIframes(
     activeCharIds: string[],
     revertOnly: boolean,
@@ -241,6 +335,11 @@ export class NonDestructiveDisplaySwapper {
         if (trackedIframe.isConnected === false) {
           trackedIframe.removeEventListener("load", listener);
           this.iframeLoadListeners.delete(trackedIframe);
+        }
+      }
+      for (const trackedIframe of Array.from(this.iframeDocTrackers.keys())) {
+        if (trackedIframe.isConnected === false) {
+          this.cleanupIframeDocTracker(trackedIframe);
         }
       }
     }
@@ -258,14 +357,20 @@ export class NonDestructiveDisplaySwapper {
       }
       try {
         const doc = iframe.contentDocument;
-        if (!doc || !doc.body) continue;
+        if (!doc || !doc.body) {
+          this.cleanupIframeDocTracker(iframe);
+          continue;
+        }
+        const root = doc.documentElement ?? doc.body;
         if (revertOnly) {
-          this.revertContainer(doc.documentElement);
+          this.revertContainer(root);
         } else {
-          this.decorateContainer(doc.documentElement, activeCharIds);
+          this.ensureIframeDocListeners(iframe, doc);
+          this.decorateContainer(root, activeCharIds);
         }
       } catch {
         // Cross-origin or inaccessible iframe
+        this.cleanupIframeDocTracker(iframe);
       }
     }
   }
@@ -360,17 +465,15 @@ export class NonDestructiveDisplaySwapper {
   ): void {
     // 1. Handle `src`
     const srcChanged = this.decorateUrlAttribute(el, "src", activeCharIds);
+    const elTag = el.tagName?.toLowerCase() ?? "";
+    const parentTag = el.parentElement?.tagName?.toLowerCase() ?? "";
     if (
       srcChanged &&
-      typeof HTMLSourceElement !== "undefined" &&
-      el instanceof HTMLSourceElement &&
-      ((typeof HTMLVideoElement !== "undefined" &&
-        el.parentElement instanceof HTMLVideoElement) ||
-        (typeof HTMLAudioElement !== "undefined" &&
-          el.parentElement instanceof HTMLAudioElement))
+      elTag === "source" &&
+      (parentTag === "video" || parentTag === "audio")
     ) {
       try {
-        el.parentElement.load();
+        (el.parentElement as HTMLMediaElement).load?.();
       } catch {
         // ignore
       }
@@ -400,7 +503,7 @@ export class NonDestructiveDisplaySwapper {
     }
 
     // 4. Handle SVG `<image href="..." xlink:href="...">`
-    if (el.tagName.toLowerCase() === "image") {
+    if (elTag === "image") {
       if (el.hasAttribute("href") || el.hasAttribute("data-ml-original-href")) {
         this.decorateUrlAttribute(el, "href", activeCharIds);
       }
@@ -410,7 +513,7 @@ export class NonDestructiveDisplaySwapper {
     }
 
     // 5. Handle `poster` on <video>
-    if (typeof HTMLVideoElement !== "undefined" && el instanceof HTMLVideoElement) {
+    if (elTag === "video") {
       this.decorateUrlAttribute(el, "poster", activeCharIds);
     }
   }
@@ -477,6 +580,12 @@ export class NonDestructiveDisplaySwapper {
     for (const styleEl of Array.from(styleTags)) {
       if (styleEl.closest(".ml-gallery-host, .ml-drawer-root")) continue;
       const currentCss = styleEl.textContent ?? "";
+      if (
+        !currentCss.toLowerCase().includes("url(") &&
+        !styleEl.hasAttribute("data-ml-original-css")
+      ) {
+        continue;
+      }
       const baseCss = this.resolveBase(styleEl, "css", currentCss);
       if (!baseCss || !baseCss.toLowerCase().includes("url(")) continue;
 

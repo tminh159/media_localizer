@@ -170,12 +170,38 @@ describe("core/downloader SSRF, SVG rejection, staged chunks, and CORS guards", 
         expect(() => detectMediaMimeType(neutralBytes, "text/javascript", "https://a.com/x")).toThrow(/content-type/i);
         expect(() => detectMediaMimeType(neutralBytes, "application/octet-stream", "https://a.com/evil.svg")).toThrow(/SVG/i);
 
-        // Binary asset with generic octet-stream falls back to safe extension MIME or sniffing
+        // Binary asset with generic octet-stream works via magic-byte sniffing, while
+        // non-media binary blobs cannot bypass validation via bare image headers/extensions
         const safePng = detectMediaMimeType(PNG_MAGIC, "application/octet-stream", "https://a.com/pic.bin");
         expect(safePng.mimeType).toBe("image/png");
 
-        const safeWebpExt = detectMediaMimeType(neutralBytes, "application/octet-stream", "https://a.com/pic.webp");
-        expect(safeWebpExt.mimeType).toBe("image/webp");
+        const webpMagic = new Uint8Array([
+            0x52, 0x49, 0x46, 0x46, 0x10, 0x00, 0x00, 0x00,
+            0x57, 0x45, 0x42, 0x50, 0x56, 0x50, 0x38, 0x20,
+        ]);
+        const safeWebp = detectMediaMimeType(webpMagic, "application/octet-stream", "https://a.com/pic.webp");
+        expect(safeWebp.mimeType).toBe("image/webp");
+
+        expect(() => detectMediaMimeType(neutralBytes, "image/png", "https://a.com/pic.png")).toThrow(/Unrecognized media format/i);
+        expect(() => detectMediaMimeType(neutralBytes, "application/octet-stream", "https://a.com/pic.webp")).toThrow(/Unrecognized media format/i);
+        expect(() => detectMediaMimeType(neutralBytes, "application/octet-stream", "https://a.com/pic.jfif")).toThrow(/Unrecognized media format/i);
+
+        // [M-01 & L-07] Short plain-text bodies (< 8 bytes), short valid image magic bytes, and QuickTime .mov atoms
+        expect(() => detectMediaMimeType(enc.encode("404"), "image/png", "https://a.com/err.png")).toThrow(/plain text/i);
+        expect(() => detectMediaMimeType(enc.encode("X"), "application/octet-stream", "https://a.com/err.jpg")).toThrow(/plain text/i);
+        expect(() => detectMediaMimeType(enc.encode("1234moov"), "video/quicktime", "https://a.com/fake.mov")).toThrow(/plain text/i);
+
+        expect(detectMediaMimeType(new Uint8Array([0xff, 0xd8, 0xff, 0xe0]), undefined, "https://a.com/a.jfif")).toEqual({ mimeType: "image/jpeg", ext: "jpg" });
+        expect(detectMediaMimeType(enc.encode("GIF89a"), undefined, "https://a.com/a.gif")).toEqual({ mimeType: "image/gif", ext: "gif" });
+        expect(detectMediaMimeType(new Uint8Array([0x00, 0x00, 0x01, 0x00]), undefined, "https://a.com/a.ico")).toEqual({ mimeType: "image/x-icon", ext: "ico" });
+
+        for (const atom of ["moov", "mdat", "wide", "free"]) {
+            const movBytes = new Uint8Array([0x00, 0x00, 0x00, 0x10, ...enc.encode(atom), 0x00, 0x00]);
+            expect(detectMediaMimeType(movBytes, "video/quicktime", "https://a.com/clip.mov")).toEqual({
+                mimeType: "video/mp4",
+                ext: "mp4",
+            });
+        }
     });
 
     test("staged spindle.files downloads assemble chunks cleanly and always delete staged files on error or overflow", async () => {
@@ -1423,5 +1449,114 @@ describe("audit fixes #8.1, #8.2, #8.3, #8.5, and character queue cancellation",
         expect(st.assets["https://cdn.example.com/keep-1.png"]?.characterIds).toEqual(["char-keep"]);
         expect(q.getProgress().skippedCount).toBe(2);
         expect(q.getProgress().succeededCount).toBe(1);
+    });
+
+    test("[M-03] cancelCharacterTasks for char A does not skip shared-URL download for waiting char B", async () => {
+        let downloadCount = 0;
+        let releaseFirst!: () => void;
+        const firstGate = new Promise<void>((r) => {
+            releaseFirst = r;
+        });
+
+        const { spindle } = createCoreMockSpindle({
+            cors: async () => {
+                downloadCount++;
+                if (downloadCount === 1) {
+                    await firstGate;
+                }
+                return { status: 200, headers: { "content-type": "image/png" }, body: PNG_MAGIC.slice() };
+            },
+        });
+        const store = new MediaIndexStore(spindle.userStorage);
+        const q = new UserDownloadQueue("u1", spindle, store, () => {});
+        const sharedUrl = "https://cdn.example.com/shared-banner.png";
+
+        await q.startOrAppendBatch({
+            userId: "u1",
+            concurrency: 2,
+            maxFileSizeBytes: 5 * 1024 * 1024,
+            timeoutMs: 5000,
+            maxItems: 0,
+            tasks: [
+                { characterId: "char-a", characterName: "A", normalizedUrl: sharedUrl, rawUrls: [sharedUrl] },
+                { characterId: "char-b", characterName: "B", normalizedUrl: sharedUrl, rawUrls: [sharedUrl] },
+            ],
+        });
+
+        await new Promise((r) => setTimeout(r, 20));
+        q.cancelCharacterTasks("char-a");
+        releaseFirst();
+
+        await waitForQueueTerminal(q);
+        const progress = q.getProgress();
+        expect(progress.status).toBe("completed");
+        expect(progress.skippedCount).toBe(1);
+        expect(progress.succeededCount).toBe(1);
+
+        const st = await store.getState("u1");
+        expect(st.assets[sharedUrl]?.characterIds).toEqual(["char-b"]);
+    });
+
+    test("[L-06] startOrAppendBatch dynamically spawns additional worker loops when concurrency increases", async () => {
+        let activeFetches = 0;
+        let maxConcurrentFetches = 0;
+        let releaseBatch!: () => void;
+        const gate = new Promise<void>((r) => {
+            releaseBatch = r;
+        });
+        let firstEntered!: () => void;
+        const firstEnteredPromise = new Promise<void>((r) => {
+            firstEntered = r;
+        });
+
+        const { spindle } = createCoreMockSpindle({
+            cors: async () => {
+                activeFetches++;
+                if (activeFetches > maxConcurrentFetches) {
+                    maxConcurrentFetches = activeFetches;
+                }
+                if (activeFetches === 1) {
+                    firstEntered();
+                }
+                await gate;
+                activeFetches--;
+                return { status: 200, headers: { "content-type": "image/png" }, body: PNG_MAGIC.slice() };
+            },
+        });
+        const store = new MediaIndexStore(spindle.userStorage);
+        const q = new UserDownloadQueue("u1", spindle, store, () => {});
+
+        await q.startOrAppendBatch({
+            userId: "u1",
+            concurrency: 1,
+            maxFileSizeBytes: 5 * 1024 * 1024,
+            timeoutMs: 5000,
+            maxItems: 0,
+            tasks: [
+                { characterId: "c1", characterName: "C1", normalizedUrl: "https://cdn.example.com/dyn-1.png", rawUrls: ["https://cdn.example.com/dyn-1.png"] },
+                { characterId: "c1", characterName: "C1", normalizedUrl: "https://cdn.example.com/dyn-2.png", rawUrls: ["https://cdn.example.com/dyn-2.png"] },
+            ],
+        });
+
+        await firstEnteredPromise;
+        // Append more tasks with higher concurrency = 3 while first batch is active at concurrency = 1
+        await q.startOrAppendBatch({
+            userId: "u1",
+            concurrency: 3,
+            maxFileSizeBytes: 5 * 1024 * 1024,
+            timeoutMs: 5000,
+            maxItems: 0,
+            tasks: [
+                { characterId: "c1", characterName: "C1", normalizedUrl: "https://cdn.example.com/dyn-3.png", rawUrls: ["https://cdn.example.com/dyn-3.png"] },
+                { characterId: "c1", characterName: "C1", normalizedUrl: "https://cdn.example.com/dyn-4.png", rawUrls: ["https://cdn.example.com/dyn-4.png"] },
+            ],
+        });
+
+        await new Promise((r) => setTimeout(r, 25));
+        expect(maxConcurrentFetches).toBe(3);
+
+        releaseBatch();
+        await waitForQueueTerminal(q);
+        expect(q.getProgress().succeededCount).toBe(4);
     });
 });

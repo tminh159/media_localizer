@@ -113,6 +113,19 @@ const pendingGalleryLinksCache = new Map<
 const characterScanCache = new Map<string, CharacterScanCacheEntry>();
 const inFlightAutoLocalize = new Set<string>();
 const failedWorldBookPromises = new WeakSet<Promise<ScannableWorldBookInput | null>>();
+const MAX_INVALIDATION_EPOCHS = 10_000;
+const characterInvalidationEpochs = new Map<string, number>();
+
+function getCharacterInvalidationEpoch(userId: string, characterId: string): number {
+  return characterInvalidationEpochs.get(`${userId}:${characterId}`) ?? 0;
+}
+
+function bumpCharacterInvalidationEpoch(userId: string, characterId: string): number {
+  const key = `${userId}:${characterId}`;
+  const next = (characterInvalidationEpochs.get(key) ?? 0) + 1;
+  setBoundedMapEntry(characterInvalidationEpochs, key, next, MAX_INVALIDATION_EPOCHS);
+  return next;
+}
 
 function recordKnownUser(userId: string): void {
   if (knownUsers.has(userId)) {
@@ -225,11 +238,15 @@ function invalidateRegexScanCaches(
 
 async function syncUrlMapToFrontend(userId: string): Promise<void> {
   try {
-    const urlMapPayload = await indexStore.buildActiveDisplayUrlMap(userId);
+    const [urlMapPayload, stats] = await Promise.all([
+      indexStore.buildActiveDisplayUrlMap(userId),
+      indexStore.getStorageStats(userId),
+    ]);
     spindle.sendToFrontend(
       {
         type: "URL_MAP_UPDATED",
         urlMapPayload,
+        stats,
       },
       userId,
     );
@@ -291,11 +308,18 @@ const queueManager = new MediaQueueManager(
   indexStore,
   (userId, progress, newAsset) => {
     try {
+      const stats =
+        newAsset ||
+        progress.status === "completed" ||
+        progress.status === "cancelled"
+          ? indexStore.peekStorageStats(userId) ?? undefined
+          : undefined;
       spindle.sendToFrontend(
         {
           type: "QUEUE_PROGRESS",
           progress,
           ...(newAsset ? { newAsset } : {}),
+          ...(stats ? { stats } : {}),
         },
         userId,
       );
@@ -493,6 +517,13 @@ export async function performCharacterScan(
     skipGalleryLinkBroadcast?: boolean;
   },
 ): Promise<CharacterMediaScanResult> {
+  if (typeof userId === "string" && userId.trim().length > 0) {
+    recordKnownUser(userId);
+  }
+  const startEpoch = getCharacterInvalidationEpoch(userId, characterId);
+  const isInvalidated = () =>
+    getCharacterInvalidationEpoch(userId, characterId) !== startEpoch;
+
   const character =
     options?.preloadedCharacter ?? (await spindle.characters.get(characterId, userId));
   if (!character) {
@@ -501,6 +532,14 @@ export async function performCharacterScan(
 
   const state = await indexStore.getState(userId);
   const override = state.characterOverrides[characterId] ?? null;
+  if (isInvalidated()) {
+    return scanCharacterMedia(character, [], [], {
+      override,
+      localizedByNormalizedUrl: new Map(Object.entries(state.assets)),
+      failedByNormalizedUrl: new Map(Object.entries(state.failedUrls)),
+      scanBareUrls: state.settings.scanBareUrls,
+    });
+  }
   const cacheKey = `${userId}:${characterId}`;
   const wbIds = includeResources ? extractCharacterWorldBookIds(character) : [];
   const wbIdsKey = `${includeResources ? "1" : "0"}:${wbIds.join(",")}`;
@@ -586,7 +625,7 @@ export async function performCharacterScan(
       scanBareUrls: state.settings.scanBareUrls,
     });
 
-    if (updatedAtKey !== "" && !resourceFetchFailed) {
+    if (!isInvalidated() && updatedAtKey !== "" && !resourceFetchFailed) {
       setBoundedMapEntry(
         characterScanCache,
         cacheKey,
@@ -604,6 +643,10 @@ export async function performCharacterScan(
         MAX_CHARACTER_CACHE_ENTRIES,
       );
     }
+  }
+
+  if (isInvalidated()) {
+    return scan;
   }
 
   // Opportunistically link shared assets already localized by another character in one batch write
@@ -627,6 +670,10 @@ export async function performCharacterScan(
     linkedAny = linkBatch.changed;
   }
 
+  if (isInvalidated()) {
+    return scan;
+  }
+
   // Reconcile native Lumiverse Gallery (`character_gallery` + `images`) with MediaIndexStore:
   // - Adopts images downloaded to the native Gallery when the extension was off (zero redownload)
   // - Prunes localized links if the user deleted an item from the native Gallery
@@ -637,7 +684,12 @@ export async function performCharacterScan(
     userId,
     character,
     scan.items,
+    { isStale: isInvalidated },
   );
+
+  if (isInvalidated()) {
+    return scan;
+  }
 
   if (reconciliation.unmatchedGalleryCandidates.length > 0) {
     setBoundedMapEntry(
@@ -940,6 +992,11 @@ async function enqueueDownloadInternal(
     throw new Error("Select at least one character to localize");
   }
 
+  const startEpochs = new Map<string, number>();
+  for (const charId of charIds) {
+    startEpochs.set(charId, getCharacterInvalidationEpoch(userId, charId));
+  }
+
   const state = await indexStore.getState(userId);
   const settings = state.settings;
   const tasks: QueuedMediaTask[] = [];
@@ -955,9 +1012,21 @@ async function enqueueDownloadInternal(
     : settings.defaultBatchCap;
 
   for (const charId of charIds) {
-    const scan =
-      preloadedScans?.get(charId) ??
-      (await performCharacterScan(userId, charId, true, worldBookCache));
+    if (getCharacterInvalidationEpoch(userId, charId) !== startEpochs.get(charId)) {
+      continue;
+    }
+    let scan: CharacterMediaScanResult;
+    try {
+      scan =
+        preloadedScans?.get(charId) ??
+        (await performCharacterScan(userId, charId, true, worldBookCache));
+    } catch (err) {
+      logWarn(`Skipping character ${charId} during enqueue:`, err);
+      continue;
+    }
+    if (getCharacterInvalidationEpoch(userId, charId) !== startEpochs.get(charId)) {
+      continue;
+    }
     const unmatchedCandidates = getLruMapEntry(
       unmatchedGalleryCache,
       `${userId}:${scan.characterId}`,
@@ -978,7 +1047,21 @@ async function enqueueDownloadInternal(
     const charFilter: Omit<DownloadFilterOptions, "characterIds"> = effective
       ? { ...effective, ...definedFilter }
       : definedFilter;
-    const matchingItems = filterScanItemsForDownload(scan, charFilter);
+    let matchingItems = filterScanItemsForDownload(scan, charFilter);
+    if (
+      charIds.length > 1 &&
+      useCharacterOverrides &&
+      !hasValidFilterMaxItems &&
+      effective &&
+      typeof effective.maxItems === "number" &&
+      Number.isFinite(effective.maxItems) &&
+      effective.maxItems > 0
+    ) {
+      const perCharCap = Math.floor(effective.maxItems);
+      if (matchingItems.length > perCharCap) {
+        matchingItems = matchingItems.slice(0, perCharCap);
+      }
+    }
     for (const item of matchingItems) {
       tasks.push({
         characterId: scan.characterId,
@@ -991,6 +1074,10 @@ async function enqueueDownloadInternal(
       });
     }
   }
+
+  const validTasks = tasks.filter(
+    (t) => getCharacterInvalidationEpoch(userId, t.characterId) === startEpochs.get(t.characterId),
+  );
 
   const clampPositiveInt = (
     raw: unknown,
@@ -1029,7 +1116,7 @@ async function enqueueDownloadInternal(
     .getQueue(userId)
     .startOrAppendBatch({
       userId,
-      tasks,
+      tasks: validTasks,
       maxItems,
       maxFileSizeBytes,
       timeoutMs,
@@ -1139,16 +1226,28 @@ export async function handleFrontendRpcAction(
       const lockKey = `${userId}:${characterId}`;
       if (inFlightAutoLocalize.has(lockKey)) return { started: false };
       inFlightAutoLocalize.add(lockKey);
+      const startEpoch = getCharacterInvalidationEpoch(userId, characterId);
+      const isInvalidated = () =>
+        getCharacterInvalidationEpoch(userId, characterId) !== startEpoch;
       try {
         const state = await indexStore.getState(userId);
+        if (isInvalidated()) return { started: false };
         if (!state.settings.autoLocalizeOnOpen) return { started: false };
         if (state.autoLocalizedCharacterIds.includes(characterId)) {
           return { started: false };
         }
-        const scan = await performCharacterScan(userId, characterId, true);
+        let scan: CharacterMediaScanResult;
+        try {
+          scan = await performCharacterScan(userId, characterId, true);
+        } catch (err) {
+          logWarn(`auto_localize_character scan skipped for ${characterId}:`, err);
+          return { started: false };
+        }
+        if (isInvalidated()) return { started: false };
         const filter = buildEffectiveFilter(state.settings, scan);
         const matching = filterScanItemsForDownload(scan, filter);
         if (matching.length === 0) {
+          if (isInvalidated()) return { started: false };
           await indexStore.markAutoLocalized(userId, characterId);
           return { started: false };
         }
@@ -1161,6 +1260,10 @@ export async function handleFrontendRpcAction(
           false,
           preloadedScans,
         );
+        if (isInvalidated()) {
+          queueManager.getQueue(userId).cancelCharacterTasks(characterId);
+          return { started: false };
+        }
         await indexStore.markAutoLocalized(userId, characterId);
         return { started: true, queueProgress: result.queueProgress };
       } finally {
@@ -1242,6 +1345,7 @@ export async function handleFrontendRpcAction(
 
       const userQueue = queueManager.getQueue(userId);
       for (const characterId of targetCharacterIds) {
+        bumpCharacterInvalidationEpoch(userId, characterId);
         userQueue.cancelCharacterTasks(characterId, urls);
         evictCharacterCaches(characterId, [userId]);
         const res = await indexStore.removeCharacterAssets(userId, characterId, urls);
@@ -1478,6 +1582,9 @@ spindle.on("CHARACTER_DELETED", async (event: unknown, rawUserId?: string) => {
   if (!characterId) return;
 
   evictCharacterCaches(characterId, explicitUserId ? [explicitUserId] : null);
+  for (const userId of targetUsers) {
+    bumpCharacterInvalidationEpoch(userId, characterId);
+  }
 
   for (const userId of targetUsers) {
     try {

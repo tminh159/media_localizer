@@ -10,14 +10,20 @@ import {
   type MediaSourceSection,
 } from "./types.ts";
 
+const MAX_FILTER_ARRAY_ITEMS = 5000;
+const MAX_FILTER_STRING_LEN = 2048;
+
 function uniqueStrings(values: unknown): string[] | undefined {
   if (!Array.isArray(values)) return undefined;
   const out: string[] = [];
   const seen = new Set<string>();
   for (const item of values) {
+    if (out.length >= MAX_FILTER_ARRAY_ITEMS) break;
     if (typeof item !== "string") continue;
     const trimmed = item.trim();
-    if (!trimmed || seen.has(trimmed)) continue;
+    if (!trimmed || trimmed.length > MAX_FILTER_STRING_LEN || seen.has(trimmed)) {
+      continue;
+    }
     seen.add(trimmed);
     out.push(trimmed);
   }
@@ -29,6 +35,7 @@ function uniqueNumbers(values: unknown): number[] | undefined {
   const out: number[] = [];
   const seen = new Set<number>();
   for (const item of values) {
+    if (out.length >= MAX_FILTER_ARRAY_ITEMS) break;
     if (typeof item !== "number" || !Number.isFinite(item)) continue;
     const n = Math.floor(item);
     if (n < 0 || seen.has(n)) continue;

@@ -440,12 +440,23 @@ describe("downloader & index-store & queue", () => {
     expect(() =>
       detectMediaMimeType(json, "application/octet-stream", "https://x.com/a.webp"),
     ).toThrow(/JSON/i);
-    // CDNs that serve binary bytes as octet-stream still work via the URL extension
-    const binaryBytes = new Uint8Array([0x01, 0x02, 0x03, 0x04]);
+    // CDNs that serve valid WebP bytes as octet-stream work via magic-byte sniffing,
+    // while arbitrary non-image bytes are rejected even with image headers/extensions
+    const webpBytes = new Uint8Array([
+      0x52, 0x49, 0x46, 0x46, 0x10, 0x00, 0x00, 0x00,
+      0x57, 0x45, 0x42, 0x50, 0x56, 0x50, 0x38, 0x20,
+    ]);
     expect(
-      detectMediaMimeType(binaryBytes, "application/octet-stream", "https://x.com/a.webp")
+      detectMediaMimeType(webpBytes, "application/octet-stream", "https://x.com/a.webp")
         .mimeType,
     ).toBe("image/webp");
+    const nonMediaBytes = new Uint8Array([0x01, 0x02, 0x03, 0x04]);
+    expect(() =>
+      detectMediaMimeType(nonMediaBytes, "application/octet-stream", "https://x.com/a.webp"),
+    ).toThrow(/Unrecognized media format/);
+    expect(() =>
+      detectMediaMimeType(nonMediaBytes, "image/webp", "https://x.com/a.webp"),
+    ).toThrow(/Unrecognized media format/);
   });
 
   test("MediaIndexStore avoids caching undefined userId and cleans character metadata only on full character removal", async () => {
@@ -1013,5 +1024,167 @@ describe("downloader & index-store & queue", () => {
       expect(/(?<![.\w$])eval\s*\(/.test(code)).toBe(false);
       expect(/\bBuffer\s*\.\s*from\s*\([^)]*["'`]base64(?:url)?["'`]\s*\)/.test(code)).toBe(false);
     }
+  });
+
+  test("[M-04] reconciler TOCTOU guard preserves concurrent record_gallery_links and encodes imageIds in localUrl", async () => {
+    const storage = createMemoryStorage();
+    const store = new MediaIndexStore(storage);
+    const userId = "u-toctou";
+    const charId = "char-toctou";
+    const concurrentUrl = "https://cdn.example.com/concurrent.png";
+    const staleUrl = "https://cdn.example.com/stale.png";
+
+    await store.recordLocalizedAsset(userId, {
+      normalizedUrl: concurrentUrl,
+      rawUrls: [concurrentUrl],
+      imageId: "img/concurrent#1",
+      localUrl: `/api/v1/images/${encodeURIComponent("img/concurrent#1")}`,
+      mimeType: "image/png",
+      sizeBytes: 100,
+      filename: "concurrent.png",
+      characterIds: [charId],
+      localizedAt: 100,
+    });
+    await store.recordLocalizedAsset(userId, {
+      normalizedUrl: staleUrl,
+      rawUrls: [staleUrl],
+      imageId: "img-stale",
+      localUrl: "/api/v1/images/img-stale",
+      mimeType: "image/png",
+      sizeBytes: 100,
+      filename: "stale.png",
+      characterIds: [charId],
+      galleryItemIds: { [charId]: "gal-stale-1" },
+      localizedAt: 100,
+    });
+
+    let releaseGallery!: () => void;
+    const galleryGate = new Promise<void>((r) => {
+      releaseGallery = r;
+    });
+
+    const spindle = {
+      characters: {
+        async getGallery() {
+          await galleryGate;
+          return [];
+        },
+      },
+      images: {
+        async list() {
+          return {
+            data: [
+              { id: "img/concurrent#1", original_filename: "concurrent.png", mime_type: "image/png", byte_size: 100 },
+              { id: "img-stale", original_filename: "stale.png", mime_type: "image/png", byte_size: 100 },
+            ],
+            total: 2,
+          };
+        },
+        async get(id: string) {
+          return { id, original_filename: "img.png", mime_type: "image/png", byte_size: 100 };
+        },
+      },
+    } as unknown as SpindleAPI;
+
+    const character = { id: charId, name: "ToctouChar" } as unknown as CharacterDTO;
+    const reconcilePromise = reconcileCharacterGalleryWithIndex(
+      spindle,
+      store,
+      userId,
+      character,
+      [],
+    );
+
+    // Simulate concurrent record_gallery_links arriving while getGallery is in flight
+    await new Promise((r) => setTimeout(r, 15));
+    await store.recordGalleryLinks(userId, [
+      {
+        characterId: charId,
+        normalizedUrl: concurrentUrl,
+        imageId: "img/concurrent#1",
+        galleryItemId: "gal-concurrent-1",
+      },
+    ]);
+    releaseGallery();
+
+    const rec = await reconcilePromise;
+    expect(rec.prunedCount).toBe(1);
+
+    const state = await store.getState(userId);
+    expect(state.assets[concurrentUrl]).toBeDefined();
+    expect(state.assets[concurrentUrl]?.galleryItemIds?.[charId]).toBe("gal-concurrent-1");
+    expect(state.assets[staleUrl]).toBeUndefined();
+
+    // Verify sanitizeAssetEntry fallback encodes special imageId characters
+    await storage.write(
+      "media_index.json",
+      JSON.stringify({
+        version: 1,
+        assets: {
+          "https://cdn.example.com/encoded.png": {
+            normalizedUrl: "https://cdn.example.com/encoded.png",
+            rawUrls: ["https://cdn.example.com/encoded.png"],
+            imageId: "id with/spaces?1",
+            mimeType: "image/png",
+            sizeBytes: 10,
+            filename: "encoded.png",
+            characterIds: ["c1"],
+            localizedAt: 1,
+          },
+        },
+        failedUrls: {},
+      }),
+      "u-enc",
+    );
+    const encStore = new MediaIndexStore(storage);
+    const encState = await encStore.getState("u-enc");
+    expect(encState.assets["https://cdn.example.com/encoded.png"]?.localUrl).toBe(
+      "/api/v1/images/id%20with%2Fspaces%3F1",
+    );
+  });
+
+  test("[L-05] MediaIndexStore caps failedUrls at 2000 most recent entries and limits corrupt backup to once per user session", async () => {
+    const storage = createMemoryStorage();
+
+    // 1. Pre-seed 2050 failedUrls on disk -> loadState keeps 2000 most recent
+    const rawFailed: Record<string, { error: string; lastAttemptAt: number }> = {};
+    for (let i = 0; i < 2050; i++) {
+      rawFailed[`https://cdn.example.com/fail-${i}.png`] = {
+        error: `err-${i}`,
+        lastAttemptAt: i + 1,
+      };
+    }
+    await storage.write(
+      "media_index.json",
+      JSON.stringify({ version: 1, assets: {}, failedUrls: rawFailed }),
+      "u-fail",
+    );
+
+    const store = new MediaIndexStore(storage);
+    const loaded = await store.getState("u-fail");
+    expect(Object.keys(loaded.failedUrls).length).toBe(2000);
+    expect(loaded.failedUrls["https://cdn.example.com/fail-0.png"]).toBeUndefined();
+    expect(loaded.failedUrls["https://cdn.example.com/fail-49.png"]).toBeUndefined();
+    expect(loaded.failedUrls["https://cdn.example.com/fail-50.png"]).toBeDefined();
+    expect(loaded.failedUrls["https://cdn.example.com/fail-2049.png"]).toBeDefined();
+
+    // Recording one more failure keeps count capped at 2000
+    await store.recordFailure("u-fail", "https://cdn.example.com/fail-new.png", "boom");
+    const afterNew = await store.getState("u-fail");
+    expect(Object.keys(afterNew.failedUrls).length).toBe(2000);
+    expect(afterNew.failedUrls["https://cdn.example.com/fail-new.png"]).toBeDefined();
+
+    // 2. Corrupt index backup is written at most once per user/session (including undefined userId)
+    await storage.write("media_index.json", "{bad-json", undefined as unknown as string);
+    const corruptStore = new MediaIndexStore(storage);
+    await corruptStore.buildActiveDisplayUrlMap();
+    await new Promise((r) => setTimeout(r, 5));
+    await corruptStore.buildActiveDisplayUrlMap();
+    await new Promise((r) => setTimeout(r, 5));
+    await corruptStore.buildActiveDisplayUrlMap();
+
+    const files = await storage.list();
+    const backups = files.filter((f) => f.startsWith("media_index.corrupt-"));
+    expect(backups.length).toBe(1);
   });
 });

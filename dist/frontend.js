@@ -47,17 +47,22 @@ function formatBytes(bytes) {
 }
 
 // src/shared/download-config.ts
+var MAX_FILTER_ARRAY_ITEMS = 5000;
+var MAX_FILTER_STRING_LEN = 2048;
 function uniqueStrings(values) {
   if (!Array.isArray(values))
     return;
   const out = [];
   const seen = new Set;
   for (const item of values) {
+    if (out.length >= MAX_FILTER_ARRAY_ITEMS)
+      break;
     if (typeof item !== "string")
       continue;
     const trimmed = item.trim();
-    if (!trimmed || seen.has(trimmed))
+    if (!trimmed || trimmed.length > MAX_FILTER_STRING_LEN || seen.has(trimmed)) {
       continue;
+    }
     seen.add(trimmed);
     out.push(trimmed);
   }
@@ -69,6 +74,8 @@ function uniqueNumbers(values) {
   const out = [];
   const seen = new Set;
   for (const item of values) {
+    if (out.length >= MAX_FILTER_ARRAY_ITEMS)
+      break;
     if (typeof item !== "number" || !Number.isFinite(item))
       continue;
     const n = Math.floor(item);
@@ -182,8 +189,8 @@ function buildEffectiveFilter(settings, scan, override) {
 
 // src/shared/url-scanner.ts
 var VIDEO_EXT_RE = /\.(?:mp4|webm|mov|m4v|ogv)$/i;
-var IMAGE_EXT_RE = /\.(?:png|jpe?g|gif|webp|avif|svg|bmp|ico|apng)$/i;
-var EXCLUDED_ASSET_EXT_RE = /\.(?:woff2?|ttf|otf|eot|css|js|mjs|json|xml|html?|txt|pdf|zip|rar|7z|mp3|wav|ogg|flac|m4a)$/i;
+var IMAGE_EXT_RE = /\.(?:png|jpe?g|jfif|pjp|pjpeg|gif|webp|avif|bmp|ico|apng)$/i;
+var EXCLUDED_ASSET_EXT_RE = /\.(?:svg|woff2?|ttf|otf|eot|css|js|mjs|json|xml|html?|txt|pdf|zip|rar|7z|mp3|wav|ogg|flac|m4a)$/i;
 var EXCLUDED_DOMAIN_RE = /^(?:fonts\.googleapis\.com|fonts\.gstatic\.com|use\.fontawesome\.com|cdnjs\.cloudflare\.com)$/i;
 var BLOCKED_HOSTNAME_EXACT = new Set([
   "localhost",
@@ -565,6 +572,20 @@ function filterScanItemsForDownload(scan, filter) {
 }
 
 // src/ui/ui-helpers.ts
+function hasBalancedParens(value) {
+  let depth = 0;
+  for (let i = 0;i < value.length; i++) {
+    const ch = value[i];
+    if (ch === "(") {
+      depth++;
+    } else if (ch === ")") {
+      depth--;
+      if (depth < 0)
+        return false;
+    }
+  }
+  return depth === 0;
+}
 function sanitizeSafeMediaUrl(rawUrl) {
   if (!rawUrl || typeof rawUrl !== "string")
     return null;
@@ -576,7 +597,7 @@ function sanitizeSafeMediaUrl(rawUrl) {
       return null;
     return trimmed;
   }
-  if (/[\s"'\\<>`]/.test(trimmed))
+  if (/[\s"'\\<>`]/.test(trimmed) || !hasBalancedParens(trimmed))
     return null;
   try {
     const parsed = new URL(trimmed);
@@ -594,6 +615,43 @@ function safeOpenExternalUrl(rawUrl) {
     return false;
   window.open(safeUrl, "_blank", "noopener,noreferrer");
   return true;
+}
+function canOpenNativeCharacterEditor(ctx) {
+  const invoke = ctx?.host?.surfaces?.invoke;
+  return typeof invoke === "function";
+}
+async function openNativeCharacterEditor(ctx, characterId) {
+  const trimmedId = typeof characterId === "string" ? characterId.trim() : "";
+  if (!trimmedId)
+    return false;
+  const capCtx = ctx;
+  const invoke = capCtx?.host?.surfaces?.invoke;
+  if (typeof invoke !== "function")
+    return false;
+  try {
+    await invoke({ kind: "modal", id: "character_editor" }, { id: trimmedId });
+    return true;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes("PERMISSION_DENIED") && typeof capCtx?.permissions?.request === "function") {
+      try {
+        const granted = await capCtx.permissions.request(["characters"], {
+          reason: "Allow Media Localizer to open Lumiverse's native Character Editor for this card."
+        });
+        if (Array.isArray(granted) && granted.includes("characters")) {
+          await invoke({ kind: "modal", id: "character_editor" }, { id: trimmedId });
+          return true;
+        }
+      } catch {}
+    }
+    try {
+      await invoke({ kind: "route", id: "/characters/:id" }, { id: trimmedId });
+      return true;
+    } catch {
+      console.warn("[media_localizer] Failed to open native Character Editor:", err);
+      return false;
+    }
+  }
 }
 var ICON_PATHS = {
   download: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>',
@@ -620,7 +678,18 @@ var ICON_PATHS = {
   "arrow-up": '<line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/>',
   "arrow-down": '<line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/>',
   shuffle: '<polyline points="16 3 21 3 21 8"/><line x1="4" y1="20" x2="21" y2="3"/><polyline points="21 16 21 21 16 21"/><line x1="15" y1="15" x2="21" y2="21"/><line x1="4" y1="4" x2="9" y2="9"/>',
-  users: '<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>'
+  users: '<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>',
+  edit: '<path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/>',
+  search: '<circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>',
+  play: '<polygon points="6 4 20 12 6 20 6 4"/>',
+  smile: '<circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/>',
+  user: '<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>',
+  sliders: '<line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/>',
+  layers: '<polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/>',
+  folder: '<path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>',
+  database: '<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>',
+  shield: '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>',
+  filter: '<polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/>'
 };
 function createIcon(name, size = 14) {
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
@@ -655,10 +724,15 @@ function createIconButton(options) {
   return btn;
 }
 var activeTipCloseFn = null;
+var activeTipTrigger = null;
 var tipDocListenersAttached = false;
 function onTipDocumentClick(ev) {
   if (!activeTipCloseFn)
     return;
+  if (activeTipTrigger && activeTipTrigger.isConnected === false) {
+    activeTipCloseFn();
+    return;
+  }
   const target = ev.target;
   if (target && target.closest?.(".ml-tip-wrap.is-open")) {
     return;
@@ -666,7 +740,13 @@ function onTipDocumentClick(ev) {
   activeTipCloseFn();
 }
 function onTipDocumentKeyDown(ev) {
-  if (ev.key === "Escape" && activeTipCloseFn) {
+  if (!activeTipCloseFn)
+    return;
+  if (activeTipTrigger && activeTipTrigger.isConnected === false) {
+    activeTipCloseFn();
+    return;
+  }
+  if (ev.key === "Escape") {
     activeTipCloseFn();
   }
 }
@@ -701,13 +781,55 @@ function createInfoTip(text) {
   popover.className = "ml-tip-popover";
   popover.setAttribute("role", "tooltip");
   popover.textContent = text;
+  const updateTipAlignment = () => {
+    wrap.classList.remove("is-align-right");
+    popover.style.left = "";
+    popover.style.right = "";
+    popover.style.maxWidth = "";
+    if (typeof wrap.getBoundingClientRect !== "function")
+      return;
+    const wrapRect = wrap.getBoundingClientRect();
+    if (!wrapRect || wrapRect.width <= 0)
+      return;
+    const container = wrap.closest?.(".ml-drawer-body, .ml-gallery-host, .ml-widget");
+    const boundsRect = typeof container?.getBoundingClientRect === "function" ? container.getBoundingClientRect() : null;
+    const winWidth = typeof window !== "undefined" && typeof window.innerWidth === "number" ? window.innerWidth : 0;
+    const leftBound = boundsRect && boundsRect.width > 0 ? boundsRect.left + 8 : 8;
+    const rightBound = boundsRect && boundsRect.width > 0 ? boundsRect.right - 8 : winWidth > 0 ? winWidth - 8 : 0;
+    if (rightBound <= leftBound)
+      return;
+    const popRect = typeof popover.getBoundingClientRect === "function" ? popover.getBoundingClientRect() : null;
+    const clampedMaxWidth = Math.max(120, Math.floor(rightBound - leftBound));
+    const tipWidth = popRect && popRect.width > 0 ? popRect.width : Math.min(240, clampedMaxWidth);
+    if (wrapRect.left + tipWidth > rightBound) {
+      if (wrapRect.right - tipWidth >= leftBound) {
+        wrap.classList.add("is-align-right");
+      } else {
+        const targetLeft = Math.max(leftBound, Math.min(wrapRect.left, rightBound - Math.min(tipWidth, clampedMaxWidth)));
+        popover.style.left = `${Math.round(targetLeft - wrapRect.left)}px`;
+        popover.style.right = "auto";
+        popover.style.maxWidth = `${clampedMaxWidth}px`;
+      }
+    } else if (popRect && popRect.width > 0 && popRect.left < leftBound) {
+      const targetLeft = Math.max(leftBound, wrapRect.left);
+      popover.style.left = `${Math.round(targetLeft - wrapRect.left)}px`;
+      popover.style.right = "auto";
+      popover.style.maxWidth = `${clampedMaxWidth}px`;
+    }
+  };
   const close = () => {
-    wrap.classList.remove("is-open");
+    wrap.classList.remove("is-open", "is-align-right");
+    popover.style.left = "";
+    popover.style.right = "";
+    popover.style.maxWidth = "";
     if (activeTipCloseFn === close) {
       activeTipCloseFn = null;
+      activeTipTrigger = null;
       detachTipDocListeners();
     }
   };
+  wrap.addEventListener("pointerenter", updateTipAlignment);
+  btn.addEventListener("focus", updateTipAlignment);
   btn.addEventListener("click", (ev) => {
     ev.stopPropagation();
     ev.preventDefault();
@@ -720,7 +842,9 @@ function createInfoTip(text) {
     } else {
       wrap.classList.add("is-open");
       activeTipCloseFn = close;
+      activeTipTrigger = wrap;
       ensureTipDocListeners();
+      updateTipAlignment();
     }
   });
   wrap.append(btn, popover);
@@ -731,14 +855,19 @@ function isQueueActiveStatus(status) {
 }
 function renderQueueBanner(q, onQueueControl) {
   const banner = document.createElement("div");
-  banner.className = "ml-queue-banner";
+  const stateClass = q.status === "paused" ? "is-paused" : q.status === "cancelling" ? "is-cancelling" : "is-running";
+  banner.className = `ml-queue-banner ${stateClass}`;
   const topRow = document.createElement("div");
   topRow.className = "ml-header-bar";
-  const statusText = document.createElement("div");
-  statusText.style.fontWeight = "600";
+  const statusWrap = document.createElement("div");
+  statusWrap.className = "ml-inline-title";
+  const statusIcon = createIcon(q.status === "paused" ? "pause" : q.status === "cancelling" ? "rotate-ccw" : "download", 13);
+  const statusText = document.createElement("span");
+  statusText.className = "ml-queue-status-text";
   const pct = q.totalQueued > 0 ? Math.min(100, Math.round(q.completedCount / q.totalQueued * 100)) : 0;
   const stateLabel = q.status === "paused" ? "Paused" : q.status === "cancelling" ? "Stopping..." : "Downloading";
-  statusText.textContent = `${stateLabel}: ${q.completedCount} / ${q.totalQueued} (${pct}%) — ${q.succeededCount} saved, ${q.skippedCount} skipped, ${q.failedCount} failed`;
+  statusText.textContent = `${stateLabel}: ${q.completedCount} / ${q.totalQueued} (${pct}%)`;
+  statusWrap.append(statusIcon, statusText);
   const controls = document.createElement("div");
   controls.className = "ml-header-actions";
   if (q.status === "running") {
@@ -776,14 +905,26 @@ function renderQueueBanner(q, onQueueControl) {
   cancelBtn.title = "Immediately stop all active downloads and clear the queue";
   cancelBtn.addEventListener("click", () => void onQueueControl("cancel_all"));
   controls.appendChild(cancelBtn);
-  topRow.append(statusText, controls);
+  topRow.append(statusWrap, controls);
   const track = document.createElement("div");
   track.className = "ml-progress-track";
   const fill = document.createElement("div");
-  fill.className = "ml-progress-fill";
+  fill.className = q.status === "running" ? "ml-progress-fill is-active" : "ml-progress-fill";
   fill.style.width = `${pct}%`;
   track.appendChild(fill);
-  banner.append(topRow, track);
+  const statStrip = document.createElement("div");
+  statStrip.className = "ml-stat-strip";
+  const savedChip = document.createElement("span");
+  savedChip.className = "ml-stat-chip is-success";
+  savedChip.textContent = `${q.succeededCount} saved`;
+  const skippedChip = document.createElement("span");
+  skippedChip.className = "ml-stat-chip is-muted";
+  skippedChip.textContent = `${q.skippedCount} skipped`;
+  const failedChip = document.createElement("span");
+  failedChip.className = q.failedCount > 0 ? "ml-stat-chip is-danger" : "ml-stat-chip is-muted";
+  failedChip.textContent = `${q.failedCount} failed`;
+  statStrip.append(savedChip, skippedChip, failedChip);
+  banner.append(topRow, track, statStrip);
   if (q.activeUrls.length > 0) {
     const activeLine = document.createElement("div");
     activeLine.className = "ml-url-sources";
@@ -823,7 +964,7 @@ function renderSharedDownloadConfigControls(options) {
         cb.checked = true;
         return;
       }
-      options.onChange();
+      options.onChange(options.state);
     });
     const text = document.createElement("span");
     if (countInfo) {
@@ -853,7 +994,7 @@ function renderSharedDownloadConfigControls(options) {
         cb.checked = true;
         return;
       }
-      options.onChange();
+      options.onChange(options.state);
     });
     const span = document.createElement("span");
     span.textContent = kind === "image" ? "Images" : "Videos";
@@ -867,7 +1008,7 @@ function renderSharedDownloadConfigControls(options) {
   failedCb.checked = options.state.includeFailed;
   failedCb.addEventListener("change", () => {
     options.state.includeFailed = failedCb.checked;
-    options.onChange();
+    options.onChange(options.state);
   });
   const failedSpan = document.createElement("span");
   failedSpan.textContent = "Retry previously failed URLs";
@@ -885,9 +1026,11 @@ function renderSharedDownloadConfigControls(options) {
   capInput.max = "2000";
   capInput.value = String(options.state.batchCap);
   capInput.addEventListener("change", () => {
-    const parsed = Math.max(0, Math.floor(Number(capInput.value) || 0));
+    const rawNum = Number(capInput.value);
+    const parsed = Number.isFinite(rawNum) ? Math.min(2000, Math.max(0, Math.floor(rawNum))) : options.state.batchCap;
+    capInput.value = String(parsed);
     options.state.batchCap = parsed;
-    options.onChange();
+    options.onChange(options.state);
   });
   capLbl.append(capSpan, capInput, createInfoTip("Maximum URLs queued per batch (0 = unlimited)."));
   row.appendChild(capLbl);
@@ -1062,12 +1205,15 @@ function openMediaLightbox(items, startIndex, onAfterRemove) {
   const onKeyDown = (ev) => {
     if (ev.key === "Escape") {
       ev.preventDefault();
+      ev.stopPropagation();
       close();
     } else if (ev.key === "ArrowLeft") {
       ev.preventDefault();
+      ev.stopPropagation();
       step(-1);
     } else if (ev.key === "ArrowRight") {
       ev.preventDefault();
+      ev.stopPropagation();
       step(1);
     }
   };
@@ -1097,6 +1243,11 @@ function openMediaLightbox(items, startIndex, onAfterRemove) {
     idx = (idx + delta + workingItems.length) % workingItems.length;
     renderCurrent();
   }
+  function updateNavChrome() {
+    counterEl.textContent = `${idx + 1} / ${workingItems.length}`;
+    prevBtn.style.visibility = workingItems.length > 1 ? "visible" : "hidden";
+    nextBtn.style.visibility = workingItems.length > 1 ? "visible" : "hidden";
+  }
   function renderCurrent() {
     if (closed)
       return;
@@ -1105,14 +1256,12 @@ function openMediaLightbox(items, startIndex, onAfterRemove) {
       close();
       return;
     }
-    counterEl.textContent = `${idx + 1} / ${workingItems.length}`;
-    prevBtn.style.visibility = workingItems.length > 1 ? "visible" : "hidden";
-    nextBtn.style.visibility = workingItems.length > 1 ? "visible" : "hidden";
+    updateNavChrome();
     const safeLocalUrl = sanitizeSafeMediaUrl(item.localUrl);
     mediaSlot.innerHTML = "";
     if (!safeLocalUrl) {
       const blocked = document.createElement("div");
-      blocked.className = "ml-empty-hint";
+      blocked.className = "ml-empty";
       blocked.textContent = "Blocked unsafe media URL.";
       mediaSlot.appendChild(blocked);
     } else if (item.mediaKind === "video") {
@@ -1133,7 +1282,9 @@ function openMediaLightbox(items, startIndex, onAfterRemove) {
     metaCol.innerHTML = "";
     const titleRow = document.createElement("div");
     titleRow.className = "ml-lightbox-title";
-    titleRow.textContent = item.title;
+    const titleSpan = document.createElement("span");
+    titleSpan.textContent = item.title;
+    titleRow.appendChild(titleSpan);
     if (item.badgeText) {
       const badge = document.createElement("span");
       badge.className = "ml-badge is-info";
@@ -1174,6 +1325,21 @@ function openMediaLightbox(items, startIndex, onAfterRemove) {
       });
       actionsCol.appendChild(copyBtn);
     }
+    if (item.onEditCharacter) {
+      const editBtn = createIconButton({
+        icon: "edit",
+        label: "Edit Card",
+        title: "Open native Character Editor for this character",
+        className: "ml-btn is-sm",
+        size: 13,
+        onClick: () => {
+          const onEdit = item.onEditCharacter;
+          close();
+          onEdit?.();
+        }
+      });
+      actionsCol.appendChild(editBtn);
+    }
     if (!item.readOnly && item.onRemove) {
       const removeBtn = createIconButton({
         icon: "trash",
@@ -1193,6 +1359,7 @@ function openMediaLightbox(items, startIndex, onAfterRemove) {
             if (removeAt === -1) {
               removeAt = workingItems.findIndex((entry) => entry.id === item.id);
             }
+            const removedCurrentSlide = removeAt !== -1 && removeAt === idx;
             if (removeAt !== -1) {
               workingItems.splice(removeAt, 1);
               if (removeAt < idx) {
@@ -1208,7 +1375,11 @@ function openMediaLightbox(items, startIndex, onAfterRemove) {
               close();
             } else {
               idx = Math.max(0, Math.min(idx, workingItems.length - 1));
-              renderCurrent();
+              if (removedCurrentSlide) {
+                renderCurrent();
+              } else {
+                updateNavChrome();
+              }
             }
           } catch (err) {
             console.warn("[media_localizer] Failed removing lightbox item:", err);
@@ -1238,7 +1409,6 @@ function pruneDetachedThumbTargets() {
   for (const el of observedThumbElements) {
     if (el.isConnected === false) {
       sharedThumbObserver.unobserve(el);
-      thumbCallbacks.delete(el);
       observedThumbElements.delete(el);
     }
   }
@@ -1270,7 +1440,6 @@ function getThumbObserver() {
         if (!entry.isIntersecting) {
           if (entry.target.isConnected === false) {
             sharedThumbObserver?.unobserve(entry.target);
-            thumbCallbacks.delete(entry.target);
             observedThumbElements.delete(entry.target);
           }
           continue;
@@ -1282,13 +1451,53 @@ function getThumbObserver() {
         cb?.();
       }
       pruneDetachedThumbTargets();
-    }, { rootMargin: "220px" });
+    }, { rootMargin: "600px" });
   }
   return sharedThumbObserver;
+}
+function reobserveLazyMedia(root) {
+  if (!root)
+    return;
+  const candidates = [];
+  const rootTag = root.tagName;
+  if (typeof rootTag === "string") {
+    const lower = rootTag.toLowerCase();
+    if (lower === "img" || lower === "video") {
+      candidates.push(root);
+    }
+  }
+  const queried = root.querySelectorAll?.("img, video");
+  if (queried) {
+    for (const el of Array.from(queried)) {
+      candidates.push(el);
+    }
+  }
+  if (candidates.length === 0)
+    return;
+  const observer = getThumbObserver();
+  for (const el of candidates) {
+    const cb = thumbCallbacks.get(el);
+    if (!cb)
+      continue;
+    const currentSrc = typeof el.getAttribute === "function" ? el.getAttribute("src") : el.src;
+    if (currentSrc) {
+      thumbCallbacks.delete(el);
+      continue;
+    }
+    if (observer) {
+      if (!observedThumbElements.has(el)) {
+        observeThumbElement(observer, el, cb);
+      }
+    } else {
+      thumbCallbacks.delete(el);
+      cb();
+    }
+  }
 }
 function cleanupUiHelpers() {
   activeTipCloseFn?.();
   activeTipCloseFn = null;
+  activeTipTrigger = null;
   detachTipDocListeners();
   activeLightboxCloseFn?.();
   activeLightboxCloseFn = null;
@@ -1303,9 +1512,69 @@ function cleanupUiHelpers() {
   observedThumbElements.clear();
   thumbCallbacks = new WeakMap;
 }
+var LOCAL_IMAGE_THUMB_PATH_RE = /^\/api\/v1\/images\/(?!remote$|wallpapers$)[^/?#]+$/;
+var THUMBNAIL_SIZE_OPTIONS = [
+  "sm",
+  "md",
+  "lg"
+];
+var DEFAULT_THUMBNAIL_SIZE = "md";
+function sanitizeThumbnailSize(raw) {
+  return raw === "sm" || raw === "md" || raw === "lg" ? raw : DEFAULT_THUMBNAIL_SIZE;
+}
+function getThumbnailImageTier(size) {
+  return size === "lg" ? "lg" : "sm";
+}
+function getThumbnailSizeClass(size) {
+  return `is-thumb-${size}`;
+}
+var THUMBNAIL_SIZE_LABELS = {
+  sm: { short: "S", title: "Small thumbnails" },
+  md: { short: "M", title: "Medium thumbnails" },
+  lg: { short: "L", title: "Large thumbnails" }
+};
+function createThumbnailSizeSegmented(currentSize, onChange) {
+  let activeSize = currentSize;
+  const wrap = document.createElement("div");
+  wrap.className = "ml-segmented ml-thumb-size-segmented";
+  wrap.setAttribute("role", "group");
+  wrap.setAttribute("aria-label", "Thumbnail size");
+  const buttons = new Map;
+  const syncActive = () => {
+    for (const [sz, button] of buttons) {
+      const isAct = sz === activeSize;
+      button.className = `ml-btn is-xs${isAct ? " is-active" : ""}`;
+      button.setAttribute("aria-pressed", isAct ? "true" : "false");
+    }
+  };
+  for (const size of THUMBNAIL_SIZE_OPTIONS) {
+    const meta = THUMBNAIL_SIZE_LABELS[size];
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.textContent = meta.short;
+    btn.title = meta.title;
+    btn.setAttribute("aria-label", meta.title);
+    btn.addEventListener("click", () => {
+      if (size === activeSize)
+        return;
+      activeSize = size;
+      syncActive();
+      onChange(size);
+    });
+    buttons.set(size, btn);
+    wrap.appendChild(btn);
+  }
+  syncActive();
+  return wrap;
+}
+function toThumbnailMediaUrl(safeSrc, mediaKind = "image", tier = "sm") {
+  if (!safeSrc || mediaKind !== "image")
+    return safeSrc;
+  return LOCAL_IMAGE_THUMB_PATH_RE.test(safeSrc) ? `${safeSrc}?size=${tier}` : safeSrc;
+}
 function createLazyMediaElement(options) {
   const safeSrc = sanitizeSafeMediaUrl(options.src);
-  const observer = safeSrc ? getThumbObserver() : null;
+  const observer = safeSrc && !options.eager ? getThumbObserver() : null;
   if (options.mediaKind === "video") {
     const vid = document.createElement("video");
     vid.className = options.className;
@@ -1317,6 +1586,7 @@ function createLazyMediaElement(options) {
     if (safeSrc) {
       if (observer) {
         observeThumbElement(observer, vid, () => {
+          thumbCallbacks.delete(vid);
           vid.src = safeSrc;
         });
       } else {
@@ -1325,27 +1595,169 @@ function createLazyMediaElement(options) {
     }
     return vid;
   }
+  const thumbSrc = toThumbnailMediaUrl(safeSrc, "image", options.thumbTier ?? "sm");
   const img = document.createElement("img");
   img.className = options.className;
-  img.loading = "lazy";
+  img.loading = "eager";
   img.decoding = "async";
   img.alt = options.alt;
   if (options.title)
     img.title = options.title;
-  if (safeSrc) {
+  if (thumbSrc) {
     if (observer) {
       observeThumbElement(observer, img, () => {
-        img.src = safeSrc;
+        thumbCallbacks.delete(img);
+        img.src = thumbSrc;
       });
     } else {
-      img.src = safeSrc;
+      img.src = thumbSrc;
     }
   }
   return img;
 }
+var SCROLLABLE_OVERFLOW_VALUES = new Set(["auto", "scroll", "overlay"]);
+function isAncestorOrSelf(ancestor, node) {
+  let cur = node;
+  while (cur) {
+    if (cur === ancestor)
+      return true;
+    cur = cur.parentElement;
+  }
+  return false;
+}
+function isElementScrollable(el) {
+  if (!el || typeof el.scrollTop !== "number" || !Number.isFinite(el.scrollTop)) {
+    return false;
+  }
+  if (el.scrollTop > 0) {
+    return true;
+  }
+  const hasOverflow = typeof el.scrollHeight === "number" && typeof el.clientHeight === "number" && el.clientHeight > 0 && el.scrollHeight > el.clientHeight + 1;
+  if (!hasOverflow) {
+    return false;
+  }
+  const doc = typeof document !== "undefined" ? document : undefined;
+  if (doc && (el === doc.scrollingElement || el === doc.documentElement)) {
+    return true;
+  }
+  if (typeof getComputedStyle === "function") {
+    try {
+      const computedOverflowY = getComputedStyle(el).overflowY;
+      if (computedOverflowY) {
+        return SCROLLABLE_OVERFLOW_VALUES.has(computedOverflowY);
+      }
+    } catch {}
+  }
+  const inlineOverflowY = el.style?.overflowY;
+  if (inlineOverflowY) {
+    return SCROLLABLE_OVERFLOW_VALUES.has(inlineOverflowY);
+  }
+  return true;
+}
+function resolveScrollContainer(startEl, rememberedEl, fallbackEl) {
+  let cur = startEl;
+  while (cur) {
+    if (isElementScrollable(cur)) {
+      return cur;
+    }
+    cur = cur.parentElement;
+  }
+  const docScrollEl = typeof document !== "undefined" ? document.scrollingElement : null;
+  if (docScrollEl && isElementScrollable(docScrollEl)) {
+    return docScrollEl;
+  }
+  if (rememberedEl && startEl && isAncestorOrSelf(rememberedEl, startEl) && typeof rememberedEl.scrollTop === "number") {
+    return rememberedEl;
+  }
+  return fallbackEl ?? startEl;
+}
+function applyScrollTopWithSettlement(getContainer, scrollTop, prevPending, shouldAbort) {
+  prevPending?.cancel();
+  const next = Number.isFinite(scrollTop) && scrollTop >= 0 ? scrollTop : 0;
+  const host = getContainer();
+  if (!host || typeof host.scrollTop !== "number") {
+    return null;
+  }
+  host.scrollTop = next;
+  if (next <= 0 || typeof requestAnimationFrame !== "function") {
+    return null;
+  }
+  const afterSync = Number.isFinite(host.scrollTop) ? host.scrollTop : 0;
+  let cancelled = false;
+  let rafId = 0;
+  let followUpRafId = 0;
+  const cancel = () => {
+    if (cancelled)
+      return;
+    cancelled = true;
+    if (typeof cancelAnimationFrame === "function") {
+      if (rafId)
+        cancelAnimationFrame(rafId);
+      if (followUpRafId)
+        cancelAnimationFrame(followUpRafId);
+    }
+  };
+  const reapplyIfClamped = () => {
+    if (cancelled || shouldAbort?.())
+      return next;
+    const target = getContainer();
+    if (!target || typeof target.scrollTop !== "number")
+      return next;
+    const current = Number.isFinite(target.scrollTop) ? target.scrollTop : 0;
+    if (current < next && (afterSync < next || current === 0)) {
+      target.scrollTop = next;
+      return Number.isFinite(target.scrollTop) ? target.scrollTop : 0;
+    }
+    return current;
+  };
+  rafId = requestAnimationFrame(() => {
+    rafId = 0;
+    const current = reapplyIfClamped();
+    if (!cancelled && !shouldAbort?.() && current < next && (afterSync < next || current === 0)) {
+      followUpRafId = requestAnimationFrame(() => {
+        followUpRafId = 0;
+        reapplyIfClamped();
+      });
+    }
+  });
+  return { cancel };
+}
+var GALLERY_PREFS_STORAGE_KEY = "lumiverse.media_localizer.gallery_prefs.v1";
+var CHARACTER_PREFS_STORAGE_KEY = "lumiverse.media_localizer.character_prefs.v1";
+function loadPrefsFromStorage(key, sanitize, fallback) {
+  try {
+    const raw = globalThis.localStorage?.getItem?.(key);
+    if (!raw)
+      return fallback();
+    return sanitize(JSON.parse(raw));
+  } catch {
+    return fallback();
+  }
+}
+function savePrefsToStorage(key, prefs) {
+  try {
+    globalThis.localStorage?.setItem?.(key, JSON.stringify(prefs));
+  } catch {}
+}
 
 // src/ui/display-swapper.ts
 var CSS_URL_RE = /\burl\(\s*(?:"([^"]+)"|'([^']+)'|([^)"'\s]+))\s*\)/gi;
+var SWAPPABLE_MEDIA_TAGS = new Set([
+  "img",
+  "video",
+  "audio",
+  "source",
+  "image"
+]);
+function isElementNode(node) {
+  return Boolean(node && node.nodeType === 1);
+}
+function isSwappableMediaElement(target) {
+  if (!isElementNode(target))
+    return false;
+  const tag = typeof target.tagName === "string" ? target.tagName.toLowerCase() : "";
+  return SWAPPABLE_MEDIA_TAGS.has(tag);
+}
 
 class NonDestructiveDisplaySwapper {
   ctx;
@@ -1361,6 +1773,7 @@ class NonDestructiveDisplaySwapper {
   timeoutId = null;
   stopped = false;
   iframeLoadListeners = new Map;
+  iframeDocTrackers = new Map;
   constructor(ctx) {
     this.ctx = ctx;
   }
@@ -1384,9 +1797,8 @@ class NonDestructiveDisplaySwapper {
     }
     if (typeof document !== "undefined") {
       this.errorListener = (event) => {
-        const target = event.target;
-        if (target instanceof HTMLImageElement || target instanceof HTMLVideoElement || typeof HTMLAudioElement !== "undefined" && target instanceof HTMLAudioElement || target instanceof HTMLSourceElement || typeof SVGImageElement !== "undefined" && target instanceof SVGImageElement) {
-          this.decorateMediaElement(target, this.getActiveCharacterIds());
+        if (isSwappableMediaElement(event.target)) {
+          this.decorateMediaElement(event.target, this.getActiveCharacterIds());
         }
       };
       document.addEventListener("error", this.errorListener, true);
@@ -1394,10 +1806,10 @@ class NonDestructiveDisplaySwapper {
   }
   isRelevantMutation(r) {
     const target = r.target;
-    const targetEl = target instanceof Element ? target : target.parentElement ?? null;
-    if (targetEl?.closest(".ml-gallery-host, .ml-drawer-root"))
+    const targetEl = isElementNode(target) ? target : target?.parentElement ?? null;
+    if (targetEl?.closest?.(".ml-gallery-host, .ml-drawer-root"))
       return false;
-    if (r.type === "attributes" && target instanceof Element) {
+    if (r.type === "attributes" && isElementNode(target)) {
       const name = r.attributeName ?? "";
       if (name === "style") {
         const style = target.getAttribute("style") ?? "";
@@ -1415,7 +1827,7 @@ class NonDestructiveDisplaySwapper {
         if (n.nodeType === 1)
           return true;
       }
-      return targetEl?.tagName === "STYLE";
+      return targetEl?.tagName?.toLowerCase() === "style";
     }
     return true;
   }
@@ -1442,6 +1854,9 @@ class NonDestructiveDisplaySwapper {
       iframe.removeEventListener("load", listener);
     }
     this.iframeLoadListeners.clear();
+    for (const iframe of Array.from(this.iframeDocTrackers.keys())) {
+      this.cleanupIframeDocTracker(iframe);
+    }
     if (typeof document !== "undefined" && document.body) {
       this.revertContainer(document.body);
       this.processSameOriginIframes([], true);
@@ -1537,6 +1952,63 @@ class NonDestructiveDisplaySwapper {
     this.decorateContainer(document.body, activeCharIds);
     this.processSameOriginIframes(activeCharIds, false);
   }
+  cleanupIframeDocTracker(iframe) {
+    const tracked = this.iframeDocTrackers.get(iframe);
+    if (!tracked)
+      return;
+    tracked.observer?.disconnect();
+    if (tracked.errorListener) {
+      try {
+        tracked.doc.removeEventListener?.("error", tracked.errorListener, true);
+      } catch {}
+    }
+    this.iframeDocTrackers.delete(iframe);
+  }
+  ensureIframeDocListeners(iframe, doc) {
+    const existing = this.iframeDocTrackers.get(iframe);
+    if (existing && existing.doc === doc) {
+      return;
+    }
+    if (existing) {
+      this.cleanupIframeDocTracker(iframe);
+    }
+    let observer = null;
+    const observeRoot = doc.documentElement ?? doc.body;
+    if (typeof MutationObserver !== "undefined" && observeRoot) {
+      observer = new MutationObserver((records) => {
+        if (!this.stopped && records.some((r) => this.isRelevantMutation(r))) {
+          this.schedulePass();
+        }
+      });
+      observer.observe(observeRoot, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: [
+          "src",
+          "data-src",
+          "srcset",
+          "href",
+          "xlink:href",
+          "poster",
+          "style",
+          "srcdoc"
+        ]
+      });
+    }
+    let errorListener = null;
+    if (typeof doc.addEventListener === "function") {
+      errorListener = (event) => {
+        if (this.stopped)
+          return;
+        if (isSwappableMediaElement(event.target)) {
+          this.decorateMediaElement(event.target, this.getActiveCharacterIds());
+        }
+      };
+      doc.addEventListener("error", errorListener, true);
+    }
+    this.iframeDocTrackers.set(iframe, { doc, observer, errorListener });
+  }
   processSameOriginIframes(activeCharIds, revertOnly) {
     if (typeof document === "undefined")
       return;
@@ -1545,6 +2017,11 @@ class NonDestructiveDisplaySwapper {
         if (trackedIframe.isConnected === false) {
           trackedIframe.removeEventListener("load", listener);
           this.iframeLoadListeners.delete(trackedIframe);
+        }
+      }
+      for (const trackedIframe of Array.from(this.iframeDocTrackers.keys())) {
+        if (trackedIframe.isConnected === false) {
+          this.cleanupIframeDocTracker(trackedIframe);
         }
       }
     }
@@ -1563,14 +2040,20 @@ class NonDestructiveDisplaySwapper {
       }
       try {
         const doc = iframe.contentDocument;
-        if (!doc || !doc.body)
+        if (!doc || !doc.body) {
+          this.cleanupIframeDocTracker(iframe);
           continue;
-        if (revertOnly) {
-          this.revertContainer(doc.documentElement);
-        } else {
-          this.decorateContainer(doc.documentElement, activeCharIds);
         }
-      } catch {}
+        const root = doc.documentElement ?? doc.body;
+        if (revertOnly) {
+          this.revertContainer(root);
+        } else {
+          this.ensureIframeDocListeners(iframe, doc);
+          this.decorateContainer(root, activeCharIds);
+        }
+      } catch {
+        this.cleanupIframeDocTracker(iframe);
+      }
     }
   }
   resolveBase(el, name, current) {
@@ -1639,9 +2122,11 @@ class NonDestructiveDisplaySwapper {
   }
   decorateMediaElement(el, activeCharIds) {
     const srcChanged = this.decorateUrlAttribute(el, "src", activeCharIds);
-    if (srcChanged && typeof HTMLSourceElement !== "undefined" && el instanceof HTMLSourceElement && (typeof HTMLVideoElement !== "undefined" && el.parentElement instanceof HTMLVideoElement || typeof HTMLAudioElement !== "undefined" && el.parentElement instanceof HTMLAudioElement)) {
+    const elTag = el.tagName?.toLowerCase() ?? "";
+    const parentTag = el.parentElement?.tagName?.toLowerCase() ?? "";
+    if (srcChanged && elTag === "source" && (parentTag === "video" || parentTag === "audio")) {
       try {
-        el.parentElement.load();
+        el.parentElement.load?.();
       } catch {}
     }
     if (el.hasAttribute("data-src") || el.hasAttribute("data-ml-original-data-src")) {
@@ -1663,7 +2148,7 @@ class NonDestructiveDisplaySwapper {
         }
       }
     }
-    if (el.tagName.toLowerCase() === "image") {
+    if (elTag === "image") {
       if (el.hasAttribute("href") || el.hasAttribute("data-ml-original-href")) {
         this.decorateUrlAttribute(el, "href", activeCharIds);
       }
@@ -1671,7 +2156,7 @@ class NonDestructiveDisplaySwapper {
         this.decorateUrlAttribute(el, "xlink:href", activeCharIds);
       }
     }
-    if (typeof HTMLVideoElement !== "undefined" && el instanceof HTMLVideoElement) {
+    if (elTag === "video") {
       this.decorateUrlAttribute(el, "poster", activeCharIds);
     }
   }
@@ -1724,6 +2209,9 @@ class NonDestructiveDisplaySwapper {
       if (styleEl.closest(".ml-gallery-host, .ml-drawer-root"))
         continue;
       const currentCss = styleEl.textContent ?? "";
+      if (!currentCss.toLowerCase().includes("url(") && !styleEl.hasAttribute("data-ml-original-css")) {
+        continue;
+      }
       const baseCss = this.resolveBase(styleEl, "css", currentCss);
       if (!baseCss || !baseCss.toLowerCase().includes("url("))
         continue;
@@ -1787,7 +2275,8 @@ function getDefaultCharacterPreferences(defaultExpandDownloadedMedia = true) {
     showRemoteThumbnails: false,
     mediaViewMode: "grid",
     mediaFilter: "all",
-    showDownloadedMedia: defaultExpandDownloadedMedia
+    showDownloadedMedia: defaultExpandDownloadedMedia,
+    thumbnailSize: DEFAULT_THUMBNAIL_SIZE
   };
 }
 function sanitizeCharacterPreferences(raw, defaultExpandDownloadedMedia = true) {
@@ -1804,7 +2293,8 @@ function sanitizeCharacterPreferences(raw, defaultExpandDownloadedMedia = true) 
     showRemoteThumbnails: typeof obj.showRemoteThumbnails === "boolean" ? obj.showRemoteThumbnails : defaults.showRemoteThumbnails,
     mediaViewMode: obj.mediaViewMode === "list" ? "list" : "grid",
     mediaFilter,
-    showDownloadedMedia: typeof obj.showDownloadedMedia === "boolean" ? obj.showDownloadedMedia : defaults.showDownloadedMedia
+    showDownloadedMedia: typeof obj.showDownloadedMedia === "boolean" ? obj.showDownloadedMedia : defaults.showDownloadedMedia,
+    thumbnailSize: sanitizeThumbnailSize(obj.thumbnailSize)
   };
 }
 function sameSetAsList(set, list) {
@@ -1837,6 +2327,7 @@ class CharacterMediaWidget {
   mediaViewMode = "grid";
   mediaFilter = "all";
   showDownloadedMedia = true;
+  thumbnailSize = DEFAULT_THUMBNAIL_SIZE;
   queueBannerEl = null;
   selectedSections = new Set;
   selectedGreetings = null;
@@ -1853,6 +2344,8 @@ class CharacterMediaWidget {
   pendingOverrideSave = null;
   inFlightOverrideSaves = new Map;
   refreshBtnEl = null;
+  mediaTileCache = new Map;
+  tileClickHandlers = new WeakMap;
   scanGeneration = 0;
   destroyed = false;
   constructor(root, ctx, characterId, settings, queueProgress, callbacks, options = {}) {
@@ -1874,6 +2367,7 @@ class CharacterMediaWidget {
     this.mediaViewMode = prefs.mediaViewMode;
     this.mediaFilter = prefs.mediaFilter;
     this.showDownloadedMedia = options.initialUiState?.showDownloadedMedia !== undefined ? prefs.showDownloadedMedia : defaultExpandDownloaded;
+    this.thumbnailSize = prefs.thumbnailSize;
     if (Array.isArray(options.initialUiState?.expandedUrls)) {
       this.expandedUrls = new Set(options.initialUiState.expandedUrls);
     }
@@ -1892,6 +2386,7 @@ class CharacterMediaWidget {
       mediaViewMode: this.mediaViewMode,
       mediaFilter: this.mediaFilter,
       showDownloadedMedia: this.showDownloadedMedia,
+      thumbnailSize: this.thumbnailSize,
       expandedUrls: Array.from(this.expandedUrls)
     });
   }
@@ -1931,6 +2426,7 @@ class CharacterMediaWidget {
     this.destroyed = true;
     this.scanGeneration++;
     this.refreshBtnEl = null;
+    this.mediaTileCache.clear();
     this.flushPendingOverrideSave();
   }
   getCharacterId() {
@@ -1952,6 +2448,10 @@ class CharacterMediaWidget {
       return;
     if (this.characterId !== nextId) {
       this.flushPendingOverrideSave();
+      this.mediaTileCache.clear();
+      for (const el of this.root.querySelectorAll("[data-scroll-id]")) {
+        el.scrollTop = 0;
+      }
       if (this.expandedUrls.size > 0) {
         this.expandedUrls.clear();
         this.emitUiStateChange();
@@ -1963,7 +2463,57 @@ class CharacterMediaWidget {
     this.filtersInitializedForChar = null;
     this.refreshScan(false);
   }
-  updateExternalState(settings, queueProgress) {
+  applySharedPreferences(prefs) {
+    if (this.destroyed || !prefs || typeof prefs !== "object")
+      return;
+    const sanitized = sanitizeCharacterPreferences({
+      showDownloadConfig: this.showDownloadConfig,
+      showGreetingSubfilter: this.showGreetingSubfilter,
+      showWorldBookSubfilter: this.showWorldBookSubfilter,
+      showUrlPicker: this.showUrlPicker,
+      showRemoteThumbnails: this.showRemoteThumbnails,
+      mediaViewMode: this.mediaViewMode,
+      mediaFilter: this.mediaFilter,
+      showDownloadedMedia: this.showDownloadedMedia,
+      thumbnailSize: this.thumbnailSize,
+      ...prefs
+    });
+    let changed = false;
+    if (prefs.showGreetingSubfilter !== undefined && sanitized.showGreetingSubfilter !== this.showGreetingSubfilter) {
+      this.showGreetingSubfilter = sanitized.showGreetingSubfilter;
+      changed = true;
+    }
+    if (prefs.showWorldBookSubfilter !== undefined && sanitized.showWorldBookSubfilter !== this.showWorldBookSubfilter) {
+      this.showWorldBookSubfilter = sanitized.showWorldBookSubfilter;
+      changed = true;
+    }
+    if (prefs.showUrlPicker !== undefined && sanitized.showUrlPicker !== this.showUrlPicker) {
+      this.showUrlPicker = sanitized.showUrlPicker;
+      changed = true;
+    }
+    if (prefs.showRemoteThumbnails !== undefined && sanitized.showRemoteThumbnails !== this.showRemoteThumbnails) {
+      this.showRemoteThumbnails = sanitized.showRemoteThumbnails;
+      changed = true;
+    }
+    if (prefs.mediaViewMode !== undefined && sanitized.mediaViewMode !== this.mediaViewMode) {
+      this.mediaViewMode = sanitized.mediaViewMode;
+      this.mediaTileCache.clear();
+      changed = true;
+    }
+    if (prefs.mediaFilter !== undefined && sanitized.mediaFilter !== this.mediaFilter) {
+      this.mediaFilter = sanitized.mediaFilter;
+      changed = true;
+    }
+    if (prefs.thumbnailSize !== undefined && sanitized.thumbnailSize !== this.thumbnailSize) {
+      this.thumbnailSize = sanitized.thumbnailSize;
+      this.mediaTileCache.clear();
+      changed = true;
+    }
+    if (changed) {
+      this.render();
+    }
+  }
+  updateExternalState(settings, queueProgress, forceRefresh = false) {
     if (this.destroyed)
       return;
     const prevSettings = this.settings;
@@ -1978,8 +2528,8 @@ class CharacterMediaWidget {
     }
     const wasActive = isQueueActiveStatus(prevStatus);
     const nowActive = isQueueActiveStatus(queueProgress.status);
-    if (wasActive && !nowActive || scanSettingsChanged && this.scan) {
-      this.refreshScan(scanSettingsChanged);
+    if (wasActive && !nowActive || scanSettingsChanged && this.scan || forceRefresh) {
+      this.refreshScan(scanSettingsChanged || forceRefresh);
       return;
     }
     if (!this.options.inDrawer && this.queueBannerEl && nowActive) {
@@ -2224,11 +2774,18 @@ class CharacterMediaWidget {
     this.queueBannerEl = null;
     this.refreshBtnEl = null;
     const wrap = document.createElement("div");
-    wrap.className = "ml-widget";
+    const thumbClass = getThumbnailSizeClass(this.thumbnailSize);
+    wrap.className = this.options.inDrawer === true ? `ml-widget is-drawer ${thumbClass}` : this.options.inDrawer === false ? `ml-widget is-embedded ${thumbClass}` : `ml-widget ${thumbClass}`;
     if (!this.characterId) {
       const empty = document.createElement("div");
-      empty.className = "ml-section ml-empty";
-      empty.textContent = "Open a character chat or editor to manage its media.";
+      empty.className = "ml-section ml-empty ml-empty-card";
+      const iconWrap = document.createElement("div");
+      iconWrap.className = "ml-empty-icon";
+      iconWrap.appendChild(createIcon("image", 20));
+      const textEl = document.createElement("div");
+      textEl.className = "ml-empty-text";
+      textEl.textContent = "Open a character chat or editor to manage its media.";
+      empty.append(iconWrap, textEl);
       wrap.appendChild(empty);
       this.root.appendChild(wrap);
       return;
@@ -2236,7 +2793,9 @@ class CharacterMediaWidget {
     if (this.error) {
       const err = document.createElement("div");
       err.className = "ml-error-banner";
-      err.textContent = this.error;
+      const errText = document.createElement("span");
+      errText.textContent = this.error;
+      err.append(createIcon("alert", 14), errText);
       wrap.appendChild(err);
     }
     if (!this.options.inDrawer && isQueueActiveStatus(this.queueProgress.status)) {
@@ -2245,19 +2804,34 @@ class CharacterMediaWidget {
     }
     if (this.loading && !this.scan) {
       const loadingEl = document.createElement("div");
-      loadingEl.className = "ml-section ml-empty";
-      loadingEl.textContent = "Scanning character media...";
+      loadingEl.className = "ml-section ml-empty ml-loading-card";
+      const iconWrap = document.createElement("div");
+      iconWrap.className = "ml-empty-icon";
+      iconWrap.appendChild(createIcon("refresh", 18));
+      const textEl = document.createElement("div");
+      textEl.className = "ml-empty-text";
+      textEl.textContent = "Scanning character media...";
+      loadingEl.append(iconWrap, textEl);
       wrap.appendChild(loadingEl);
       this.root.appendChild(wrap);
       return;
     }
     if (!this.scan) {
-      const retry = document.createElement("button");
-      retry.type = "button";
-      retry.className = "ml-btn is-primary";
-      retry.textContent = "Scan Character Media";
-      retry.addEventListener("click", () => void this.refreshScan(true));
-      wrap.appendChild(retry);
+      const retryCard = document.createElement("div");
+      retryCard.className = "ml-section ml-empty ml-empty-card";
+      const iconWrap = document.createElement("div");
+      iconWrap.className = "ml-empty-icon";
+      iconWrap.appendChild(createIcon("search", 18));
+      const retry = createIconButton({
+        icon: "refresh",
+        label: "Scan Character Media",
+        title: "Scan character fields, linked World Books, and Regex scripts",
+        className: "ml-btn is-primary",
+        size: 13,
+        onClick: () => void this.refreshScan(true)
+      });
+      retryCard.append(iconWrap, retry);
+      wrap.appendChild(retryCard);
       this.root.appendChild(wrap);
       return;
     }
@@ -2266,9 +2840,6 @@ class CharacterMediaWidget {
     const selectedPending = candidateItems.filter((i) => !this.excludedUrls.has(i.normalizedUrl));
     const effectivePendingCount = this.batchCap > 0 ? Math.min(selectedPending.length, this.batchCap) : selectedPending.length;
     wrap.appendChild(this.renderHeaderSection(scan, effectivePendingCount, selectedPending.length));
-    if (this.showDownloadConfig) {
-      wrap.appendChild(this.renderOptionsSection(scan, candidateItems, selectedPending, effectivePendingCount));
-    }
     const failedEntries = scan.items.filter((i) => i.status === "failed" && !this.excludedUrls.has(i.normalizedUrl)).map((i) => ({
       normalizedUrl: i.normalizedUrl,
       error: i.failureInfo?.error || "Download failed",
@@ -2299,7 +2870,7 @@ class CharacterMediaWidget {
     if (failedPanel) {
       wrap.appendChild(failedPanel);
     }
-    wrap.appendChild(this.renderMediaGallerySection(scan));
+    wrap.appendChild(this.renderCombinedOptionsAndMediaSection(scan, candidateItems, selectedPending, effectivePendingCount));
     this.root.appendChild(wrap);
     this.restoreScrollState(scrollState);
   }
@@ -2313,13 +2884,19 @@ class CharacterMediaWidget {
     header.className = "ml-section ml-char-header";
     const identityRow = document.createElement("div");
     identityRow.className = "ml-char-identity";
-    const safeAvatarUrl = sanitizeSafeMediaUrl(scan.media?.avatarUrl);
+    const safeAvatarUrl = this.options.inDrawer !== false ? sanitizeSafeMediaUrl(scan.media?.avatarUrl) : null;
     if (safeAvatarUrl) {
       const avatar = document.createElement("img");
       avatar.className = "ml-char-avatar";
       avatar.src = safeAvatarUrl;
       avatar.alt = scan.characterName;
       identityRow.appendChild(avatar);
+    } else if (this.options.inDrawer !== false) {
+      const avatarFallback = document.createElement("div");
+      avatarFallback.className = "ml-char-avatar-fallback";
+      avatarFallback.setAttribute("aria-hidden", "true");
+      avatarFallback.appendChild(createIcon("user", 18));
+      identityRow.appendChild(avatarFallback);
     }
     const titleCol = document.createElement("div");
     titleCol.className = "ml-char-meta";
@@ -2328,8 +2905,9 @@ class CharacterMediaWidget {
     const titleGroup = document.createElement("div");
     titleGroup.className = "ml-inline-title";
     const nameEl = document.createElement("span");
-    nameEl.className = "ml-title";
+    nameEl.className = "ml-title ml-char-name";
     nameEl.textContent = scan.characterName;
+    nameEl.title = scan.characterName;
     titleGroup.append(nameEl, createInfoTip("Localized media is automatically displayed instead of remote URLs while keeping your character card untouched."));
     if (this.hasCustomOverride) {
       const customBadge = document.createElement("span");
@@ -2344,27 +2922,16 @@ class CharacterMediaWidget {
       icon: "download",
       label: effectivePendingCount > 0 ? effectivePendingCount < totalMatchedCount ? `Localize (${effectivePendingCount}/${totalMatchedCount})` : `Localize (${effectivePendingCount})` : "Localized",
       title: effectivePendingCount > 0 ? `Download ${effectivePendingCount} remote media file(s) using ${this.hasCustomOverride ? "custom card options" : "global download defaults"}` : "No pending remote media matches the current filter options",
-      className: `ml-btn ${effectivePendingCount > 0 ? "is-primary" : ""}`,
-      size: 14,
+      className: `ml-btn is-sm ${effectivePendingCount > 0 ? "is-primary" : ""}`,
+      size: 13,
       disabled: effectivePendingCount === 0,
       onClick: () => void this.triggerOneClickLocalize()
-    });
-    const gearBtn = createIconButton({
-      icon: "settings",
-      title: this.showDownloadConfig ? "Hide download options & URL inspector" : "Customize per-card download options & inspect individual URLs",
-      className: `ml-btn ml-icon-btn ${this.showDownloadConfig ? "is-active" : ""}`,
-      size: 14,
-      onClick: () => {
-        this.showDownloadConfig = !this.showDownloadConfig;
-        this.emitUiStateChange();
-        this.render();
-      }
     });
     const refreshBtn = createIconButton({
       icon: "refresh",
       title: "Rescan character fields, linked World Books, and Regex scripts",
-      className: `ml-btn ml-icon-btn ${this.loading ? "is-busy" : ""}`,
-      size: 14,
+      className: `ml-btn ml-icon-btn is-sm ${this.loading ? "is-busy" : ""}`,
+      size: 13,
       disabled: this.loading,
       onClick: () => {
         if (this.loading)
@@ -2373,30 +2940,61 @@ class CharacterMediaWidget {
       }
     });
     this.refreshBtnEl = refreshBtn;
-    actions.append(localizeBtn, gearBtn, refreshBtn);
+    actions.appendChild(localizeBtn);
+    if (this.callbacks.onOpenCharacterEditor) {
+      const editBtn = createIconButton({
+        icon: "edit",
+        label: "Edit",
+        title: "Open native Character Editor for this character",
+        className: "ml-btn is-sm",
+        size: 13,
+        onClick: () => this.callbacks.onOpenCharacterEditor?.(scan.characterId)
+      });
+      actions.appendChild(editBtn);
+    }
+    actions.appendChild(refreshBtn);
     titleLine.append(titleGroup, actions);
     const statusLine = document.createElement("div");
     statusLine.className = "ml-status-row";
-    const addBadge = (text, variant = "") => {
+    const addBadge = (text, variant = "", icon) => {
       const b = document.createElement("span");
       b.className = `ml-badge ${variant}`.trim();
-      b.textContent = text;
+      const textSpan = document.createElement("span");
+      textSpan.textContent = text;
+      if (icon) {
+        b.append(createIcon(icon, 11), textSpan);
+      } else {
+        b.appendChild(textSpan);
+      }
       statusLine.appendChild(b);
     };
-    addBadge(`${localizedItems.length} localized${totalBytes > 0 ? ` (${formatBytes(totalBytes)})` : ""}`, localizedItems.length > 0 ? "is-success" : "");
-    addBadge(`${remoteCount} remote`, remoteCount > 0 ? "is-warn" : "");
+    addBadge(`${localizedItems.length} localized${totalBytes > 0 ? ` (${formatBytes(totalBytes)})` : ""}`, localizedItems.length > 0 ? "is-local" : "is-muted", localizedItems.length > 0 ? "check" : undefined);
+    if (remoteCount > 0 || localizedItems.length === 0 && failedCount === 0) {
+      addBadge(`${remoteCount} remote`, remoteCount > 0 ? "is-remote" : "is-muted", remoteCount > 0 ? "download" : undefined);
+    }
     if (failedCount > 0)
-      addBadge(`${failedCount} failed`, "is-danger");
+      addBadge(`${failedCount} failed`, "is-failed", "alert");
     if (exprCount > 0)
-      addBadge(`${exprCount} expressions`, "is-info");
+      addBadge(`${exprCount} expr`, "is-info", "sparkles");
     titleCol.append(titleLine, statusLine);
+    if (scan.items.length > 0) {
+      const pct = Math.min(100, Math.round(localizedItems.length / scan.items.length * 100));
+      const progress = document.createElement("div");
+      progress.className = "ml-mini-progress";
+      progress.title = `${localizedItems.length} of ${scan.items.length} scanned URLs localized (${pct}%)`;
+      const fill = document.createElement("div");
+      fill.className = "ml-mini-progress-fill";
+      fill.style.width = `${pct}%`;
+      progress.appendChild(fill);
+      titleCol.appendChild(progress);
+    }
     identityRow.appendChild(titleCol);
     header.appendChild(identityRow);
     return header;
   }
   renderOptionsSection(scan, candidateItems, selectedPending, effectivePendingCount) {
     const container = document.createElement("div");
-    container.className = "ml-section ml-options-panel";
+    container.className = "ml-combined-pane ml-options-panel";
     const top = document.createElement("div");
     top.className = "ml-section-title";
     const titleGroup = document.createElement("div");
@@ -2405,14 +3003,14 @@ class CharacterMediaWidget {
     heading.textContent = "Per-Card Download Options";
     const statusPill = document.createElement("span");
     statusPill.className = `ml-badge ${this.hasCustomOverride ? "is-info" : ""}`;
-    statusPill.textContent = this.hasCustomOverride ? "Custom" : "Using global defaults";
-    titleGroup.append(heading, statusPill, createInfoTip("Customize which sections, greetings, World Books, domains, or specific URLs are included when clicking Localize for this character."));
+    statusPill.textContent = this.hasCustomOverride ? "Custom" : "Global defaults";
+    titleGroup.append(createIcon("sliders", 13), heading, statusPill, createInfoTip("Customize which sections, greetings, World Books, domains, or specific URLs are included when clicking Localize for this character."));
     const resetBtn = createIconButton({
       icon: "rotate-ccw",
-      label: "Reset to global",
+      label: "Reset",
       title: "Clear per-card customizations and use Settings global defaults",
-      className: "ml-btn is-sm",
-      size: 12,
+      className: "ml-btn is-xs",
+      size: 11,
       disabled: !this.hasCustomOverride,
       onClick: () => void this.runAction(() => this.resetToGlobalDefaults())
     });
@@ -2427,129 +3025,27 @@ class CharacterMediaWidget {
       },
       sectionCounts: scan.sectionCounts,
       sectionTip: "Unchecking sections skips them for one-click localization on this character.",
-      onChange: () => {
+      onChange: (nextState) => {
+        this.selectedSections = nextState.sections;
+        this.selectedKinds = nextState.mediaKinds;
+        this.includeFailed = nextState.includeFailed;
+        this.batchCap = nextState.batchCap;
         this.scheduleSaveOverride();
         this.render();
       }
     }));
-    if (this.selectedSections.has("alternate_greetings") && scan.greetingBreakdown.length > 1) {
-      const subBar = document.createElement("div");
-      subBar.className = "ml-header-bar";
-      const subBtn = document.createElement("button");
-      subBtn.type = "button";
-      subBtn.className = "ml-btn is-sm";
-      subBtn.textContent = this.showGreetingSubfilter ? "Hide Greeting Picker" : `Filter Greetings (${scan.greetingBreakdown.length})...`;
-      subBtn.addEventListener("click", () => {
-        this.showGreetingSubfilter = !this.showGreetingSubfilter;
-        this.emitUiStateChange();
-        this.render();
-      });
-      subBar.appendChild(subBtn);
-      container.appendChild(subBar);
-      if (this.showGreetingSubfilter) {
-        const subBox = document.createElement("div");
-        subBox.className = "ml-subfilter-box";
-        const subList = document.createElement("div");
-        subList.className = "ml-subfilter-list";
-        subList.dataset.scrollId = "greetings-subfilter";
-        for (const g of scan.greetingBreakdown) {
-          const gLabel = document.createElement("label");
-          gLabel.className = "ml-checkbox-item";
-          const gCb = document.createElement("input");
-          gCb.type = "checkbox";
-          gCb.checked = this.selectedGreetings === null || this.selectedGreetings.has(g.greetingIndex);
-          gCb.addEventListener("change", () => {
-            if (this.selectedGreetings === null) {
-              this.selectedGreetings = new Set(scan.greetingBreakdown.map((item) => item.greetingIndex));
-            }
-            if (gCb.checked) {
-              this.selectedGreetings.add(g.greetingIndex);
-            } else {
-              const remaining = scan.greetingBreakdown.filter((item) => item.greetingIndex !== g.greetingIndex && this.selectedGreetings.has(item.greetingIndex));
-              if (remaining.length === 0) {
-                gCb.checked = true;
-                return;
-              }
-              this.selectedGreetings.delete(g.greetingIndex);
-            }
-            if (scan.greetingBreakdown.every((item) => this.selectedGreetings.has(item.greetingIndex))) {
-              this.selectedGreetings = null;
-            }
-            this.scheduleSaveOverride();
-            this.render();
-          });
-          const gFailed = g.failedCount ?? 0;
-          const gSummary = gFailed > 0 ? `${g.remoteCount} remote, ${gFailed} failed` : `${g.remoteCount} remote`;
-          gLabel.append(gCb, document.createTextNode(`${g.label} (${gSummary})`));
-          subList.appendChild(gLabel);
-        }
-        subBox.appendChild(subList);
-        container.appendChild(subBox);
-      }
-    }
-    if (this.selectedSections.has("world_books") && scan.worldBookBreakdown.length > 1) {
-      const wbRow = document.createElement("div");
-      wbRow.className = "ml-header-bar";
-      const wbBtn = document.createElement("button");
-      wbBtn.type = "button";
-      wbBtn.className = "ml-btn is-sm";
-      wbBtn.textContent = this.showWorldBookSubfilter ? "Hide World Book Picker" : `Filter World Books (${scan.worldBookBreakdown.length})...`;
-      wbBtn.addEventListener("click", () => {
-        this.showWorldBookSubfilter = !this.showWorldBookSubfilter;
-        this.emitUiStateChange();
-        this.render();
-      });
-      wbRow.appendChild(wbBtn);
-      container.appendChild(wbRow);
-      if (this.showWorldBookSubfilter) {
-        const wbBox = document.createElement("div");
-        wbBox.className = "ml-subfilter-box";
-        wbBox.dataset.scrollId = "worldbooks-subfilter";
-        for (const wb of scan.worldBookBreakdown) {
-          const wbLabel = document.createElement("label");
-          wbLabel.className = "ml-checkbox-item";
-          const wbCb = document.createElement("input");
-          wbCb.type = "checkbox";
-          wbCb.checked = this.selectedWorldBooks === null || this.selectedWorldBooks.has(wb.worldBookId);
-          wbCb.addEventListener("change", () => {
-            if (this.selectedWorldBooks === null) {
-              this.selectedWorldBooks = new Set(scan.worldBookBreakdown.map((item) => item.worldBookId));
-            }
-            if (wbCb.checked) {
-              this.selectedWorldBooks.add(wb.worldBookId);
-            } else {
-              const remaining = scan.worldBookBreakdown.filter((item) => item.worldBookId !== wb.worldBookId && this.selectedWorldBooks.has(item.worldBookId));
-              if (remaining.length === 0) {
-                wbCb.checked = true;
-                return;
-              }
-              this.selectedWorldBooks.delete(wb.worldBookId);
-            }
-            if (scan.worldBookBreakdown.every((item) => this.selectedWorldBooks.has(item.worldBookId))) {
-              this.selectedWorldBooks = null;
-            }
-            this.scheduleSaveOverride();
-            this.render();
-          });
-          const wbFailed = wb.failedCount ?? 0;
-          const wbSummary = wbFailed > 0 ? `${wb.remoteCount} remote, ${wbFailed} failed` : `${wb.remoteCount} remote`;
-          wbLabel.append(wbCb, document.createTextNode(`${wb.worldBookName} (${wbSummary})`));
-          wbBox.appendChild(wbLabel);
-        }
-        container.appendChild(wbBox);
-      }
-    }
     const remoteDomains = scan.domainBreakdown.filter((d) => {
       const failed = d.failedCount ?? 0;
       return d.remoteCount + failed > 0;
     });
     if (remoteDomains.length > 1) {
-      const domLabel = document.createElement("div");
-      domLabel.className = "ml-config-label";
-      domLabel.textContent = "Host Domains";
-      container.appendChild(domLabel);
       const pillRow = document.createElement("div");
       pillRow.className = "ml-pill-row";
+      pillRow.style.alignItems = "center";
+      const domLabel = document.createElement("span");
+      domLabel.className = "ml-config-label";
+      domLabel.textContent = "Domains";
+      pillRow.appendChild(domLabel);
       for (const dom of remoteDomains) {
         const isSelected = this.selectedDomains === null || this.selectedDomains.has(dom.domain);
         const domFailed = dom.failedCount ?? 0;
@@ -2580,18 +3076,50 @@ class CharacterMediaWidget {
       }
       container.appendChild(pillRow);
     }
-    const pickerBar = document.createElement("div");
-    pickerBar.className = "ml-header-bar";
-    const togglePickerBtn = document.createElement("button");
-    togglePickerBtn.type = "button";
-    togglePickerBtn.className = "ml-btn is-sm";
-    togglePickerBtn.textContent = this.showUrlPicker ? `Hide URL List (${selectedPending.length}/${candidateItems.length})` : `Inspect & Pick URLs (${selectedPending.length}/${candidateItems.length})...`;
-    togglePickerBtn.addEventListener("click", () => {
-      this.showUrlPicker = !this.showUrlPicker;
-      this.emitUiStateChange();
-      this.render();
-    });
-    pickerBar.appendChild(togglePickerBtn);
+    const hasGreetingSubfilter = this.selectedSections.has("alternate_greetings") && scan.greetingBreakdown.length > 1;
+    const hasWorldBookSubfilter = this.selectedSections.has("world_books") && scan.worldBookBreakdown.length > 1;
+    const triggerRow = document.createElement("div");
+    triggerRow.className = "ml-compact-row";
+    if (hasGreetingSubfilter) {
+      triggerRow.appendChild(createIconButton({
+        icon: "filter",
+        label: this.showGreetingSubfilter ? `Hide Greetings (${scan.greetingBreakdown.length})` : `Filter Greetings (${scan.greetingBreakdown.length})`,
+        title: "Toggle per-greeting filter",
+        className: `ml-btn is-xs ${this.showGreetingSubfilter ? "is-active" : ""}`,
+        size: 11,
+        onClick: () => {
+          this.showGreetingSubfilter = !this.showGreetingSubfilter;
+          this.emitUiStateChange();
+          this.render();
+        }
+      }));
+    }
+    if (hasWorldBookSubfilter) {
+      triggerRow.appendChild(createIconButton({
+        icon: "filter",
+        label: this.showWorldBookSubfilter ? `Hide World Books (${scan.worldBookBreakdown.length})` : `Filter World Books (${scan.worldBookBreakdown.length})`,
+        title: "Toggle per-World Book filter",
+        className: `ml-btn is-xs ${this.showWorldBookSubfilter ? "is-active" : ""}`,
+        size: 11,
+        onClick: () => {
+          this.showWorldBookSubfilter = !this.showWorldBookSubfilter;
+          this.emitUiStateChange();
+          this.render();
+        }
+      }));
+    }
+    triggerRow.appendChild(createIconButton({
+      icon: "list",
+      label: this.showUrlPicker ? `Hide URL List (${selectedPending.length}/${candidateItems.length})` : `Inspect & Pick URLs (${selectedPending.length}/${candidateItems.length})`,
+      title: "Inspect individual candidate URLs and toggle them",
+      className: `ml-btn is-xs ${this.showUrlPicker ? "is-active" : ""}`,
+      size: 11,
+      onClick: () => {
+        this.showUrlPicker = !this.showUrlPicker;
+        this.emitUiStateChange();
+        this.render();
+      }
+    }));
     if (this.showUrlPicker && candidateItems.length > 0) {
       const thumbToggle = document.createElement("label");
       thumbToggle.className = "ml-toggle-label";
@@ -2603,10 +3131,42 @@ class CharacterMediaWidget {
         this.emitUiStateChange();
         this.render();
       });
-      thumbToggle.append(thumbCb, document.createTextNode("Remote Previews"));
-      pickerBar.appendChild(thumbToggle);
+      thumbToggle.append(thumbCb, document.createTextNode("Previews"));
+      triggerRow.appendChild(thumbToggle);
     }
-    container.appendChild(pickerBar);
+    container.appendChild(triggerRow);
+    if (hasGreetingSubfilter && this.showGreetingSubfilter) {
+      container.appendChild(this.renderSubfilterBox({
+        title: hasWorldBookSubfilter && this.showWorldBookSubfilter ? "Greetings" : undefined,
+        scrollId: "greetings-subfilter",
+        entries: scan.greetingBreakdown.map((g) => ({
+          key: g.greetingIndex,
+          label: g.label,
+          remoteCount: g.remoteCount,
+          failedCount: g.failedCount ?? 0
+        })),
+        getSelected: () => this.selectedGreetings,
+        setSelected: (next) => {
+          this.selectedGreetings = next;
+        }
+      }));
+    }
+    if (hasWorldBookSubfilter && this.showWorldBookSubfilter) {
+      container.appendChild(this.renderSubfilterBox({
+        title: hasGreetingSubfilter && this.showGreetingSubfilter ? "World Books" : undefined,
+        scrollId: "worldbooks-subfilter",
+        entries: scan.worldBookBreakdown.map((wb) => ({
+          key: wb.worldBookId,
+          label: wb.worldBookName,
+          remoteCount: wb.remoteCount,
+          failedCount: wb.failedCount ?? 0
+        })),
+        getSelected: () => this.selectedWorldBooks,
+        setSelected: (next) => {
+          this.selectedWorldBooks = next;
+        }
+      }));
+    }
     if (this.showUrlPicker && candidateItems.length > 0) {
       container.appendChild(this.renderUrlPicker(scan, candidateItems));
     }
@@ -2614,19 +3174,67 @@ class CharacterMediaWidget {
     summaryBar.className = "ml-download-bar";
     const countNote = document.createElement("span");
     countNote.className = "ml-subtitle";
-    countNote.textContent = effectivePendingCount < selectedPending.length ? `${effectivePendingCount} of ${selectedPending.length} selected files will download (limit ${this.batchCap}).` : `${selectedPending.length} matching file(s) ready.`;
+    countNote.textContent = effectivePendingCount < selectedPending.length ? `${effectivePendingCount} of ${selectedPending.length} selected (limit ${this.batchCap})` : `${selectedPending.length} selected`;
     const applyBtn = createIconButton({
       icon: "download",
       label: `Localize (${effectivePendingCount})`,
       title: "Start downloading selected items now",
-      className: "ml-btn is-primary is-sm",
-      size: 13,
+      className: "ml-btn is-primary is-xs",
+      size: 12,
       disabled: effectivePendingCount === 0,
       onClick: () => void this.triggerOneClickLocalize()
     });
     summaryBar.append(countNote, applyBtn);
     container.appendChild(summaryBar);
     return container;
+  }
+  renderSubfilterBox(opts) {
+    const box = document.createElement("div");
+    box.className = "ml-subfilter-box";
+    if (opts.title) {
+      const titleEl = document.createElement("div");
+      titleEl.className = "ml-config-label";
+      titleEl.textContent = opts.title;
+      box.appendChild(titleEl);
+    }
+    const list = document.createElement("div");
+    list.className = "ml-subfilter-list";
+    list.dataset.scrollId = opts.scrollId;
+    for (const entry of opts.entries) {
+      const lbl = document.createElement("label");
+      lbl.className = "ml-checkbox-item";
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      const current = opts.getSelected();
+      cb.checked = current === null || current.has(entry.key);
+      cb.addEventListener("change", () => {
+        let next = opts.getSelected();
+        if (next === null) {
+          next = new Set(opts.entries.map((item) => item.key));
+        }
+        if (cb.checked) {
+          next.add(entry.key);
+        } else {
+          const remaining = opts.entries.filter((item) => item.key !== entry.key && next.has(item.key));
+          if (remaining.length === 0) {
+            cb.checked = true;
+            return;
+          }
+          next.delete(entry.key);
+        }
+        if (opts.entries.every((item) => next.has(item.key))) {
+          next = null;
+        }
+        opts.setSelected(next);
+        this.scheduleSaveOverride();
+        this.render();
+      });
+      const summary = entry.failedCount > 0 ? `${entry.remoteCount} rem, ${entry.failedCount} err` : `${entry.remoteCount}`;
+      lbl.append(cb, document.createTextNode(`${entry.label} (${summary})`));
+      list.appendChild(lbl);
+    }
+    box.appendChild(list);
+    return box;
   }
   renderUrlPicker(scan, candidateItems) {
     const urlBox = document.createElement("div");
@@ -2637,7 +3245,7 @@ class CharacterMediaWidget {
     urlTopBtns.className = "ml-header-actions";
     const checkAllBtn = document.createElement("button");
     checkAllBtn.type = "button";
-    checkAllBtn.className = "ml-btn is-sm";
+    checkAllBtn.className = "ml-btn is-xs";
     checkAllBtn.textContent = "Check All";
     checkAllBtn.addEventListener("click", () => {
       for (const item of candidateItems)
@@ -2647,7 +3255,7 @@ class CharacterMediaWidget {
     });
     const uncheckAllBtn = document.createElement("button");
     uncheckAllBtn.type = "button";
-    uncheckAllBtn.className = "ml-btn is-sm";
+    uncheckAllBtn.className = "ml-btn is-xs";
     uncheckAllBtn.textContent = "Uncheck All";
     uncheckAllBtn.addEventListener("click", () => {
       for (const item of candidateItems)
@@ -2659,7 +3267,7 @@ class CharacterMediaWidget {
     if (this.expandedUrls.size > 0) {
       const collapseAllBtn = document.createElement("button");
       collapseAllBtn.type = "button";
-      collapseAllBtn.className = "ml-btn is-sm";
+      collapseAllBtn.className = "ml-btn is-xs";
       collapseAllBtn.textContent = `Collapse (${this.expandedUrls.size})`;
       collapseAllBtn.addEventListener("click", () => {
         this.expandedUrls.clear();
@@ -2708,25 +3316,34 @@ class CharacterMediaWidget {
       urlText.textContent = item.normalizedUrl;
       const sourcesText = document.createElement("div");
       sourcesText.className = "ml-url-sources";
-      sourcesText.textContent = `${item.mediaKind.toUpperCase()} · ${item.domain} · ${item.occurrenceCount} ref${item.occurrenceCount === 1 ? "" : "s"} · ${item.sources[0]?.label ?? ""}`;
+      const kindChip = document.createElement("span");
+      const kindClass = item.status === "failed" ? "is-failed" : item.mediaKind === "video" ? "is-video" : "is-image";
+      kindChip.className = `ml-kind-chip ${kindClass}`;
+      kindChip.textContent = item.status === "failed" ? "FAILED" : item.mediaKind === "video" ? "VID" : "IMG";
+      const refTag = item.occurrenceCount > 1 ? ` ×${item.occurrenceCount}` : "";
+      const srcLabel = item.sources[0]?.label ?? "";
+      sourcesText.append(kindChip, document.createTextNode(` · ${item.domain}${refTag}${srcLabel ? ` · ${srcLabel}` : ""}`));
       meta.append(urlText, sourcesText);
       const expandHint = document.createElement("span");
       expandHint.className = "ml-expand-hint";
-      expandHint.textContent = isExpanded ? "Hide ▴" : "Info ▾";
-      const singleBtn = document.createElement("button");
-      singleBtn.type = "button";
-      singleBtn.className = "ml-btn is-sm";
-      singleBtn.textContent = item.status === "failed" ? "Retry" : "Localize";
-      singleBtn.addEventListener("click", (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        singleBtn.disabled = true;
-        this.runAction(() => this.callbacks.onStartDownload({
-          characterIds: [scan.characterId],
-          explicitUrls: [item.normalizedUrl],
-          includeFailed: true,
-          maxItems: 1
-        }));
+      expandHint.textContent = isExpanded ? "▴" : "▾";
+      expandHint.title = isExpanded ? "Hide URL details" : "Inspect preview & sources";
+      const singleBtn = createIconButton({
+        icon: item.status === "failed" ? "refresh" : "download",
+        title: item.status === "failed" ? "Retry this URL" : "Localize this URL",
+        className: "ml-btn ml-icon-btn is-xs",
+        size: 11,
+        onClick: (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          singleBtn.disabled = true;
+          this.runAction(() => this.callbacks.onStartDownload({
+            characterIds: [scan.characterId],
+            explicitUrls: [item.normalizedUrl],
+            includeFailed: true,
+            maxItems: 1
+          }));
+        }
       });
       row.append(meta, expandHint, singleBtn);
       row.addEventListener("click", () => {
@@ -2803,10 +3420,10 @@ class CharacterMediaWidget {
     actionsRow.className = "ml-detail-kv-row";
     const copyBtn = createIconButton({
       icon: "copy",
-      label: "Copy URL",
+      label: "Copy",
       title: "Copy URL",
-      className: "ml-btn is-sm",
-      size: 12,
+      className: "ml-btn is-xs",
+      size: 11,
       onClick: (e) => {
         e.stopPropagation();
         navigator.clipboard?.writeText?.(item.normalizedUrl);
@@ -2819,8 +3436,8 @@ class CharacterMediaWidget {
       icon: "external-link",
       label: "Open",
       title: safeUrl ? "Open original URL in new tab" : "Blocked unsafe media URL",
-      className: "ml-btn is-sm",
-      size: 12,
+      className: "ml-btn is-xs",
+      size: 11,
       disabled: !safeUrl,
       onClick: (e) => {
         e.stopPropagation();
@@ -2831,8 +3448,8 @@ class CharacterMediaWidget {
       icon: "download",
       label: item.status === "failed" ? "Retry" : "Localize",
       title: "Queue this single media item",
-      className: "ml-btn is-primary is-sm",
-      size: 12,
+      className: "ml-btn is-primary is-xs",
+      size: 11,
       onClick: (e) => {
         e.stopPropagation();
         this.runAction(() => this.callbacks.onStartDownload({
@@ -2864,16 +3481,69 @@ class CharacterMediaWidget {
     details.appendChild(top);
     return details;
   }
-  renderMediaGallerySection(scan) {
-    const box = document.createElement("div");
-    box.className = "ml-section";
+  renderCombinedOptionsAndMediaSection(scan, candidateItems, selectedPending, effectivePendingCount) {
+    const section = document.createElement("div");
+    section.className = "ml-section ml-combined-drawer";
     const expressions = scan.media?.expressions ?? [];
     const exprImageIds = new Set(expressions.map((e) => e.imageId));
     const localizedItems = scan.items.filter((item) => item.status === "localized" && Boolean(item.localizedEntry) && !exprImageIds.has(item.localizedEntry.imageId));
     const hasAvatar = Boolean(scan.media?.avatarUrl);
+    const bar = document.createElement("div");
+    bar.className = "ml-combined-bar";
+    const mediaBtn = document.createElement("button");
+    mediaBtn.type = "button";
+    mediaBtn.className = `ml-combined-trigger ${this.showDownloadedMedia ? "is-active" : ""}`.trim();
+    const mediaTitle = this.showDownloadedMedia ? "Collapse Downloaded Media" : "Expand Downloaded Media";
+    mediaBtn.title = mediaTitle;
+    mediaBtn.setAttribute("aria-label", mediaTitle);
+    mediaBtn.setAttribute("aria-expanded", String(this.showDownloadedMedia));
+    mediaBtn.appendChild(createIcon("image", 13));
+    const mediaLabel = document.createElement("span");
+    mediaLabel.textContent = `Downloaded Media (${localizedItems.length}${expressions.length > 0 ? ` + ${expressions.length} expr` : ""})`;
+    mediaBtn.append(mediaLabel, createIcon(this.showDownloadedMedia ? "chevron-down" : "chevron-right", 12));
+    mediaBtn.addEventListener("click", () => {
+      this.showDownloadedMedia = !this.showDownloadedMedia;
+      this.emitUiStateChange();
+      this.render();
+    });
+    const mediaTip = createInfoTip("Click any tile to open the lightbox. Character Avatar and native Expressions are read-only; localized assets can be removed individually or in bulk.");
+    const optionsBtn = document.createElement("button");
+    optionsBtn.type = "button";
+    optionsBtn.className = `ml-combined-trigger ${this.showDownloadConfig ? "is-active" : ""}`.trim();
+    const optionsTitle = this.showDownloadConfig ? "Hide download options & URL inspector" : "Customize per-card download options & inspect individual URLs";
+    optionsBtn.title = optionsTitle;
+    optionsBtn.setAttribute("aria-label", optionsTitle);
+    optionsBtn.setAttribute("aria-expanded", String(this.showDownloadConfig));
+    optionsBtn.appendChild(createIcon("sliders", 13));
+    const optionsLabel = document.createElement("span");
+    optionsLabel.textContent = "Options";
+    optionsBtn.appendChild(optionsLabel);
+    if (this.hasCustomOverride) {
+      const customBadge = document.createElement("span");
+      customBadge.className = "ml-badge is-info";
+      customBadge.textContent = "Custom";
+      optionsBtn.appendChild(customBadge);
+    }
+    optionsBtn.appendChild(createIcon(this.showDownloadConfig ? "chevron-down" : "chevron-right", 12));
+    optionsBtn.addEventListener("click", () => {
+      this.showDownloadConfig = !this.showDownloadConfig;
+      this.emitUiStateChange();
+      this.render();
+    });
+    bar.append(mediaBtn, mediaTip, optionsBtn);
+    section.appendChild(bar);
+    if (this.showDownloadConfig) {
+      section.appendChild(this.renderOptionsSection(scan, candidateItems, selectedPending, effectivePendingCount));
+    }
+    if (!this.showDownloadedMedia) {
+      this.mediaTileCache.clear();
+      return section;
+    }
     const allTiles = [];
+    const onEditCharacter = this.callbacks.onOpenCharacterEditor ? () => this.callbacks.onOpenCharacterEditor(scan.characterId) : undefined;
     if (hasAvatar && scan.media?.avatarUrl) {
       allTiles.push({
+        cacheKey: `avatar:${scan.characterId}`,
         lightbox: {
           id: `avatar:${scan.characterId}`,
           localUrl: scan.media.avatarUrl,
@@ -2881,7 +3551,8 @@ class CharacterMediaWidget {
           title: `${scan.characterName} — Avatar`,
           subtitle: "Character card avatar",
           readOnly: true,
-          badgeText: "Avatar"
+          badgeText: "Avatar",
+          onEditCharacter
         },
         badge: "Avatar",
         badgeVariant: "is-info",
@@ -2894,6 +3565,7 @@ class CharacterMediaWidget {
     for (const item of localizedItems) {
       const entry = item.localizedEntry;
       allTiles.push({
+        cacheKey: `loc:${entry.imageId}:${item.normalizedUrl}`,
         lightbox: {
           id: entry.imageId,
           localUrl: entry.localUrl,
@@ -2903,12 +3575,12 @@ class CharacterMediaWidget {
           originalUrl: item.normalizedUrl,
           readOnly: false,
           badgeText: item.mediaKind === "video" ? "Video" : "Localized",
+          onEditCharacter,
           onRemove: async () => {
             await this.callbacks.onPurgeCharacterCache(scan.characterId, [item.normalizedUrl]);
-            await this.refreshScan(false);
           }
         },
-        badge: item.mediaKind === "video" ? "Video" : "Localized",
+        badge: item.mediaKind === "video" ? "Vid" : "Local",
         caption: entry.filename,
         subcaption: `${formatBytes(entry.sizeBytes)} · ${item.sources[0]?.label ?? item.domain}`,
         isExpression: false,
@@ -2918,6 +3590,7 @@ class CharacterMediaWidget {
     }
     for (const expr of expressions) {
       allTiles.push({
+        cacheKey: `expr:${expr.imageId}:${expr.label}`,
         lightbox: {
           id: `expr:${expr.imageId}:${expr.label}`,
           localUrl: expr.localUrl,
@@ -2925,7 +3598,8 @@ class CharacterMediaWidget {
           title: expr.label,
           subtitle: expr.groupName ? `Native expression (${expr.groupName}) · read-only` : "Native expression · read-only",
           readOnly: true,
-          badgeText: "Expression"
+          badgeText: "Expression",
+          onEditCharacter
         },
         badge: "Expr",
         badgeVariant: "is-info",
@@ -2944,40 +3618,17 @@ class CharacterMediaWidget {
         return t.mediaKind === "video";
       return true;
     });
-    const topBar = document.createElement("div");
-    topBar.className = "ml-section-title";
-    const titleWrap = document.createElement("div");
-    titleWrap.className = "ml-inline-title";
-    const collapseBtn = createIconButton({
-      icon: this.showDownloadedMedia ? "chevron-down" : "chevron-right",
-      title: this.showDownloadedMedia ? "Collapse Downloaded Media" : "Expand Downloaded Media",
-      className: "ml-btn ml-icon-btn is-sm ml-collapse-btn",
-      size: 13,
-      onClick: () => {
-        this.showDownloadedMedia = !this.showDownloadedMedia;
-        this.emitUiStateChange();
-        this.render();
-      }
-    });
-    collapseBtn.setAttribute("aria-expanded", String(this.showDownloadedMedia));
-    collapseBtn.setAttribute("aria-label", this.showDownloadedMedia ? "Collapse Downloaded Media" : "Expand Downloaded Media");
-    const titleSpan = document.createElement("span");
-    titleSpan.textContent = `Downloaded Media (${localizedItems.length}${expressions.length > 0 ? ` + ${expressions.length} expr` : ""})`;
-    titleWrap.append(collapseBtn, titleSpan, createInfoTip("Click any tile to open the lightbox. Character Avatar and native Expressions are read-only; localized assets can be removed individually or in bulk."));
-    if (!this.showDownloadedMedia) {
-      topBar.appendChild(titleWrap);
-      box.appendChild(topBar);
-      return box;
-    }
-    const toolbar = document.createElement("div");
-    toolbar.className = "ml-header-actions";
+    const mediaPane = document.createElement("div");
+    mediaPane.className = "ml-combined-pane ml-media-pane";
+    const mediaToolbar = document.createElement("div");
+    mediaToolbar.className = "ml-header-bar ml-media-toolbar";
     const filterSelect = document.createElement("select");
     filterSelect.className = "ml-select is-sm";
     filterSelect.title = "Filter shown media tiles";
     const filterChoices = [
       { val: "all", label: `All (${allTiles.length})` },
-      { val: "localized", label: `Localized (${localizedItems.length})` },
-      { val: "expressions", label: `Expressions (${expressions.length})` },
+      { val: "localized", label: `Local (${localizedItems.length})` },
+      { val: "expressions", label: `Expr (${expressions.length})` },
       { val: "video", label: "Videos" }
     ];
     for (const c of filterChoices) {
@@ -2994,8 +3645,11 @@ class CharacterMediaWidget {
       this.emitUiStateChange();
       this.render();
     });
-    toolbar.appendChild(filterSelect);
-    toolbar.appendChild(createIconButton({
+    const toolbar = document.createElement("div");
+    toolbar.className = "ml-header-actions";
+    const seg = document.createElement("div");
+    seg.className = "ml-segmented";
+    seg.appendChild(createIconButton({
       icon: "grid",
       title: "Grid view",
       className: `ml-btn ml-icon-btn is-sm ${this.mediaViewMode === "grid" ? "is-active" : ""}`,
@@ -3006,7 +3660,7 @@ class CharacterMediaWidget {
         this.render();
       }
     }));
-    toolbar.appendChild(createIconButton({
+    seg.appendChild(createIconButton({
       icon: "list",
       title: "List view",
       className: `ml-btn ml-icon-btn is-sm ${this.mediaViewMode === "list" ? "is-active" : ""}`,
@@ -3016,6 +3670,14 @@ class CharacterMediaWidget {
         this.emitUiStateChange();
         this.render();
       }
+    }));
+    toolbar.appendChild(seg);
+    toolbar.appendChild(createThumbnailSizeSegmented(this.thumbnailSize, (nextSize) => {
+      if (nextSize === this.thumbnailSize)
+        return;
+      this.thumbnailSize = nextSize;
+      this.emitUiStateChange();
+      this.render();
     }));
     if (localizedItems.length > 0) {
       toolbar.appendChild(createIconButton({
@@ -3045,122 +3707,221 @@ class CharacterMediaWidget {
         }
       }));
     }
-    topBar.append(titleWrap, toolbar);
-    box.appendChild(topBar);
+    mediaToolbar.append(filterSelect, toolbar);
+    mediaPane.appendChild(mediaToolbar);
     if (filteredTiles.length === 0) {
+      this.mediaTileCache.clear();
       const empty = document.createElement("div");
-      empty.className = "ml-empty";
-      empty.textContent = allTiles.length === 0 ? "No downloaded media or expressions yet. Click Localize above to fetch remote media." : "No items match this filter.";
-      box.appendChild(empty);
-      return box;
+      empty.className = "ml-empty ml-empty-card";
+      const iconWrap = document.createElement("div");
+      iconWrap.className = "ml-empty-icon";
+      iconWrap.appendChild(createIcon(allTiles.length === 0 ? "image" : "filter", 18));
+      const textEl = document.createElement("div");
+      textEl.className = "ml-empty-text";
+      textEl.textContent = allTiles.length === 0 ? "No downloaded media or expressions yet." : "No items match this filter.";
+      empty.append(iconWrap, textEl);
+      mediaPane.appendChild(empty);
+      section.appendChild(mediaPane);
+      return section;
     }
     const lightboxItems = filteredTiles.map((t) => t.lightbox);
+    const seenKeys = new Map;
+    const usedKeys = new Set;
+    const nextTileCacheKey = (tile) => {
+      const base = `${this.mediaViewMode}:${tile.cacheKey}`;
+      const occ = seenKeys.get(base) ?? 0;
+      seenKeys.set(base, occ + 1);
+      return occ === 0 ? base : `${base}#${occ}`;
+    };
+    const thumbTier = getThumbnailImageTier(this.thumbnailSize);
+    const computeTileSig = (tile) => {
+      const thumbSrc = toThumbnailMediaUrl(sanitizeSafeMediaUrl(tile.lightbox.localUrl), tile.mediaKind, thumbTier) ?? tile.lightbox.localUrl;
+      return [
+        scan.characterId,
+        thumbSrc,
+        tile.mediaKind,
+        tile.caption,
+        tile.subcaption,
+        tile.badge,
+        tile.badgeVariant ?? "",
+        tile.isExpression ? "1" : "0",
+        tile.urlToRemove ?? ""
+      ].join("\x01");
+    };
     if (this.mediaViewMode === "list") {
       const list = document.createElement("div");
       list.className = "ml-media-list";
       list.dataset.scrollId = "localized-asset-grid";
       filteredTiles.forEach((tile, index) => {
-        const row = document.createElement("div");
-        row.className = "ml-media-list-row";
-        row.addEventListener("click", () => openMediaLightbox(lightboxItems, index));
-        const thumb = createLazyMediaElement({
-          src: tile.lightbox.localUrl,
-          mediaKind: tile.mediaKind,
-          alt: tile.caption,
-          className: "ml-media-list-thumb"
-        });
-        const info = document.createElement("div");
-        info.className = "ml-url-meta";
-        const cap = document.createElement("div");
-        cap.className = "ml-url-text";
-        cap.textContent = tile.caption;
-        const sub = document.createElement("div");
-        sub.className = "ml-url-sources";
-        sub.textContent = tile.subcaption;
-        info.append(cap, sub);
-        const badge = document.createElement("span");
-        badge.className = `ml-badge ${tile.badgeVariant ?? ""}`.trim();
-        badge.textContent = tile.badge;
-        row.append(thumb, info, badge);
-        if (tile.urlToRemove) {
-          const rmBtn = createIconButton({
-            icon: "trash",
-            title: "Remove localized asset",
-            className: "ml-btn ml-icon-btn is-danger is-sm",
-            size: 12,
-            onClick: async (ev) => {
-              ev.stopPropagation();
-              rmBtn.disabled = true;
-              await this.runAction(async () => {
-                await this.callbacks.onPurgeCharacterCache(scan.characterId, [
-                  tile.urlToRemove
-                ]);
-                await this.refreshScan(false);
-              });
-            }
+        const key = nextTileCacheKey(tile);
+        const sig = computeTileSig(tile);
+        usedKeys.add(key);
+        const cached = this.mediaTileCache.get(key);
+        let row;
+        if (cached && cached.sig === sig) {
+          row = cached.el;
+          reobserveLazyMedia(row);
+          const rmBtn = row.querySelector("button.is-danger");
+          if (rmBtn)
+            rmBtn.disabled = false;
+        } else {
+          row = document.createElement("div");
+          row.className = "ml-media-list-row";
+          row.addEventListener("click", () => this.tileClickHandlers.get(row)?.());
+          const thumbWrap = document.createElement("div");
+          thumbWrap.className = "ml-media-list-thumb-wrap";
+          const thumb = createLazyMediaElement({
+            src: tile.lightbox.localUrl,
+            mediaKind: tile.mediaKind,
+            alt: tile.caption,
+            className: "ml-media-list-thumb",
+            thumbTier
           });
-          row.appendChild(rmBtn);
+          thumbWrap.appendChild(thumb);
+          if (tile.mediaKind === "video") {
+            const kindIndicator = document.createElement("span");
+            kindIndicator.className = "ml-media-list-kind-badge";
+            kindIndicator.setAttribute("aria-hidden", "true");
+            kindIndicator.appendChild(createIcon("play", 9));
+            thumbWrap.appendChild(kindIndicator);
+          }
+          const info = document.createElement("div");
+          info.className = "ml-url-meta";
+          const cap = document.createElement("div");
+          cap.className = "ml-url-text";
+          cap.textContent = tile.caption;
+          const sub = document.createElement("div");
+          sub.className = "ml-url-sources";
+          sub.textContent = tile.subcaption;
+          info.append(cap, sub);
+          const badgeVariant = tile.badgeVariant ?? (tile.mediaKind === "video" ? "is-info" : "is-success");
+          const badge = document.createElement("span");
+          badge.className = `ml-badge ${badgeVariant}`.trim();
+          badge.textContent = tile.badge;
+          row.append(thumbWrap, info, badge);
+          if (tile.urlToRemove) {
+            const urlToRemove = tile.urlToRemove;
+            const rmBtn = createIconButton({
+              icon: "trash",
+              title: "Remove localized asset",
+              className: "ml-btn ml-icon-btn is-danger is-sm",
+              size: 12,
+              onClick: async (ev) => {
+                ev.stopPropagation();
+                rmBtn.disabled = true;
+                try {
+                  await this.runAction(async () => {
+                    await this.callbacks.onPurgeCharacterCache(scan.characterId, [
+                      urlToRemove
+                    ]);
+                    await this.refreshScan(false);
+                  });
+                } finally {
+                  if (!this.destroyed) {
+                    rmBtn.disabled = false;
+                  }
+                }
+              }
+            });
+            row.appendChild(rmBtn);
+          }
+          this.mediaTileCache.set(key, { sig, el: row });
         }
+        this.tileClickHandlers.set(row, () => openMediaLightbox(lightboxItems, index, () => void this.refreshScan(false)));
         list.appendChild(row);
       });
-      box.appendChild(list);
-      return box;
+      for (const key of this.mediaTileCache.keys()) {
+        if (!usedKeys.has(key))
+          this.mediaTileCache.delete(key);
+      }
+      mediaPane.appendChild(list);
+      section.appendChild(mediaPane);
+      return section;
     }
     const grid = document.createElement("div");
     grid.className = "ml-asset-grid";
     grid.dataset.scrollId = "localized-asset-grid";
     filteredTiles.forEach((tile, index) => {
-      const card = document.createElement("div");
-      card.className = "ml-asset-card";
-      const mediaWrap = document.createElement("div");
-      mediaWrap.className = "ml-asset-thumb-wrap";
-      const thumb = createLazyMediaElement({
-        src: tile.lightbox.localUrl,
-        mediaKind: tile.mediaKind,
-        alt: tile.caption,
-        className: "ml-asset-preview",
-        title: `${tile.caption} — Click to preview`
-      });
-      mediaWrap.addEventListener("click", () => openMediaLightbox(lightboxItems, index));
-      const cornerBadge = document.createElement("span");
-      cornerBadge.className = `ml-tile-badge ${tile.badgeVariant ?? ""}`.trim();
-      cornerBadge.textContent = tile.badge;
-      mediaWrap.append(thumb, cornerBadge);
-      const footer = document.createElement("div");
-      footer.className = "ml-asset-footer";
-      const capRow = document.createElement("div");
-      capRow.className = "ml-asset-cap-row";
-      const metaLine = document.createElement("div");
-      metaLine.className = "ml-url-sources";
-      metaLine.textContent = tile.isExpression ? tile.caption : tile.subcaption;
-      metaLine.title = `${tile.caption}
-${tile.subcaption}`;
-      capRow.appendChild(metaLine);
-      if (tile.urlToRemove) {
-        const rmBtn = createIconButton({
-          icon: "trash",
-          title: "Remove from cache & Character Gallery",
-          className: "ml-btn ml-icon-btn is-danger is-xs",
-          size: 11,
-          onClick: async (ev) => {
-            ev.stopPropagation();
-            rmBtn.disabled = true;
-            await this.runAction(async () => {
-              await this.callbacks.onPurgeCharacterCache(scan.characterId, [
-                tile.urlToRemove
-              ]);
-              await this.refreshScan(false);
-            });
-          }
+      const key = nextTileCacheKey(tile);
+      const sig = computeTileSig(tile);
+      usedKeys.add(key);
+      const cached = this.mediaTileCache.get(key);
+      let card;
+      if (cached && cached.sig === sig) {
+        card = cached.el;
+        reobserveLazyMedia(card);
+        const rmBtn = card.querySelector("button.is-danger");
+        if (rmBtn)
+          rmBtn.disabled = false;
+      } else {
+        card = document.createElement("div");
+        card.className = "ml-asset-card";
+        const mediaWrap = document.createElement("div");
+        mediaWrap.className = "ml-asset-thumb-wrap";
+        const thumb = createLazyMediaElement({
+          src: tile.lightbox.localUrl,
+          mediaKind: tile.mediaKind,
+          alt: tile.caption,
+          className: "ml-asset-preview",
+          title: `${tile.caption} — Click to preview`,
+          thumbTier
         });
-        capRow.appendChild(rmBtn);
+        mediaWrap.addEventListener("click", () => this.tileClickHandlers.get(card)?.());
+        const tileBadgeVariant = tile.badge === "Avatar" ? "is-avatar" : tile.isExpression ? "is-expression" : tile.mediaKind === "video" ? "is-video" : "is-local";
+        const cornerBadge = document.createElement("span");
+        cornerBadge.className = `ml-tile-badge ${tileBadgeVariant}`;
+        cornerBadge.textContent = tile.badge;
+        mediaWrap.append(thumb, cornerBadge);
+        const footer = document.createElement("div");
+        footer.className = "ml-asset-footer";
+        const capRow = document.createElement("div");
+        capRow.className = "ml-asset-cap-row";
+        const metaLine = document.createElement("div");
+        metaLine.className = "ml-url-sources";
+        metaLine.textContent = tile.isExpression ? tile.caption : tile.subcaption;
+        metaLine.title = `${tile.caption}
+${tile.subcaption}`;
+        capRow.appendChild(metaLine);
+        if (tile.urlToRemove) {
+          const urlToRemove = tile.urlToRemove;
+          const rmBtn = createIconButton({
+            icon: "trash",
+            title: "Remove from cache & Character Gallery",
+            className: "ml-btn ml-icon-btn is-danger is-xs",
+            size: 11,
+            onClick: async (ev) => {
+              ev.stopPropagation();
+              rmBtn.disabled = true;
+              try {
+                await this.runAction(async () => {
+                  await this.callbacks.onPurgeCharacterCache(scan.characterId, [
+                    urlToRemove
+                  ]);
+                  await this.refreshScan(false);
+                });
+              } finally {
+                if (!this.destroyed) {
+                  rmBtn.disabled = false;
+                }
+              }
+            }
+          });
+          capRow.appendChild(rmBtn);
+        }
+        footer.appendChild(capRow);
+        card.append(mediaWrap, footer);
+        this.mediaTileCache.set(key, { sig, el: card });
       }
-      footer.appendChild(capRow);
-      card.append(mediaWrap, footer);
+      this.tileClickHandlers.set(card, () => openMediaLightbox(lightboxItems, index, () => void this.refreshScan(false)));
       grid.appendChild(card);
     });
-    box.appendChild(grid);
-    return box;
+    for (const key of this.mediaTileCache.keys()) {
+      if (!usedKeys.has(key))
+        this.mediaTileCache.delete(key);
+    }
+    mediaPane.appendChild(grid);
+    section.appendChild(mediaPane);
+    return section;
   }
 }
 
@@ -3188,7 +3949,8 @@ function getDefaultGalleryPreferences() {
     sortDirection: "asc",
     selectedMediaTypes: [...ALL_GALLERY_MEDIA_TYPES],
     includeEmptyCharacters: false,
-    pageSize: DEFAULT_GALLERY_PAGE_SIZE
+    pageSize: DEFAULT_GALLERY_PAGE_SIZE,
+    thumbnailSize: DEFAULT_THUMBNAIL_SIZE
   };
 }
 function sanitizeGalleryPreferences(raw) {
@@ -3207,6 +3969,7 @@ function sanitizeGalleryPreferences(raw) {
   const includeEmptyCharacters = typeof obj.includeEmptyCharacters === "boolean" ? obj.includeEmptyCharacters : defaults.includeEmptyCharacters;
   const rawPageSize = Number(obj.pageSize);
   const pageSize = GALLERY_PAGE_SIZE_OPTIONS.includes(rawPageSize) ? rawPageSize : defaults.pageSize;
+  const thumbnailSize = sanitizeThumbnailSize(obj.thumbnailSize);
   return {
     grouped,
     viewMode,
@@ -3214,7 +3977,8 @@ function sanitizeGalleryPreferences(raw) {
     sortDirection,
     selectedMediaTypes,
     includeEmptyCharacters,
-    pageSize
+    pageSize,
+    thumbnailSize
   };
 }
 function parseGallerySearchQuery(raw) {
@@ -3286,6 +4050,150 @@ function matchesSearchText(haystacks, lowerTags, parsed) {
   return true;
 }
 var GALLERY_COLLATOR = new Intl.Collator;
+var MAX_WARM_THUMB_CACHE = 240;
+var MAX_DOM_NODE_CACHE = 192;
+var EAGER_PAGE_ITEM_LIMIT = 96;
+var EAGER_LEADING_WINDOW = 48;
+var warmThumbCache = new Map;
+function warmGalleryThumb(url) {
+  if (!url || typeof Image !== "function")
+    return;
+  const existing = warmThumbCache.get(url);
+  if (existing) {
+    warmThumbCache.delete(url);
+    warmThumbCache.set(url, existing);
+    return;
+  }
+  try {
+    const preloader = new Image;
+    preloader.decoding = "async";
+    preloader.src = url;
+    warmThumbCache.set(url, preloader);
+    if (warmThumbCache.size > MAX_WARM_THUMB_CACHE) {
+      const oldestKey = warmThumbCache.keys().next().value;
+      if (oldestKey !== undefined) {
+        warmThumbCache.delete(oldestKey);
+      }
+    }
+  } catch {}
+}
+function clearWarmGalleryThumbs(url) {
+  if (url !== undefined) {
+    warmThumbCache.delete(url);
+    return;
+  }
+  warmThumbCache.clear();
+}
+function createGalleryMediaElement(options) {
+  const thumbTier = options.thumbTier ?? "sm";
+  if (options.mediaKind === "image" && options.eager) {
+    const safeSrc = sanitizeSafeMediaUrl(options.src);
+    const thumbSrc = toThumbnailMediaUrl(safeSrc, "image", thumbTier);
+    const img = document.createElement("img");
+    img.className = options.className;
+    img.loading = "eager";
+    img.decoding = "async";
+    img.alt = options.alt;
+    if (options.title)
+      img.title = options.title;
+    if (thumbSrc) {
+      img.src = thumbSrc;
+      warmGalleryThumb(thumbSrc);
+    }
+    return img;
+  }
+  const el = createLazyMediaElement({
+    src: options.src,
+    mediaKind: options.mediaKind,
+    alt: options.alt,
+    className: options.className,
+    title: options.title,
+    eager: options.eager,
+    thumbTier
+  });
+  if (options.mediaKind === "image") {
+    const img = el;
+    img.loading = "eager";
+    const safeSrc = sanitizeSafeMediaUrl(options.src);
+    const thumbSrc = toThumbnailMediaUrl(safeSrc, "image", thumbTier);
+    if (thumbSrc) {
+      if (img.complete && img.src) {
+        warmGalleryThumb(thumbSrc);
+      } else if (typeof img.addEventListener === "function") {
+        img.addEventListener("load", () => warmGalleryThumb(thumbSrc), { once: true });
+      }
+    }
+  }
+  return el;
+}
+function isGalleryMediaContainer(el) {
+  const cls = el.className ?? "";
+  return cls.includes("ml-char-card-grid") || cls.includes("ml-asset-grid") || cls.includes("ml-media-list");
+}
+function reconcileContainerChildren(container, nextChildren) {
+  const current = Array.from(container.children);
+  if (current.length === nextChildren.length && nextChildren.every((el, idx) => current[idx] === el)) {
+    return;
+  }
+  if (typeof container.insertBefore !== "function") {
+    container.innerHTML = "";
+    for (const child of nextChildren) {
+      container.appendChild(child);
+    }
+    return;
+  }
+  const keepSet = new Set(nextChildren);
+  for (const child of current) {
+    if (!keepSet.has(child)) {
+      child.remove();
+    }
+  }
+  let cursor = container.firstElementChild;
+  for (const target of nextChildren) {
+    while (cursor && !keepSet.has(cursor)) {
+      const nextSib = cursor.nextElementSibling;
+      cursor.remove();
+      cursor = nextSib;
+    }
+    if (cursor === target) {
+      cursor = cursor.nextElementSibling;
+    } else {
+      container.insertBefore(target, cursor);
+    }
+  }
+}
+function updateContentSlotInPlace(bodyOnly, nextContent) {
+  if (typeof bodyOnly.insertBefore !== "function") {
+    bodyOnly.replaceWith(nextContent);
+    return;
+  }
+  const oldChildren = Array.from(bodyOnly.children);
+  const newChildren = Array.from(nextContent.children);
+  const oldGrid = oldChildren.find(isGalleryMediaContainer);
+  const newGrid = newChildren.find(isGalleryMediaContainer);
+  if (!oldGrid || !newGrid || oldGrid.className !== newGrid.className) {
+    bodyOnly.replaceWith(nextContent);
+    return;
+  }
+  const nextCards = Array.from(newGrid.children);
+  reconcileContainerChildren(oldGrid, nextCards);
+  const newGridIdx = newChildren.indexOf(newGrid);
+  for (const child of oldChildren) {
+    if (child !== oldGrid) {
+      child.remove();
+    }
+  }
+  for (let i = 0;i < newChildren.length; i++) {
+    if (i === newGridIdx)
+      continue;
+    const child = newChildren[i];
+    if (i < newGridIdx) {
+      bodyOnly.insertBefore(child, oldGrid);
+    } else {
+      bodyOnly.appendChild(child);
+    }
+  }
+}
 function inferKind(mimeType, filename) {
   if (mimeType.startsWith("video/") || /\.(mp4|webm|mov|m4v|ogv)(?:$|[?#])/i.test(filename)) {
     return "video";
@@ -3306,10 +4214,35 @@ function formatCharacterSummary(char) {
   if (char.totalSizeBytes > 0) {
     parts.push(formatBytes(char.totalSizeBytes));
   }
-  return parts.length > 0 ? parts.join(" · ") : "No localized media yet";
+  return parts.length > 0 ? parts.join(" · ") : "No media";
 }
 function defaultDirectionForSort(mode) {
   return mode === "name" ? "asc" : "desc";
+}
+function buildGalleryEmptyState(options) {
+  const el = document.createElement("div");
+  el.className = options.className ?? "ml-empty ml-empty-card";
+  const iconWrap = document.createElement("span");
+  iconWrap.className = "ml-empty-icon";
+  iconWrap.appendChild(createIcon(options.icon, 15));
+  const text = document.createElement("div");
+  text.className = "ml-empty-text";
+  text.textContent = options.message;
+  el.append(iconWrap, text);
+  return el;
+}
+function buildTileKindBadge(options) {
+  const badge = document.createElement("span");
+  badge.className = options.modifier ? `ml-tile-badge ${options.modifier}` : "ml-tile-badge";
+  if (options.title)
+    badge.title = options.title;
+  if (options.icon) {
+    badge.appendChild(createIcon(options.icon, 9));
+  }
+  const span = document.createElement("span");
+  span.textContent = options.label;
+  badge.appendChild(span);
+  return badge;
 }
 
 class LibraryGalleryView {
@@ -3330,11 +4263,23 @@ class LibraryGalleryView {
   includeEmptyCharacters = false;
   loadedIncludeEmpty = false;
   pageSize = DEFAULT_GALLERY_PAGE_SIZE;
+  thumbnailSize = DEFAULT_THUMBNAIL_SIZE;
   currentPage = 1;
   randomWeights = new Map;
   randomWeightsDirty = false;
   searchQuery = "";
   activeCharacterId = null;
+  listScrollTop = 0;
+  listPageBeforeDrilldown = 1;
+  widgetWrapEl = null;
+  refreshBtnEl = null;
+  charCardCache = new Map;
+  assetCardCache = new Map;
+  listRowCache = new Map;
+  cardClickHandlers = new WeakMap;
+  cardEditHandlers = new WeakMap;
+  rememberedScrollContainer = null;
+  pendingScrollRestore = null;
   constructor(root, callbacks, initial) {
     this.root = root;
     this.callbacks = callbacks;
@@ -3347,6 +4292,7 @@ class LibraryGalleryView {
       this.selectedMediaTypes = new Set(prefs.selectedMediaTypes);
       this.includeEmptyCharacters = prefs.includeEmptyCharacters;
       this.pageSize = prefs.pageSize;
+      this.thumbnailSize = prefs.thumbnailSize;
       if (typeof initial.state.searchQuery === "string") {
         this.searchQuery = initial.state.searchQuery;
       }
@@ -3355,6 +4301,12 @@ class LibraryGalleryView {
       }
       if (typeof initial.state.activeCharacterId === "string" || initial.state.activeCharacterId === null) {
         this.activeCharacterId = initial.state.activeCharacterId;
+      }
+      if (typeof initial.state.listScrollTop === "number" && Number.isFinite(initial.state.listScrollTop) && initial.state.listScrollTop >= 0) {
+        this.listScrollTop = initial.state.listScrollTop;
+      }
+      if (typeof initial.state.listPageBeforeDrilldown === "number" && Number.isFinite(initial.state.listPageBeforeDrilldown) && initial.state.listPageBeforeDrilldown >= 1) {
+        this.listPageBeforeDrilldown = Math.floor(initial.state.listPageBeforeDrilldown);
       }
     }
     if (initial?.cache) {
@@ -3374,14 +4326,74 @@ class LibraryGalleryView {
       selectedMediaTypes: Array.from(this.selectedMediaTypes),
       includeEmptyCharacters: this.includeEmptyCharacters,
       pageSize: this.pageSize,
+      thumbnailSize: this.thumbnailSize,
       searchQuery: this.searchQuery,
       currentPage: this.currentPage,
-      activeCharacterId: this.activeCharacterId
+      activeCharacterId: this.activeCharacterId,
+      listScrollTop: this.listScrollTop,
+      listPageBeforeDrilldown: this.listPageBeforeDrilldown
     };
+  }
+  getScrollContainer() {
+    return resolveScrollContainer(this.root.parentElement, this.rememberedScrollContainer, this.root.parentElement);
+  }
+  readScrollTop() {
+    if (this.callbacks.onGetScrollTop) {
+      const value = this.callbacks.onGetScrollTop();
+      return Number.isFinite(value) && value >= 0 ? value : 0;
+    }
+    const host = this.getScrollContainer();
+    if (host && typeof host.scrollTop === "number" && Number.isFinite(host.scrollTop)) {
+      this.rememberedScrollContainer = host;
+      return Math.max(0, host.scrollTop);
+    }
+    return 0;
+  }
+  applyScrollTop(scrollTop) {
+    const next = Number.isFinite(scrollTop) && scrollTop >= 0 ? scrollTop : 0;
+    if (this.callbacks.onSetScrollTop) {
+      this.callbacks.onSetScrollTop(next);
+      return;
+    }
+    this.pendingScrollRestore = applyScrollTopWithSettlement(() => this.getScrollContainer(), next, this.pendingScrollRestore, () => this.destroyed);
   }
   destroy() {
     this.destroyed = true;
+    this.pendingScrollRestore?.cancel();
+    this.pendingScrollRestore = null;
+    this.rememberedScrollContainer = null;
     this.pendingRefresh = null;
+    this.widgetWrapEl = null;
+    this.refreshBtnEl = null;
+    this.clearRenderCaches();
+  }
+  syncWrapperThumbnailClass() {
+    if (this.widgetWrapEl) {
+      this.widgetWrapEl.className = `ml-widget ${getThumbnailSizeClass(this.thumbnailSize)}`;
+    }
+  }
+  clearRenderCaches() {
+    this.charCardCache.clear();
+    this.assetCardCache.clear();
+    this.listRowCache.clear();
+  }
+  pruneRenderCache(cache, usedKeys, maxSize = MAX_DOM_NODE_CACHE) {
+    const limit = Math.max(maxSize, usedKeys.size);
+    if (cache.size <= limit)
+      return;
+    for (const key of cache.keys()) {
+      if (cache.size <= limit)
+        break;
+      if (!usedKeys.has(key)) {
+        cache.delete(key);
+      }
+    }
+  }
+  syncToolbarControls() {
+    if (this.refreshBtnEl) {
+      this.refreshBtnEl.disabled = this.loading;
+      this.refreshBtnEl.className = `ml-btn ml-icon-btn is-sm${this.loading ? " is-busy" : ""}`;
+    }
   }
   emitStateChange() {
     if (this.destroyed)
@@ -3416,6 +4428,9 @@ class LibraryGalleryView {
       return this.activeRefreshPromise;
     }
     const run = (async () => {
+      const prevActiveCharId = this.activeCharacterId;
+      const prevHadError = Boolean(this.error) || Boolean(this.root.querySelector(".ml-error-banner"));
+      let drilldownExited = false;
       let nextRefresh = {
         preserveActive,
         reshuffleRandom
@@ -3429,8 +4444,11 @@ class LibraryGalleryView {
         if (this.sortMode === "random" && current.reshuffleRandom) {
           this.reshuffleRandomOrder();
         }
-        if (!this.characters)
+        if (!this.characters) {
           this.render();
+        } else if (this.root.querySelector(".ml-gallery-toolbar")) {
+          this.syncToolbarControls();
+        }
         try {
           const loaded = await this.callbacks.onLoadLibraryMedia({
             includeEmpty: requestedIncludeEmpty
@@ -3440,8 +4458,13 @@ class LibraryGalleryView {
           this.characters = loaded;
           this.precomputedCharCache = new WeakMap;
           this.loadedIncludeEmpty = requestedIncludeEmpty;
-          if (!current.preserveActive || this.activeCharacterId && !this.characters.some((c) => c.characterId === this.activeCharacterId)) {
+          const activeCharMissing = Boolean(this.activeCharacterId) && !this.characters.some((c) => c.characterId === this.activeCharacterId);
+          if (!current.preserveActive || activeCharMissing) {
             this.activeCharacterId = null;
+            if (activeCharMissing && current.preserveActive) {
+              this.currentPage = this.listPageBeforeDrilldown >= 1 ? this.listPageBeforeDrilldown : 1;
+              drilldownExited = true;
+            }
           }
           this.emitCacheChange();
           this.emitStateChange();
@@ -3462,7 +4485,14 @@ class LibraryGalleryView {
         }
       }
       if (!this.destroyed) {
-        this.render();
+        drilldownExited = drilldownExited && prevActiveCharId !== null && this.activeCharacterId === null;
+        const canUpdateInPlace = Boolean(this.characters && this.characters.length > 0) && !this.error && !prevHadError && this.activeCharacterId === prevActiveCharId && Boolean(this.root.querySelector(".ml-gallery-toolbar")) && Boolean(this.root.querySelector(".ml-gallery-content-slot"));
+        if (canUpdateInPlace) {
+          this.syncToolbarControls();
+          this.rerenderContentSlot();
+        } else {
+          this.render(drilldownExited ? { scrollTop: this.listScrollTop } : undefined);
+        }
       }
     })().finally(() => {
       this.activeRefreshPromise = null;
@@ -3505,35 +4535,50 @@ class LibraryGalleryView {
     }
     return w;
   }
-  render() {
+  render(options) {
     if (this.destroyed)
       return;
+    const isPlaceholder = !this.characters && (this.loading || !this.error);
+    const targetScrollTop = options?.scrollTop !== undefined ? options.scrollTop : isPlaceholder ? undefined : this.readScrollTop();
     this.root.innerHTML = "";
+    this.widgetWrapEl = null;
+    this.refreshBtnEl = null;
     const wrap = document.createElement("div");
-    wrap.className = "ml-widget";
+    wrap.className = `ml-widget ${getThumbnailSizeClass(this.thumbnailSize)}`;
+    this.widgetWrapEl = wrap;
     if (this.error) {
       const err = document.createElement("div");
       err.className = "ml-error-banner";
-      err.textContent = this.error;
+      err.appendChild(createIcon("alert", 13));
+      const errText = document.createElement("span");
+      errText.textContent = this.error;
+      err.appendChild(errText);
       wrap.appendChild(err);
     }
     const toolbar = this.renderToolbar();
     wrap.appendChild(toolbar);
-    if (!this.characters && (this.loading || !this.error)) {
-      const msg = document.createElement("div");
-      msg.className = "ml-section ml-empty";
-      msg.textContent = "Loading library media gallery...";
-      wrap.appendChild(msg);
+    if (isPlaceholder) {
+      this.clearRenderCaches();
+      wrap.appendChild(buildGalleryEmptyState({
+        icon: "refresh",
+        message: "Loading library media gallery...",
+        className: "ml-section ml-empty ml-loading-card ml-placeholder"
+      }));
       this.root.appendChild(wrap);
       return;
     }
     const chars = this.characters ?? [];
     if (chars.length === 0) {
-      const empty = document.createElement("div");
-      empty.className = "ml-section ml-empty";
-      empty.textContent = this.includeEmptyCharacters ? "No character cards found in your library." : "No localized media or native expressions found yet. Enable All Cards to browse every character.";
-      wrap.appendChild(empty);
+      this.clearRenderCaches();
+      wrap.appendChild(buildGalleryEmptyState({
+        icon: "image",
+        message: this.includeEmptyCharacters ? "No character cards found in your library." : "No localized media or native expressions found yet. Enable All Cards to browse every character.",
+        className: "ml-section ml-empty ml-empty-card"
+      }));
       this.root.appendChild(wrap);
+      if (targetScrollTop !== undefined) {
+        this.applyScrollTop(targetScrollTop);
+      }
       return;
     }
     if (this.grouped) {
@@ -3542,75 +4587,50 @@ class LibraryGalleryView {
         if (selected) {
           wrap.appendChild(this.renderCharacterDrilldown(selected));
           this.root.appendChild(wrap);
+          if (targetScrollTop !== undefined) {
+            this.applyScrollTop(targetScrollTop);
+          }
           return;
         }
         this.activeCharacterId = null;
+        this.currentPage = this.listPageBeforeDrilldown >= 1 ? this.listPageBeforeDrilldown : 1;
       }
       wrap.appendChild(this.renderGroupedCharacters(chars));
     } else {
       wrap.appendChild(this.renderFlatMedia(chars));
     }
     this.root.appendChild(wrap);
+    if (targetScrollTop !== undefined) {
+      this.applyScrollTop(targetScrollTop);
+    }
   }
   renderToolbar() {
     const box = document.createElement("div");
     box.className = "ml-section ml-gallery-toolbar";
     const row1 = document.createElement("div");
-    row1.className = "ml-header-bar";
-    const titleWrap = document.createElement("div");
-    titleWrap.className = "ml-inline-title";
-    const title = document.createElement("span");
-    title.className = "ml-title";
-    title.textContent = "Library Gallery";
-    titleWrap.append(title, createInfoTip("Browse localized media and character expressions across your entire library. Search by character name, tag (e.g. tag:fantasy or #fantasy), filename, or expression."));
-    const rightBtns = document.createElement("div");
-    rightBtns.className = "ml-header-actions";
-    const groupBtn = createIconButton({
-      icon: "group",
-      label: "Group",
-      title: this.grouped ? "Grouped by character card (click for flat media view)" : "Flat media view (click to group by character card)",
-      className: `ml-btn is-sm ${this.grouped ? "is-active" : ""}`,
-      size: 13,
-      onClick: () => {
-        this.grouped = !this.grouped;
-        this.currentPage = 1;
-        if (!this.grouped) {
-          this.activeCharacterId = null;
-          if (this.sortMode === "count") {
-            this.sortMode = "recent";
-            this.sortDirection = defaultDirectionForSort("recent");
-          }
-        }
-        if (this.sortMode === "random")
-          this.reshuffleRandomOrder();
-        this.emitStateChange();
-        this.render();
-      }
+    row1.className = "ml-gallery-controls";
+    const infoTip = createInfoTip("Browse localized media and character expressions across your entire library. Search by character name, tag (e.g. tag:fantasy or #fantasy), filename, or expression.");
+    const searchWrap = document.createElement("div");
+    searchWrap.className = "ml-input-wrap";
+    const searchIcon = document.createElement("span");
+    searchIcon.className = "ml-input-icon";
+    searchIcon.appendChild(createIcon("search", 13));
+    const searchInput = document.createElement("input");
+    searchInput.type = "search";
+    searchInput.className = "ml-input-text has-icon";
+    searchInput.placeholder = "Search name, tag, tag:name, file...";
+    searchInput.value = this.searchQuery;
+    searchInput.addEventListener("input", () => {
+      this.searchQuery = searchInput.value;
+      this.currentPage = 1;
+      this.emitStateChange();
+      this.rerenderContentSlot();
     });
-    const allCardsBtn = createIconButton({
-      icon: "users",
-      label: "All Cards",
-      title: "Show all character cards in the library, even those without localized media yet",
-      className: `ml-btn is-sm ${this.includeEmptyCharacters ? "is-active" : ""}`,
-      size: 13,
-      onClick: () => {
-        this.includeEmptyCharacters = !this.includeEmptyCharacters;
-        this.currentPage = 1;
-        if (this.sortMode === "random")
-          this.reshuffleRandomOrder();
-        this.emitStateChange();
-        if (this.includeEmptyCharacters && !this.loadedIncludeEmpty) {
-          this.render();
-          this.refresh();
-        } else {
-          this.render();
-        }
-      }
-    });
+    searchWrap.append(searchIcon, searchInput);
     const gridBtn = createIconButton({
       icon: "grid",
       title: "Grid view",
-      className: `ml-btn ml-icon-btn is-sm ${this.viewMode === "grid" ? "is-active" : ""}`,
+      className: `ml-btn ml-icon-btn is-sm${this.viewMode === "grid" ? " is-active" : ""}`,
       size: 13,
       onClick: () => {
         this.viewMode = "grid";
@@ -3621,7 +4641,7 @@ class LibraryGalleryView {
     const listBtn = createIconButton({
       icon: "list",
       title: "List view",
-      className: `ml-btn ml-icon-btn is-sm ${this.viewMode === "list" ? "is-active" : ""}`,
+      className: `ml-btn ml-icon-btn is-sm${this.viewMode === "list" ? " is-active" : ""}`,
       size: 13,
       onClick: () => {
         this.viewMode = "list";
@@ -3629,29 +4649,24 @@ class LibraryGalleryView {
         this.render();
       }
     });
+    const viewSegmented = document.createElement("div");
+    viewSegmented.className = "ml-segmented";
+    viewSegmented.append(gridBtn, listBtn);
     const refreshBtn = createIconButton({
       icon: "refresh",
       title: "Refresh library media list",
-      className: `ml-btn ml-icon-btn is-sm ${this.loading ? "is-busy" : ""}`,
+      className: `ml-btn ml-icon-btn is-sm${this.loading ? " is-busy" : ""}`,
       size: 13,
       disabled: this.loading,
       onClick: () => void this.refresh()
     });
-    rightBtns.append(groupBtn, allCardsBtn, gridBtn, listBtn, refreshBtn);
-    row1.append(titleWrap, rightBtns);
+    this.refreshBtnEl = refreshBtn;
+    const viewActions = document.createElement("div");
+    viewActions.className = "ml-header-actions";
+    viewActions.append(viewSegmented, refreshBtn);
+    row1.append(infoTip, searchWrap, viewActions);
     const row2 = document.createElement("div");
-    row2.className = "ml-gallery-controls";
-    const searchInput = document.createElement("input");
-    searchInput.type = "search";
-    searchInput.className = "ml-input-text";
-    searchInput.placeholder = "Search name, tag, tag:name, filename...";
-    searchInput.value = this.searchQuery;
-    searchInput.addEventListener("input", () => {
-      this.searchQuery = searchInput.value;
-      this.currentPage = 1;
-      this.emitStateChange();
-      this.rerenderContentSlot();
-    });
+    row2.className = "ml-header-bar";
     const sortGroup = document.createElement("div");
     sortGroup.className = "ml-sort-group";
     const sortSelect = document.createElement("select");
@@ -3661,13 +4676,13 @@ class LibraryGalleryView {
     const sortOpts = [
       ...isGroupedCards ? [
         { value: "name", label: "Sort: Name" },
-        { value: "count", label: "Sort: Media Count" },
-        { value: "size", label: "Sort: File Size" },
+        { value: "count", label: "Sort: Count" },
+        { value: "size", label: "Sort: Size" },
         { value: "recent", label: "Sort: Recent" }
       ] : [
         { value: "recent", label: "Sort: Recent" },
         { value: "name", label: "Sort: Name" },
-        { value: "size", label: "Sort: File Size" }
+        { value: "size", label: "Sort: Size" }
       ],
       { value: "random", label: "Sort: Random" }
     ];
@@ -3715,15 +4730,69 @@ class LibraryGalleryView {
       }
     });
     sortGroup.append(sortSelect, sortDirBtn);
-    row2.append(searchInput, sortGroup);
+    const modeBtns = document.createElement("div");
+    modeBtns.className = "ml-header-actions";
+    const groupBtn = createIconButton({
+      icon: "group",
+      label: "Group",
+      title: this.grouped ? "Grouped by character card (click for flat media view)" : "Flat media view (click to group by character card)",
+      className: `ml-btn is-sm ${this.grouped ? "is-active" : ""}`,
+      size: 12,
+      onClick: () => {
+        this.grouped = !this.grouped;
+        this.currentPage = 1;
+        if (!this.grouped) {
+          this.activeCharacterId = null;
+          if (this.sortMode === "count") {
+            this.sortMode = "recent";
+            this.sortDirection = defaultDirectionForSort("recent");
+          }
+        }
+        if (this.sortMode === "random")
+          this.reshuffleRandomOrder();
+        this.emitStateChange();
+        this.render();
+      }
+    });
+    const allCardsBtn = createIconButton({
+      icon: "users",
+      label: "All Cards",
+      title: "Show all character cards in the library, even those without localized media yet",
+      className: `ml-btn is-sm ${this.includeEmptyCharacters ? "is-active" : ""}`,
+      size: 12,
+      onClick: () => {
+        this.includeEmptyCharacters = !this.includeEmptyCharacters;
+        this.currentPage = 1;
+        if (this.sortMode === "random")
+          this.reshuffleRandomOrder();
+        this.emitStateChange();
+        if (this.includeEmptyCharacters && !this.loadedIncludeEmpty) {
+          this.render();
+          this.refresh();
+        } else {
+          this.render();
+        }
+      }
+    });
+    const thumbSizeToggle = createThumbnailSizeSegmented(this.thumbnailSize, (nextSize) => {
+      this.thumbnailSize = nextSize;
+      this.syncWrapperThumbnailClass();
+      this.emitStateChange();
+      this.rerenderContentSlot();
+    });
+    modeBtns.append(thumbSizeToggle, groupBtn, allCardsBtn);
+    row2.append(sortGroup, modeBtns);
     const row3 = document.createElement("div");
     row3.className = "ml-pill-row ml-gallery-type-pills";
     const allOn = this.selectedMediaTypes.size === ALL_GALLERY_MEDIA_TYPES.length;
     const allPill = document.createElement("button");
     allPill.type = "button";
     allPill.className = `ml-pill ${allOn ? "is-selected" : ""}`;
-    allPill.textContent = "All Media";
     allPill.title = "Turn on all media types";
+    allPill.appendChild(createIcon("layers", 11));
+    const allPillLabel = document.createElement("span");
+    allPillLabel.textContent = "All Media";
+    allPill.appendChild(allPillLabel);
     allPill.addEventListener("click", () => {
       this.selectedMediaTypes = new Set(ALL_GALLERY_MEDIA_TYPES);
       this.currentPage = 1;
@@ -3732,18 +4801,21 @@ class LibraryGalleryView {
     });
     row3.appendChild(allPill);
     const typeToggles = [
-      { type: "image", label: "Images", title: "Toggle localized images" },
-      { type: "video", label: "Videos", title: "Toggle localized videos" },
-      { type: "expression", label: "Expressions", title: "Toggle character expressions" },
-      { type: "avatar", label: "Avatars", title: "Toggle character card avatars" }
+      { type: "image", label: "Images", title: "Toggle localized images", icon: "image", pillClass: "is-image" },
+      { type: "video", label: "Videos", title: "Toggle localized videos", icon: "video", pillClass: "is-video" },
+      { type: "expression", label: "Expressions", title: "Toggle character expressions", icon: "smile", pillClass: "is-expression" },
+      { type: "avatar", label: "Avatars", title: "Toggle character card avatars", icon: "user", pillClass: "is-avatar" }
     ];
     for (const def of typeToggles) {
       const isSelected = this.selectedMediaTypes.has(def.type);
       const pill = document.createElement("button");
       pill.type = "button";
-      pill.className = `ml-pill ${isSelected ? "is-selected" : ""}`;
-      pill.textContent = def.label;
+      pill.className = `ml-pill ${def.pillClass}${isSelected ? " is-selected" : ""}`;
       pill.title = def.title;
+      pill.appendChild(createIcon(def.icon, 11));
+      const pillLabel = document.createElement("span");
+      pillLabel.textContent = def.label;
+      pill.appendChild(pillLabel);
       pill.addEventListener("click", () => {
         if (this.selectedMediaTypes.has(def.type)) {
           this.selectedMediaTypes.delete(def.type);
@@ -3768,9 +4840,11 @@ class LibraryGalleryView {
     }
     const bodyOnly = this.root.querySelector(".ml-gallery-content-slot");
     if (bodyOnly) {
+      const savedScrollTop = this.readScrollTop();
       const selectedChar = this.activeCharacterId ? this.characters.find((c) => c.characterId === this.activeCharacterId) : undefined;
       const nextContent = this.grouped ? selectedChar ? this.renderCharacterDrilldown(selectedChar) : this.renderGroupedCharacters(this.characters) : this.renderFlatMedia(this.characters);
-      bodyOnly.replaceWith(nextContent);
+      updateContentSlotInPlace(bodyOnly, nextContent);
+      this.applyScrollTop(savedScrollTop);
     } else {
       this.render();
     }
@@ -3796,8 +4870,15 @@ class LibraryGalleryView {
       badgeText: "Avatar",
       searchBlob: `${lowerName} avatar`
     } : null;
+    let hasImage = false;
+    let videoCount = 0;
     const localizedEntries = char.localizedAssets.map((asset) => {
       const kind = inferKind(asset.mimeType, asset.filename);
+      if (kind === "video") {
+        videoCount++;
+      } else {
+        hasImage = true;
+      }
       return {
         kind,
         entry: {
@@ -3833,16 +4914,31 @@ class LibraryGalleryView {
       badgeText: "Expr",
       searchBlob: `${lowerName} ${expr.label} ${expr.groupName ?? ""} expression`.toLowerCase()
     }));
+    const fallbackAsset = !char.avatarUrl ? char.localizedAssets[0] : undefined;
+    const thumbUrl = char.avatarUrl ?? fallbackAsset?.localUrl ?? char.expressions[0]?.localUrl ?? "";
+    const thumbKind = fallbackAsset ? inferKind(fallbackAsset.mimeType, fallbackAsset.filename) : "image";
     cached = {
       lowerName,
       lowerTags,
+      tagsSig: (char.tags ?? []).join("\x00"),
+      summaryText: formatCharacterSummary(char),
       hasMedia: hasCharacterMedia(char),
+      hasAvatar: avatarEntry !== null,
+      hasImage,
+      hasVideo: videoCount > 0,
+      hasExpression: expressionEntries.length > 0,
+      videoCount,
+      thumbUrl,
+      thumbKind,
       avatarEntry,
       localizedEntries,
       expressionEntries
     };
     this.precomputedCharCache.set(char, cached);
     return cached;
+  }
+  hasAnySelectedEntry(pre) {
+    return pre.hasAvatar && this.selectedMediaTypes.has("avatar") || pre.hasImage && this.selectedMediaTypes.has("image") || pre.hasVideo && this.selectedMediaTypes.has("video") || pre.hasExpression && this.selectedMediaTypes.has("expression");
   }
   getCharEntries(char, includeAvatar) {
     const pre = this.getPrecomputedChar(char);
@@ -3890,7 +4986,7 @@ class LibraryGalleryView {
     const info = document.createElement("div");
     info.className = "ml-gallery-pagination-info";
     const summary = document.createElement("span");
-    summary.textContent = options.totalPages > 1 ? `Showing ${options.startIndex + 1}–${options.endIndex} of ${options.totalItems} ${options.unitLabel}` : `${options.totalItems} ${options.unitLabel}`;
+    summary.textContent = options.totalPages > 1 ? `${options.startIndex + 1}–${options.endIndex} / ${options.totalItems} ${options.unitLabel}` : `${options.totalItems} ${options.unitLabel}`;
     info.appendChild(summary);
     if (options.includePageSizeSelect) {
       const sizeSelect = document.createElement("select");
@@ -3899,7 +4995,7 @@ class LibraryGalleryView {
       for (const size of GALLERY_PAGE_SIZE_OPTIONS) {
         const opt = document.createElement("option");
         opt.value = String(size);
-        opt.textContent = size === 0 ? "Show: All" : `${size} / page`;
+        opt.textContent = size === 0 ? "All" : `${size} / pg`;
         if (size === this.pageSize)
           opt.selected = true;
         sizeSelect.appendChild(opt);
@@ -3960,6 +5056,7 @@ class LibraryGalleryView {
     const startIndex = (page - 1) * effectiveSize;
     const endIndex = Math.min(totalItems, startIndex + effectiveSize);
     const pageItems = this.pageSize > 0 ? items.slice(startIndex, endIndex) : items;
+    const showPageSizeSelect = totalItems > GALLERY_PAGE_SIZE_OPTIONS[0] || totalPages > 1 || this.pageSize !== DEFAULT_GALLERY_PAGE_SIZE;
     slot.appendChild(this.buildPaginationBar({
       totalItems,
       startIndex,
@@ -3967,7 +5064,7 @@ class LibraryGalleryView {
       page,
       totalPages,
       unitLabel,
-      includePageSizeSelect: true
+      includePageSizeSelect: showPageSizeSelect
     }));
     slot.appendChild(renderPageItems(pageItems));
     if (totalPages > 1 && pageItems.length >= 12) {
@@ -3992,12 +5089,12 @@ class LibraryGalleryView {
       if (!this.includeEmptyCharacters && !pre.hasMedia) {
         return false;
       }
-      const entries = this.getCharEntries(char, true);
-      if (!this.includeEmptyCharacters && entries.length === 0) {
+      if (!this.includeEmptyCharacters && !this.hasAnySelectedEntry(pre)) {
         return false;
       }
       if (!parsedQuery.hasQuery)
         return true;
+      const entries = this.getCharEntries(char, true);
       const haystacks = [pre.lowerName, ...entries.map((e) => e.searchBlob)];
       return matchesSearchText(haystacks, pre.lowerTags, parsedQuery);
     });
@@ -4022,100 +5119,238 @@ class LibraryGalleryView {
       });
     }
     if (filtered.length === 0) {
-      const empty = document.createElement("div");
-      empty.className = "ml-empty";
-      empty.textContent = this.selectedMediaTypes.size === 0 && !this.includeEmptyCharacters ? "No media types selected. Click All Media or enable a media type." : "No character cards match the current search/filter.";
-      slot.appendChild(empty);
+      slot.appendChild(buildGalleryEmptyState({
+        icon: this.selectedMediaTypes.size === 0 && !this.includeEmptyCharacters ? "filter" : "search",
+        message: this.selectedMediaTypes.size === 0 && !this.includeEmptyCharacters ? "No media types selected. Click All Media or enable a media type." : "No character cards match the current search/filter."
+      }));
       return slot;
     }
     const openDrilldown = (characterId) => {
+      this.listScrollTop = this.readScrollTop();
+      this.listPageBeforeDrilldown = this.currentPage >= 1 ? this.currentPage : 1;
       this.activeCharacterId = characterId;
       this.currentPage = 1;
       if (this.sortMode === "random")
         this.reshuffleRandomOrder();
       this.emitStateChange();
-      this.render();
+      this.render({ scrollTop: 0 });
+    };
+    const thumbTier = getThumbnailImageTier(this.thumbnailSize);
+    const computeCharSig = (char, pre) => {
+      const thumbSrc = pre.thumbUrl ? toThumbnailMediaUrl(sanitizeSafeMediaUrl(pre.thumbUrl), pre.thumbKind, thumbTier) ?? pre.thumbUrl : "";
+      return [
+        char.characterName,
+        thumbSrc,
+        pre.thumbKind,
+        pre.videoCount,
+        char.localizedAssets.length,
+        char.expressions.length,
+        char.totalSizeBytes,
+        char.lastLocalizedAt,
+        pre.tagsSig
+      ].join("\x01");
     };
     this.appendPaginatedContent(slot, filtered, "cards", (pageChars) => {
+      const usedKeys = new Set;
+      const eagerAllOnPage = pageChars.length <= EAGER_PAGE_ITEM_LIMIT;
       if (this.viewMode === "list") {
         const list = document.createElement("div");
         list.className = "ml-media-list";
-        for (const char of pageChars) {
-          const row = document.createElement("div");
-          row.className = "ml-media-list-row";
-          row.addEventListener("click", () => openDrilldown(char.characterId));
-          const thumbUrl = char.avatarUrl ?? char.localizedAssets[0]?.localUrl ?? char.expressions[0]?.localUrl;
-          if (thumbUrl) {
-            row.appendChild(createLazyMediaElement({
-              src: thumbUrl,
-              mediaKind: "image",
-              alt: char.characterName,
-              className: "ml-media-list-thumb"
-            }));
+        pageChars.forEach((char, idx) => {
+          const pre = this.getPrecomputedChar(char);
+          const sig = computeCharSig(char, pre);
+          const cacheKey = `char:${char.characterId}`;
+          usedKeys.add(cacheKey);
+          const cached = this.listRowCache.get(cacheKey);
+          let row;
+          if (cached && cached.sig === sig) {
+            row = cached.el;
+            reobserveLazyMedia(row);
+            this.listRowCache.delete(cacheKey);
+            this.listRowCache.set(cacheKey, cached);
+          } else {
+            row = document.createElement("div");
+            row.className = "ml-media-list-row";
+            row.addEventListener("click", () => this.cardClickHandlers.get(row)?.());
+            const thumbWrap = document.createElement("div");
+            thumbWrap.className = "ml-media-list-thumb-wrap";
+            if (pre.thumbUrl) {
+              thumbWrap.appendChild(createGalleryMediaElement({
+                src: pre.thumbUrl,
+                mediaKind: pre.thumbKind,
+                alt: char.characterName,
+                className: "ml-media-list-thumb",
+                eager: eagerAllOnPage || idx < EAGER_LEADING_WINDOW,
+                thumbTier
+              }));
+              if (pre.thumbKind === "video" || pre.videoCount > 0) {
+                const kindBadge = document.createElement("span");
+                kindBadge.className = "ml-media-list-kind-badge";
+                kindBadge.appendChild(createIcon("video", 9));
+                thumbWrap.appendChild(kindBadge);
+              }
+            } else {
+              const placeholder = document.createElement("div");
+              placeholder.className = "ml-media-list-placeholder";
+              placeholder.appendChild(createIcon("user", 15));
+              thumbWrap.appendChild(placeholder);
+            }
+            row.appendChild(thumbWrap);
+            const meta = document.createElement("div");
+            meta.className = "ml-url-meta";
+            const name = document.createElement("div");
+            name.className = "ml-url-text";
+            name.textContent = char.characterName;
+            const sub = document.createElement("div");
+            sub.className = "ml-url-sources";
+            sub.textContent = pre.summaryText;
+            if (char.tags && char.tags.length > 0) {
+              row.title = `Tags: ${char.tags.join(", ")}`;
+            }
+            meta.append(name, sub);
+            const chevron = createIcon("chevron-right", 13);
+            row.appendChild(meta);
+            if (this.callbacks.onOpenCharacterEditor) {
+              const editBtn = createIconButton({
+                icon: "edit",
+                title: `Edit "${char.characterName}" in native Character Editor`,
+                className: "ml-btn ml-icon-btn is-sm",
+                size: 12,
+                onClick: (ev) => {
+                  ev.stopPropagation();
+                  this.cardEditHandlers.get(row)?.();
+                }
+              });
+              row.appendChild(editBtn);
+            }
+            row.appendChild(chevron);
+            this.listRowCache.set(cacheKey, { sig, el: row });
           }
-          const meta = document.createElement("div");
-          meta.className = "ml-url-meta";
-          const name = document.createElement("div");
-          name.className = "ml-url-text";
-          name.textContent = char.characterName;
-          const sub = document.createElement("div");
-          sub.className = "ml-url-sources";
-          sub.textContent = formatCharacterSummary(char);
-          if (char.tags && char.tags.length > 0) {
-            row.title = `Tags: ${char.tags.join(", ")}`;
+          this.cardClickHandlers.set(row, () => openDrilldown(char.characterId));
+          if (this.callbacks.onOpenCharacterEditor) {
+            const onOpenEdit = this.callbacks.onOpenCharacterEditor;
+            this.cardEditHandlers.set(row, () => onOpenEdit(char.characterId));
           }
-          meta.append(name, sub);
-          const chevron = createIcon("chevron-right", 14);
-          row.append(meta, chevron);
           list.appendChild(row);
-        }
+        });
+        this.pruneRenderCache(this.listRowCache, usedKeys);
         return list;
       }
       const grid = document.createElement("div");
       grid.className = "ml-char-card-grid";
-      for (const char of pageChars) {
-        const card = document.createElement("button");
-        card.type = "button";
-        card.className = "ml-char-card";
-        card.addEventListener("click", () => openDrilldown(char.characterId));
-        if (char.tags && char.tags.length > 0) {
-          card.title = `${char.characterName}
-Tags: ${char.tags.join(", ")}`;
-        }
-        const thumbUrl = char.avatarUrl ?? char.localizedAssets[0]?.localUrl ?? char.expressions[0]?.localUrl;
-        const mediaWrap = document.createElement("div");
-        mediaWrap.className = "ml-char-card-thumb-wrap";
-        if (thumbUrl) {
-          mediaWrap.appendChild(createLazyMediaElement({
-            src: thumbUrl,
-            mediaKind: "image",
-            alt: char.characterName,
-            className: "ml-char-card-thumb"
-          }));
+      pageChars.forEach((char, idx) => {
+        const pre = this.getPrecomputedChar(char);
+        const sig = computeCharSig(char, pre);
+        const cacheKey = char.characterId;
+        usedKeys.add(cacheKey);
+        const cached = this.charCardCache.get(cacheKey);
+        let card;
+        if (cached && cached.sig === sig) {
+          card = cached.el;
+          reobserveLazyMedia(card);
+          this.charCardCache.delete(cacheKey);
+          this.charCardCache.set(cacheKey, cached);
         } else {
-          const placeholder = document.createElement("div");
-          placeholder.className = "ml-char-card-placeholder";
-          placeholder.appendChild(createIcon("image", 24));
-          mediaWrap.appendChild(placeholder);
+          const cardEl = document.createElement("div");
+          cardEl.className = "ml-char-card";
+          cardEl.setAttribute("role", "button");
+          cardEl.tabIndex = 0;
+          cardEl.addEventListener("click", () => this.cardClickHandlers.get(cardEl)?.());
+          cardEl.addEventListener("keydown", (ev) => {
+            if (ev.target === cardEl && (ev.key === "Enter" || ev.key === " ")) {
+              ev.preventDefault();
+              this.cardClickHandlers.get(cardEl)?.();
+            }
+          });
+          if (char.tags && char.tags.length > 0) {
+            cardEl.title = `${char.characterName}
+Tags: ${char.tags.join(", ")}`;
+          }
+          const mediaWrap = document.createElement("div");
+          mediaWrap.className = "ml-char-card-thumb-wrap";
+          if (pre.thumbUrl) {
+            mediaWrap.appendChild(createGalleryMediaElement({
+              src: pre.thumbUrl,
+              mediaKind: pre.thumbKind,
+              alt: char.characterName,
+              className: "ml-char-card-thumb",
+              eager: eagerAllOnPage || idx < EAGER_LEADING_WINDOW,
+              thumbTier
+            }));
+          } else {
+            const placeholder = document.createElement("div");
+            placeholder.className = "ml-char-card-placeholder";
+            placeholder.appendChild(createIcon("user", 24));
+            mediaWrap.appendChild(placeholder);
+          }
+          const scrim = document.createElement("div");
+          scrim.className = "ml-char-card-scrim";
+          mediaWrap.appendChild(scrim);
+          const badgesWrap = document.createElement("div");
+          badgesWrap.className = "ml-char-card-badges";
+          const total = char.localizedAssets.length + char.expressions.length;
+          badgesWrap.appendChild(buildTileKindBadge({
+            label: `${total}`,
+            title: `${total} total item(s)`
+          }));
+          if (pre.videoCount > 0) {
+            badgesWrap.appendChild(buildTileKindBadge({
+              icon: "video",
+              label: `${pre.videoCount}`,
+              modifier: "is-video",
+              title: `${pre.videoCount} localized video(s)`
+            }));
+          }
+          if (char.expressions.length > 0) {
+            badgesWrap.appendChild(buildTileKindBadge({
+              icon: "smile",
+              label: `${char.expressions.length}`,
+              modifier: "is-expression",
+              title: `${char.expressions.length} character expression(s)`
+            }));
+          }
+          mediaWrap.appendChild(badgesWrap);
+          if (this.callbacks.onOpenCharacterEditor) {
+            const editBtn = createIconButton({
+              icon: "edit",
+              title: `Edit "${char.characterName}" in native Character Editor`,
+              className: "ml-char-card-edit-btn",
+              size: 11,
+              onClick: (ev) => {
+                ev.stopPropagation();
+                this.cardEditHandlers.get(cardEl)?.();
+              }
+            });
+            editBtn.addEventListener("keydown", (ev) => {
+              if (ev.key === "Enter" || ev.key === " ") {
+                ev.stopPropagation();
+              }
+            });
+            mediaWrap.appendChild(editBtn);
+          }
+          const footer = document.createElement("div");
+          footer.className = "ml-char-card-footer";
+          const nameEl = document.createElement("div");
+          nameEl.className = "ml-char-card-name";
+          nameEl.textContent = char.characterName;
+          nameEl.title = char.characterName;
+          const statLine = document.createElement("div");
+          statLine.className = "ml-url-sources";
+          statLine.textContent = pre.summaryText;
+          statLine.title = pre.summaryText;
+          footer.append(nameEl, statLine);
+          cardEl.append(mediaWrap, footer);
+          card = cardEl;
+          this.charCardCache.set(cacheKey, { sig, el: card });
         }
-        const countPill = document.createElement("span");
-        countPill.className = "ml-tile-badge";
-        const total = char.localizedAssets.length + char.expressions.length;
-        countPill.textContent = `${total}`;
-        mediaWrap.appendChild(countPill);
-        const footer = document.createElement("div");
-        footer.className = "ml-char-card-footer";
-        const nameEl = document.createElement("div");
-        nameEl.className = "ml-char-card-name";
-        nameEl.textContent = char.characterName;
-        nameEl.title = char.characterName;
-        const statLine = document.createElement("div");
-        statLine.className = "ml-url-sources";
-        statLine.textContent = formatCharacterSummary(char);
-        footer.append(nameEl, statLine);
-        card.append(mediaWrap, footer);
+        this.cardClickHandlers.set(card, () => openDrilldown(char.characterId));
+        if (this.callbacks.onOpenCharacterEditor) {
+          const onOpenEdit = this.callbacks.onOpenCharacterEditor;
+          this.cardEditHandlers.set(card, () => onOpenEdit(char.characterId));
+        }
         grid.appendChild(card);
-      }
+      });
+      this.pruneRenderCache(this.charCardCache, usedKeys);
       return grid;
     });
     return slot;
@@ -4124,31 +5359,40 @@ Tags: ${char.tags.join(", ")}`;
     const slot = document.createElement("div");
     slot.className = "ml-section ml-gallery-content-slot";
     const top = document.createElement("div");
-    top.className = "ml-header-bar";
+    top.className = "ml-gallery-drilldown-header";
     const backBtn = createIconButton({
       icon: "chevron-left",
       label: "All Characters",
       title: "Return to character library grid",
       className: "ml-btn is-sm",
-      size: 13,
+      size: 12,
       onClick: () => {
         this.activeCharacterId = null;
-        this.currentPage = 1;
-        if (this.sortMode === "random")
-          this.reshuffleRandomOrder();
+        this.currentPage = this.listPageBeforeDrilldown >= 1 ? this.listPageBeforeDrilldown : 1;
+        const restoredScrollTop = this.listScrollTop;
         this.emitStateChange();
-        this.render();
+        this.render({ scrollTop: restoredScrollTop });
       }
     });
     const charLabel = document.createElement("div");
-    charLabel.className = "ml-inline-title";
+    charLabel.className = "ml-gallery-drilldown-title";
+    if (char.avatarUrl) {
+      charLabel.appendChild(createGalleryMediaElement({
+        src: char.avatarUrl,
+        mediaKind: "image",
+        alt: char.characterName,
+        className: "ml-gallery-drilldown-avatar",
+        eager: true
+      }));
+    }
     const nameEl = document.createElement("span");
-    nameEl.className = "ml-title";
+    nameEl.className = "ml-gallery-drilldown-name";
     nameEl.textContent = char.characterName;
+    nameEl.title = char.characterName;
     charLabel.appendChild(nameEl);
     if (char.totalSizeBytes > 0) {
       const sizeBadge = document.createElement("span");
-      sizeBadge.className = "ml-badge";
+      sizeBadge.className = "ml-badge is-muted";
       sizeBadge.textContent = formatBytes(char.totalSizeBytes);
       charLabel.appendChild(sizeBadge);
     }
@@ -4165,15 +5409,26 @@ Tags: ${char.tags.join(", ")}`;
       });
       actions.appendChild(manageBtn);
     }
+    if (this.callbacks.onOpenCharacterEditor) {
+      const editBtn = createIconButton({
+        icon: "edit",
+        label: "Edit",
+        title: "Open native Character Editor for this character",
+        className: "ml-btn is-sm",
+        size: 12,
+        onClick: () => this.callbacks.onOpenCharacterEditor(char.characterId)
+      });
+      actions.appendChild(editBtn);
+    }
     top.append(backBtn, charLabel, actions);
     slot.appendChild(top);
     const parsedQuery = parseGallerySearchQuery(this.searchQuery);
     const entries = this.sortFlatEntries(this.getCharEntries(char, true).filter((e) => matchesSearchText([e.searchBlob], e.lowerTags, parsedQuery)), { pinAvatarFirst: this.sortMode !== "random" });
     if (entries.length === 0) {
-      const empty = document.createElement("div");
-      empty.className = "ml-empty";
-      empty.textContent = this.selectedMediaTypes.size === 0 ? "No media types selected. Click All Media or enable a media type." : !hasCharacterMedia(char) && !parsedQuery.hasQuery ? "No localized media yet. Click Manage to scan and localize this character." : "No items match the current filter.";
-      slot.appendChild(empty);
+      slot.appendChild(buildGalleryEmptyState({
+        icon: this.selectedMediaTypes.size === 0 ? "filter" : !hasCharacterMedia(char) && !parsedQuery.hasQuery ? "image" : "search",
+        message: this.selectedMediaTypes.size === 0 ? "No media types selected. Click All Media or enable a media type." : !hasCharacterMedia(char) && !parsedQuery.hasQuery ? "No localized media yet. Click Manage to scan and localize this character." : "No items match the current filter."
+      }));
       return slot;
     }
     this.appendPaginatedContent(slot, entries, "items", (pageEntries) => this.renderMediaEntries(pageEntries));
@@ -4196,10 +5451,10 @@ Tags: ${char.tags.join(", ")}`;
     }
     this.sortFlatEntries(entries);
     if (entries.length === 0) {
-      const empty = document.createElement("div");
-      empty.className = "ml-empty";
-      empty.textContent = this.selectedMediaTypes.size === 0 ? "No media types selected. Click All Media or enable a media type." : "No media items match the current search/filter.";
-      slot.appendChild(empty);
+      slot.appendChild(buildGalleryEmptyState({
+        icon: this.selectedMediaTypes.size === 0 ? "filter" : "search",
+        message: this.selectedMediaTypes.size === 0 ? "No media types selected. Click All Media or enable a media type." : "No media items match the current search/filter."
+      }));
       return slot;
     }
     this.appendPaginatedContent(slot, entries, "items", (pageEntries) => this.renderMediaEntries(pageEntries));
@@ -4207,10 +5462,10 @@ Tags: ${char.tags.join(", ")}`;
   }
   renderMediaEntries(entries) {
     if (entries.length === 0) {
-      const empty = document.createElement("div");
-      empty.className = "ml-empty";
-      empty.textContent = "No items match the current filter.";
-      return empty;
+      return buildGalleryEmptyState({
+        icon: "search",
+        message: "No items match the current filter."
+      });
     }
     const lightboxItems = entries.map((e) => ({
       id: `${e.characterId}:${e.localUrl}:${e.title}`,
@@ -4221,95 +5476,167 @@ Tags: ${char.tags.join(", ")}`;
       originalUrl: e.originalUrl,
       readOnly: e.isAvatar || e.isExpression,
       badgeText: e.badgeText,
+      onEditCharacter: this.callbacks.onOpenCharacterEditor ? () => this.callbacks.onOpenCharacterEditor(e.characterId) : undefined,
       onRemove: !e.isAvatar && !e.isExpression && e.originalUrl ? async () => {
+        const safeSrc = sanitizeSafeMediaUrl(e.localUrl);
+        for (const tier of ["sm", "lg"]) {
+          const thumbSrc = toThumbnailMediaUrl(safeSrc, e.mediaKind, tier);
+          if (thumbSrc)
+            clearWarmGalleryThumbs(thumbSrc);
+        }
         await this.callbacks.onPurgeAsset(e.characterId, e.originalUrl);
       } : undefined
     }));
     const onAfterRemove = () => void this.refresh({ reshuffleRandom: false });
+    const seenBaseKeys = new Map;
+    const usedKeys = new Set;
+    const eagerAllOnPage = entries.length <= EAGER_PAGE_ITEM_LIMIT;
+    const nextUniqueKey = (entry) => {
+      const kindPrefix = entry.isAvatar ? "avatar" : entry.isExpression ? "expr" : "loc";
+      const baseKey = `${entry.characterId}:${kindPrefix}:${entry.localUrl}:${entry.title}`;
+      const occ = seenBaseKeys.get(baseKey) ?? 0;
+      seenBaseKeys.set(baseKey, occ + 1);
+      return occ === 0 ? baseKey : `${baseKey}#${occ}`;
+    };
+    const thumbTier = getThumbnailImageTier(this.thumbnailSize);
+    const computeEntrySig = (entry) => {
+      const thumbSrc = toThumbnailMediaUrl(sanitizeSafeMediaUrl(entry.localUrl), entry.mediaKind, thumbTier) ?? entry.localUrl;
+      return [
+        thumbSrc,
+        entry.mediaKind,
+        entry.title,
+        entry.subtitle,
+        entry.badgeText,
+        entry.isExpression ? "1" : "0",
+        entry.isAvatar ? "1" : "0",
+        entry.originalUrl ?? "",
+        entry.sizeBytes
+      ].join("\x01");
+    };
+    const getEntryTileBadgeSpec = (entry) => {
+      if (entry.mediaKind === "video") {
+        return { icon: "play", modifier: "is-video" };
+      }
+      if (entry.isExpression) {
+        return { icon: "smile", modifier: "is-expression" };
+      }
+      if (entry.isAvatar) {
+        return { icon: "user", modifier: "is-avatar" };
+      }
+      return { modifier: "is-local" };
+    };
     if (this.viewMode === "list") {
       const list = document.createElement("div");
       list.className = "ml-media-list";
       entries.forEach((entry, index) => {
-        const row = document.createElement("div");
-        row.className = "ml-media-list-row";
-        row.addEventListener("click", () => openMediaLightbox(lightboxItems, index, onAfterRemove));
-        row.appendChild(createLazyMediaElement({
-          src: entry.localUrl,
-          mediaKind: entry.mediaKind,
-          alt: entry.title,
-          className: "ml-media-list-thumb"
-        }));
-        const info = document.createElement("div");
-        info.className = "ml-url-meta";
-        const t = document.createElement("div");
-        t.className = "ml-url-text";
-        t.textContent = entry.title;
-        const s = document.createElement("div");
-        s.className = "ml-url-sources";
-        s.textContent = entry.subtitle;
-        info.append(t, s);
-        const badge = document.createElement("span");
-        badge.className = `ml-badge ${entry.isExpression || entry.isAvatar ? "is-info" : ""}`;
-        badge.textContent = entry.badgeText;
-        row.append(info, badge);
+        const cacheKey = `media:${nextUniqueKey(entry)}`;
+        const sig = computeEntrySig(entry);
+        usedKeys.add(cacheKey);
+        const cached = this.listRowCache.get(cacheKey);
+        let row;
+        if (cached && cached.sig === sig) {
+          row = cached.el;
+          reobserveLazyMedia(row);
+          this.listRowCache.delete(cacheKey);
+          this.listRowCache.set(cacheKey, cached);
+        } else {
+          row = document.createElement("div");
+          row.className = "ml-media-list-row";
+          row.addEventListener("click", () => this.cardClickHandlers.get(row)?.());
+          const thumbWrap = document.createElement("div");
+          thumbWrap.className = "ml-media-list-thumb-wrap";
+          thumbWrap.appendChild(createGalleryMediaElement({
+            src: entry.localUrl,
+            mediaKind: entry.mediaKind,
+            alt: entry.title,
+            className: "ml-media-list-thumb",
+            eager: eagerAllOnPage || index < EAGER_LEADING_WINDOW,
+            thumbTier
+          }));
+          if (entry.mediaKind === "video") {
+            const kindBadge = document.createElement("span");
+            kindBadge.className = "ml-media-list-kind-badge";
+            kindBadge.appendChild(createIcon("play", 8));
+            thumbWrap.appendChild(kindBadge);
+          }
+          const info = document.createElement("div");
+          info.className = "ml-url-meta";
+          const t = document.createElement("div");
+          t.className = "ml-url-text";
+          t.textContent = entry.title;
+          const s = document.createElement("div");
+          s.className = "ml-url-sources";
+          s.textContent = entry.subtitle;
+          info.append(t, s);
+          const badge = document.createElement("span");
+          const listBadgeClass = entry.isExpression || entry.isAvatar ? "is-info" : entry.mediaKind === "video" ? "is-type" : "is-local";
+          badge.className = `ml-badge ${listBadgeClass}`;
+          badge.textContent = entry.badgeText;
+          row.append(thumbWrap, info, badge);
+          this.listRowCache.set(cacheKey, { sig, el: row });
+        }
+        this.cardClickHandlers.set(row, () => openMediaLightbox(lightboxItems, index, onAfterRemove));
         list.appendChild(row);
       });
+      this.pruneRenderCache(this.listRowCache, usedKeys);
       return list;
     }
     const grid = document.createElement("div");
     grid.className = "ml-asset-grid ml-gallery-grid";
     entries.forEach((entry, index) => {
-      const card = document.createElement("div");
-      card.className = "ml-asset-card";
-      const wrap = document.createElement("div");
-      wrap.className = "ml-asset-thumb-wrap";
-      wrap.addEventListener("click", () => openMediaLightbox(lightboxItems, index, onAfterRemove));
-      wrap.appendChild(createLazyMediaElement({
-        src: entry.localUrl,
-        mediaKind: entry.mediaKind,
-        alt: entry.title,
-        className: "ml-asset-preview",
-        title: `${entry.title}
-${entry.subtitle}`
-      }));
-      const badge = document.createElement("span");
-      badge.className = `ml-tile-badge ${entry.isExpression || entry.isAvatar ? "is-info" : ""}`;
-      badge.textContent = entry.badgeText;
-      wrap.appendChild(badge);
-      const footer = document.createElement("div");
-      footer.className = "ml-asset-footer";
-      const cap = document.createElement("div");
-      cap.className = "ml-url-sources";
-      cap.textContent = entry.isExpression || entry.isAvatar ? entry.title : entry.subtitle;
-      cap.title = `${entry.title}
+      const cacheKey = nextUniqueKey(entry);
+      const sig = computeEntrySig(entry);
+      usedKeys.add(cacheKey);
+      const cached = this.assetCardCache.get(cacheKey);
+      let card;
+      if (cached && cached.sig === sig) {
+        card = cached.el;
+        reobserveLazyMedia(card);
+        this.assetCardCache.delete(cacheKey);
+        this.assetCardCache.set(cacheKey, cached);
+      } else {
+        card = document.createElement("div");
+        card.className = "ml-asset-card";
+        const wrap = document.createElement("div");
+        wrap.className = "ml-asset-thumb-wrap";
+        wrap.addEventListener("click", () => this.cardClickHandlers.get(card)?.());
+        wrap.appendChild(createGalleryMediaElement({
+          src: entry.localUrl,
+          mediaKind: entry.mediaKind,
+          alt: entry.title,
+          className: "ml-asset-preview",
+          title: `${entry.title}
+${entry.subtitle}`,
+          eager: eagerAllOnPage || index < EAGER_LEADING_WINDOW,
+          thumbTier
+        }));
+        const badgeSpec = getEntryTileBadgeSpec(entry);
+        wrap.appendChild(buildTileKindBadge({
+          icon: badgeSpec.icon,
+          label: entry.badgeText,
+          modifier: badgeSpec.modifier
+        }));
+        const footer = document.createElement("div");
+        footer.className = "ml-asset-footer";
+        const cap = document.createElement("div");
+        cap.className = "ml-url-sources";
+        cap.textContent = entry.isExpression || entry.isAvatar ? entry.title : entry.subtitle;
+        cap.title = `${entry.title}
 ${entry.subtitle}`;
-      footer.appendChild(cap);
-      card.append(wrap, footer);
+        footer.appendChild(cap);
+        card.append(wrap, footer);
+        this.assetCardCache.set(cacheKey, { sig, el: card });
+      }
+      this.cardClickHandlers.set(card, () => openMediaLightbox(lightboxItems, index, onAfterRemove));
       grid.appendChild(card);
     });
+    this.pruneRenderCache(this.assetCardCache, usedKeys);
     return grid;
   }
 }
 
 // src/ui/drawer-panel.ts
-var GALLERY_PREFS_STORAGE_KEY = "lumiverse.media_localizer.gallery_prefs.v1";
-var CHARACTER_PREFS_STORAGE_KEY = "lumiverse.media_localizer.character_prefs.v1";
 var LIBRARY_BATCH_PAGE_SIZE = 50;
-function loadPrefsFromStorage(key, sanitize, fallback) {
-  try {
-    const raw = globalThis.localStorage?.getItem?.(key);
-    if (!raw)
-      return fallback();
-    return sanitize(JSON.parse(raw));
-  } catch {
-    return fallback();
-  }
-}
-function savePrefsToStorage(key, prefs) {
-  try {
-    globalThis.localStorage?.setItem?.(key, JSON.stringify(prefs));
-  } catch {}
-}
 
 class MediaLocalizerDrawerPanel {
   ctx;
@@ -4317,6 +5644,7 @@ class MediaLocalizerDrawerPanel {
   stats;
   queueProgress;
   callbacks;
+  options;
   activeTab = "character";
   bodyEl = null;
   stickyBannerHost = null;
@@ -4352,34 +5680,60 @@ class MediaLocalizerDrawerPanel {
   libraryOnlyWithRemote = true;
   inspectedCharacterId = null;
   expandNextCharacterConfig = false;
-  constructor(ctx, settings, stats, queueProgress, callbacks) {
+  renderedTab = null;
+  isRenderingBody = false;
+  rememberedScrollContainer = null;
+  cachedScrollContainer = null;
+  galleryHostEl = null;
+  pendingScrollRestore = null;
+  isSettlingScrollRestore = false;
+  scrollSettleRafIds = [];
+  tabScrollTops = {
+    character: 0,
+    gallery: 0,
+    library: 0,
+    settings: 0
+  };
+  innerScrollTops = new Map;
+  constructor(ctx, settings, stats, queueProgress, callbacks, options) {
     this.ctx = ctx;
     this.settings = settings;
     this.stats = stats;
     this.queueProgress = queueProgress;
     this.callbacks = callbacks;
+    this.options = options;
     this.librarySelectedSections = new Set(settings.defaultSections);
     this.libraryBatchCap = settings.defaultBatchCap;
   }
   mount(container) {
     const mountGen = ++this.mountGen;
+    const prevContainerWidth = container.style?.width ?? "";
+    const prevContainerHeight = container.style?.height ?? "";
+    const prevContainerMinHeight = container.style?.minHeight ?? "";
+    if (container.style) {
+      container.style.width = "100%";
+      container.style.height = "100%";
+      container.style.minHeight = "0";
+    }
     container.innerHTML = "";
     const root = document.createElement("div");
     root.className = "ml-drawer-root";
     const nav = document.createElement("div");
     nav.className = "ml-drawer-nav";
     const tabs = [
-      { id: "character", label: "Character" },
-      { id: "gallery", label: "Gallery" },
-      { id: "library", label: "Library Batch" },
-      { id: "settings", label: "Settings" }
+      { id: "character", label: "Character", icon: "user" },
+      { id: "gallery", label: "Gallery", icon: "image" },
+      { id: "library", label: "Library Batch", icon: "layers" },
+      { id: "settings", label: "Settings", icon: "settings" }
     ];
     this.navButtons.clear();
     for (const t of tabs) {
       const btn = document.createElement("button");
       btn.type = "button";
       btn.className = `ml-drawer-nav-btn ${this.activeTab === t.id ? "is-active" : ""}`;
-      btn.textContent = t.label;
+      const labelSpan = document.createElement("span");
+      labelSpan.textContent = t.label;
+      btn.append(createIcon(t.icon, 13), labelSpan);
       btn.addEventListener("click", () => {
         this.setActiveTab(t.id);
       });
@@ -4391,7 +5745,67 @@ class MediaLocalizerDrawerPanel {
     this.stickyBannerHost = bannerHost;
     const body = document.createElement("div");
     body.className = "ml-drawer-body";
+    const recordScrollFromTarget = (targetEl) => {
+      if (!targetEl || targetEl.clientHeight === 0 || this.isRenderingBody || !this.renderedTab || this.renderedTab !== this.activeTab || this.isShowingPlaceholder(body) || body.isConnected === false) {
+        return;
+      }
+      if (targetEl !== this.cachedScrollContainer) {
+        this.cachedScrollContainer = null;
+        const activeScroller = this.getActiveScrollContainer();
+        if (activeScroller && targetEl !== activeScroller) {
+          return;
+        }
+      }
+      if (typeof targetEl.scrollTop === "number" && Number.isFinite(targetEl.scrollTop)) {
+        const nextTop = Math.max(0, targetEl.scrollTop);
+        if (this.isSettlingScrollRestore && nextTop === 0 && this.tabScrollTops[this.renderedTab] > 0) {
+          return;
+        }
+        this.rememberedScrollContainer = targetEl;
+        this.tabScrollTops[this.renderedTab] = nextTop;
+      }
+    };
+    body.addEventListener("scroll", () => {
+      recordScrollFromTarget(body);
+    }, { passive: true });
+    let offDocScroll = null;
+    if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
+      const onCaptureScroll = (ev) => {
+        if (this.isRenderingBody || !this.renderedTab || this.renderedTab !== this.activeTab || body.isConnected === false) {
+          return;
+        }
+        const rawTarget = ev.target;
+        if (!rawTarget || rawTarget === body)
+          return;
+        const targetEl = rawTarget === document ? document.scrollingElement : rawTarget;
+        if (!targetEl || typeof targetEl.contains !== "function")
+          return;
+        if (targetEl === this.cachedScrollContainer || targetEl.contains(body)) {
+          recordScrollFromTarget(targetEl);
+        }
+      };
+      document.addEventListener("scroll", onCaptureScroll, {
+        capture: true,
+        passive: true
+      });
+      offDocScroll = () => {
+        document.removeEventListener("scroll", onCaptureScroll, {
+          capture: true
+        });
+      };
+    }
+    let offWinResize = null;
+    if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+      const onResize = () => {
+        this.cachedScrollContainer = null;
+      };
+      window.addEventListener("resize", onResize, { passive: true });
+      offWinResize = () => {
+        window.removeEventListener("resize", onResize);
+      };
+    }
     this.bodyEl = body;
+    this.cachedScrollContainer = null;
     root.append(nav, bannerHost, body);
     container.appendChild(root);
     this.renderStickyQueueBanner();
@@ -4400,6 +5814,23 @@ class MediaLocalizerDrawerPanel {
       if (this.mountGen === mountGen) {
         this.mountGen++;
       }
+      this.captureScrollPositions();
+      this.cancelScrollSettleTracker();
+      this.pendingScrollRestore?.cancel();
+      this.pendingScrollRestore = null;
+      offDocScroll?.();
+      offDocScroll = null;
+      offWinResize?.();
+      offWinResize = null;
+      this.rememberedScrollContainer = null;
+      this.cachedScrollContainer = null;
+      this.galleryHostEl = null;
+      if (container.style) {
+        container.style.width = prevContainerWidth;
+        container.style.height = prevContainerHeight;
+        container.style.minHeight = prevContainerMinHeight;
+      }
+      this.renderedTab = null;
       this.characterWidget?.flushPendingOverrideSave();
       this.characterWidget?.destroy();
       this.characterWidget = null;
@@ -4411,16 +5842,50 @@ class MediaLocalizerDrawerPanel {
     };
   }
   setActiveTab(tab, characterId, options) {
+    const prevCharId = this.resolveCurrentCharacterId();
     this.activeTab = tab;
     this.actionError = null;
     if (characterId !== undefined) {
       this.inspectedCharacterId = characterId;
     }
+    const nextCharId = this.resolveCurrentCharacterId();
+    const characterChanged = tab === "character" && characterId !== undefined && nextCharId !== prevCharId;
+    if (characterChanged) {
+      this.tabScrollTops.character = 0;
+      this.clearCharacterInnerScrollTops();
+    }
     this.expandNextCharacterConfig = Boolean(options?.expandOptions);
     for (const [id, b] of this.navButtons.entries()) {
       b.classList.toggle("is-active", id === this.activeTab);
     }
-    this.renderBody();
+    this.renderBody(characterChanged && this.renderedTab === "character");
+  }
+  syncPreferencesFromStorage() {
+    const loaded = loadPrefsFromStorage(CHARACTER_PREFS_STORAGE_KEY, sanitizeCharacterPreferences, () => getDefaultCharacterPreferences(true));
+    const prevThumbnailSize = this.characterUiState.thumbnailSize;
+    this.characterUiState = {
+      ...this.characterUiState,
+      showGreetingSubfilter: loaded.showGreetingSubfilter,
+      showWorldBookSubfilter: loaded.showWorldBookSubfilter,
+      showUrlPicker: loaded.showUrlPicker,
+      showRemoteThumbnails: loaded.showRemoteThumbnails,
+      mediaViewMode: loaded.mediaViewMode,
+      mediaFilter: loaded.mediaFilter,
+      thumbnailSize: loaded.thumbnailSize
+    };
+    if (this.characterWidget) {
+      this.characterWidget.applySharedPreferences({
+        showGreetingSubfilter: loaded.showGreetingSubfilter,
+        showWorldBookSubfilter: loaded.showWorldBookSubfilter,
+        showUrlPicker: loaded.showUrlPicker,
+        showRemoteThumbnails: loaded.showRemoteThumbnails,
+        mediaViewMode: loaded.mediaViewMode,
+        mediaFilter: loaded.mediaFilter,
+        thumbnailSize: loaded.thumbnailSize
+      });
+    } else if (this.activeTab === "settings" && this.bodyEl && loaded.thumbnailSize !== prevThumbnailSize) {
+      this.renderBody();
+    }
   }
   renderStickyQueueBanner() {
     if (!this.stickyBannerHost)
@@ -4443,11 +5908,12 @@ class MediaLocalizerDrawerPanel {
     this.renderStickyQueueBanner();
     const wasActive = isQueueActiveStatus(prevStatus);
     const nowActive = isQueueActiveStatus(queueProgress.status);
-    const galleryInvalidated = stats.totalAssets !== prevStatsAssets;
+    const queueCompleted = wasActive && !nowActive;
+    const galleryInvalidated = stats.totalAssets !== prevStatsAssets || queueCompleted;
     if (galleryInvalidated) {
       this.invalidateGalleryCache();
     }
-    if (galleryInvalidated || stats.totalFailedUrls !== prevStatsFailed || wasActive && !nowActive || scanSettingsChanged) {
+    if (galleryInvalidated || stats.totalFailedUrls !== prevStatsFailed || queueCompleted || scanSettingsChanged) {
       this.invalidateCharacterCache();
       this.invalidateLibrarySummaries();
     }
@@ -4467,17 +5933,17 @@ class MediaLocalizerDrawerPanel {
     if (!this.bodyEl)
       return;
     if (this.activeTab === "gallery") {
-      if (wasActive && !nowActive || galleryInvalidated) {
+      if (queueCompleted || galleryInvalidated) {
         this.galleryView?.refresh({ reshuffleRandom: false });
       }
       return;
     }
-    if (!dataChanged && (prevStatus === queueProgress.status || wasActive && nowActive)) {
+    if (!dataChanged && !queueCompleted && (prevStatus === queueProgress.status || wasActive && nowActive)) {
       return;
     }
-    if (this.activeTab === "settings" && !dataChanged)
+    if (this.activeTab === "settings" && !dataChanged && !queueCompleted)
       return;
-    if (this.activeTab === "library" && !dataChanged)
+    if (this.activeTab === "library" && !dataChanged && !queueCompleted)
       return;
     this.renderBody();
   }
@@ -4497,19 +5963,28 @@ class MediaLocalizerDrawerPanel {
     }
   }
   notifyActiveChatChanged() {
-    this.inspectedCharacterId = null;
     if (this.activeTab === "character" && this.bodyEl) {
-      const nextId = this.resolveCurrentCharacterId();
       const currentId = this.characterWidget?.getCharacterId() ?? null;
+      const prevInspected = this.inspectedCharacterId;
+      this.inspectedCharacterId = null;
+      const nextId = this.resolveCurrentCharacterId();
       if (this.characterWidget && nextId && currentId === nextId) {
+        this.inspectedCharacterId = prevInspected;
         return;
       }
+      this.tabScrollTops.character = 0;
+      this.clearCharacterInnerScrollTops();
       if (this.characterWidget && nextId) {
+        this.applyTabScrollTop(0);
         this.characterWidget.setCharacterId(nextId);
         return;
       }
-      this.renderBody();
+      this.renderBody(true);
+      return;
     }
+    this.inspectedCharacterId = null;
+    this.tabScrollTops.character = 0;
+    this.clearCharacterInnerScrollTops();
   }
   invalidateCharacterCache(characterId) {
     if (characterId) {
@@ -4524,7 +5999,10 @@ class MediaLocalizerDrawerPanel {
       loadedIncludeEmpty: false,
       randomWeights: this.galleryCache.randomWeights
     };
-    this.galleryView?.invalidateCache();
+    const isGalleryActiveInOpenDrawer = Boolean(this.bodyEl) && this.activeTab === "gallery" && Boolean(this.galleryView);
+    if (!isGalleryActiveInOpenDrawer) {
+      this.galleryView?.invalidateCache();
+    }
   }
   invalidateLibrarySummaries() {
     this.librarySummaries = null;
@@ -4578,52 +6056,181 @@ class MediaLocalizerDrawerPanel {
     } catch {}
     return null;
   }
-  renderBody() {
+  isShowingPlaceholder(body) {
+    if (this.renderedTab !== "gallery")
+      return false;
+    const host = this.galleryHostEl;
+    const wrap = host?.firstElementChild ?? host?.children?.[0];
+    if (wrap && wrap.children) {
+      for (let i = 0;i < wrap.children.length; i++) {
+        if (wrap.children[i]?.classList?.contains("ml-placeholder")) {
+          return true;
+        }
+      }
+      return false;
+    }
+    return Boolean(body.querySelector(".ml-placeholder"));
+  }
+  getActiveScrollContainer() {
+    const body = this.bodyEl;
+    if (!body)
+      return null;
+    const cached = this.cachedScrollContainer;
+    if (cached && cached.isConnected !== false && (cached === body || typeof cached.contains === "function" && cached.contains(body))) {
+      return cached;
+    }
+    const resolved = resolveScrollContainer(body, this.rememberedScrollContainer, body);
+    if (resolved && isElementScrollable(resolved)) {
+      this.cachedScrollContainer = resolved;
+    } else {
+      this.cachedScrollContainer = null;
+    }
+    return resolved;
+  }
+  readTabScrollTop() {
+    const scroller = this.getActiveScrollContainer();
+    if (scroller && typeof scroller.scrollTop === "number" && Number.isFinite(scroller.scrollTop)) {
+      this.rememberedScrollContainer = scroller;
+      return Math.max(0, scroller.scrollTop);
+    }
+    return this.tabScrollTops[this.activeTab] ?? 0;
+  }
+  clearCharacterInnerScrollTops() {
+    for (const key of [
+      "localized-asset-grid",
+      "url-picker-list",
+      "greetings-subfilter",
+      "worldbooks-subfilter"
+    ]) {
+      this.innerScrollTops.delete(key);
+    }
+  }
+  cancelScrollSettleTracker() {
+    if (typeof cancelAnimationFrame === "function") {
+      for (const id of this.scrollSettleRafIds) {
+        cancelAnimationFrame(id);
+      }
+    }
+    this.scrollSettleRafIds = [];
+    this.isSettlingScrollRestore = false;
+  }
+  applyTabScrollTop(scrollTop) {
+    const mountGen = this.mountGen;
+    this.cancelScrollSettleTracker();
+    this.pendingScrollRestore = applyScrollTopWithSettlement(() => this.getActiveScrollContainer(), scrollTop, this.pendingScrollRestore, () => !this.bodyEl || this.mountGen !== mountGen);
+    this.isSettlingScrollRestore = Boolean(this.pendingScrollRestore);
+    if (this.pendingScrollRestore && typeof requestAnimationFrame === "function") {
+      const raf1 = requestAnimationFrame(() => {
+        if (this.mountGen !== mountGen)
+          return;
+        const raf2 = requestAnimationFrame(() => {
+          if (this.mountGen !== mountGen)
+            return;
+          this.isSettlingScrollRestore = false;
+          this.scrollSettleRafIds = [];
+        });
+        this.scrollSettleRafIds = [raf2];
+      });
+      this.scrollSettleRafIds = [raf1];
+    }
+  }
+  restoreScrollIfReset() {
+    const body = this.bodyEl;
+    if (!body || this.isRenderingBody || this.isShowingPlaceholder(body))
+      return;
+    const saved = this.tabScrollTops[this.activeTab] ?? 0;
+    if (saved > 0 && this.readTabScrollTop() === 0) {
+      this.applyTabScrollTop(saved);
+    }
+  }
+  captureScrollPositions() {
+    const body = this.bodyEl;
+    if (!body || !this.renderedTab)
+      return;
+    if (!this.isShowingPlaceholder(body) && body.isConnected !== false && body.clientHeight !== 0) {
+      const scroller = this.getActiveScrollContainer();
+      if (scroller && scroller.clientHeight !== 0 && typeof scroller.scrollTop === "number" && Number.isFinite(scroller.scrollTop)) {
+        const nextTop = Math.max(0, scroller.scrollTop);
+        if (!(this.isSettlingScrollRestore && nextTop === 0 && this.tabScrollTops[this.renderedTab] > 0)) {
+          this.rememberedScrollContainer = scroller;
+          this.tabScrollTops[this.renderedTab] = nextTop;
+        }
+      }
+    }
+    for (const el of body.querySelectorAll("[data-scroll-id]")) {
+      const id = el.dataset.scrollId;
+      if (id && typeof el.scrollTop === "number" && Number.isFinite(el.scrollTop)) {
+        this.innerScrollTops.set(id, Math.max(0, el.scrollTop));
+      }
+    }
+  }
+  restoreScrollPositions() {
     const body = this.bodyEl;
     if (!body)
       return;
-    const savedBodyScrollTop = body.scrollTop;
-    const savedInnerScrolls = new Map;
     for (const el of body.querySelectorAll("[data-scroll-id]")) {
       const id = el.dataset.scrollId;
-      if (id && el.scrollTop > 0) {
-        savedInnerScrolls.set(id, el.scrollTop);
+      if (!id)
+        continue;
+      const saved = this.innerScrollTops.get(id);
+      if (saved !== undefined) {
+        el.scrollTop = saved;
       }
     }
-    this.characterWidget?.flushPendingOverrideSave();
-    this.characterWidget?.destroy();
-    this.characterWidget = null;
-    this.galleryView?.destroy();
-    this.galleryView = null;
-    body.innerHTML = "";
-    if (this.actionError) {
-      const errBox = document.createElement("div");
-      errBox.className = "ml-error-banner";
-      errBox.textContent = `Error: ${this.actionError}`;
-      body.appendChild(errBox);
+    this.applyTabScrollTop(this.tabScrollTops[this.activeTab] ?? 0);
+  }
+  renderBody(skipCaptureScroll = false) {
+    const body = this.bodyEl;
+    if (!body)
+      return;
+    if (!skipCaptureScroll) {
+      this.captureScrollPositions();
     }
-    if (this.activeTab === "character") {
-      this.renderCharacterTab(body);
-    } else if (this.activeTab === "gallery") {
-      this.renderGalleryTab(body);
-    } else if (this.activeTab === "library") {
-      this.renderLibraryTab(body);
-    } else {
-      this.renderSettingsTab(body);
+    this.isRenderingBody = true;
+    this.cachedScrollContainer = null;
+    this.galleryHostEl = null;
+    try {
+      this.characterWidget?.flushPendingOverrideSave();
+      this.characterWidget?.destroy();
+      this.characterWidget = null;
+      this.galleryView?.destroy();
+      this.galleryView = null;
+      body.innerHTML = "";
+      this.renderedTab = this.activeTab;
+      if (this.actionError) {
+        const errBox = document.createElement("div");
+        errBox.className = "ml-error-banner";
+        const errText = document.createElement("span");
+        errText.textContent = `Error: ${this.actionError}`;
+        errBox.append(createIcon("alert", 14), errText);
+        body.appendChild(errBox);
+      }
+      if (this.activeTab === "character") {
+        this.renderCharacterTab(body);
+      } else if (this.activeTab === "gallery") {
+        this.renderGalleryTab(body);
+      } else if (this.activeTab === "library") {
+        this.renderLibraryTab(body);
+      } else {
+        this.renderSettingsTab(body);
+      }
+      this.restoreScrollPositions();
+    } finally {
+      this.isRenderingBody = false;
     }
-    for (const [id, top] of savedInnerScrolls.entries()) {
-      const el = body.querySelector(`[data-scroll-id="${id}"]`);
-      if (el)
-        el.scrollTop = top;
-    }
-    body.scrollTop = savedBodyScrollTop;
   }
   renderCharacterTab(body) {
     const charId = this.resolveCurrentCharacterId();
     if (!charId) {
       const empty = document.createElement("div");
-      empty.className = "ml-section-box ml-empty";
-      empty.textContent = "Open a character chat or Character Editor to inspect and localize its media.";
+      empty.className = "ml-section ml-empty ml-empty-card";
+      const iconWrap = document.createElement("div");
+      iconWrap.className = "ml-empty-icon";
+      iconWrap.appendChild(createIcon("image", 20));
+      const textEl = document.createElement("div");
+      textEl.className = "ml-empty-text";
+      textEl.textContent = "Open a character chat or Character Editor to inspect and localize its media.";
+      empty.append(iconWrap, textEl);
       body.appendChild(empty);
       return;
     }
@@ -4641,10 +6248,15 @@ class MediaLocalizerDrawerPanel {
     host.className = "ml-gallery-host";
     host.style.marginTop = "0";
     body.appendChild(host);
+    const onOpenCharacterEditor = this.callbacks.onOpenCharacterEditor ?? (canOpenNativeCharacterEditor(this.ctx) ? (targetCharId) => {
+      openNativeCharacterEditor(this.ctx, targetCharId);
+    } : undefined);
     const widgetCallbacks = {
       ...this.callbacks,
+      onOpenCharacterEditor,
       onPurgeCharacterCache: async (targetCharId, urls) => {
         await this.callbacks.onPurgeCharacterCache(targetCharId, urls);
+        clearWarmGalleryThumbs();
         this.invalidateGalleryCache();
         this.invalidateLibrarySummaries();
       }
@@ -4661,6 +6273,7 @@ class MediaLocalizerDrawerPanel {
           expandedUrls: [...nextState.expandedUrls]
         };
         savePrefsToStorage(CHARACTER_PREFS_STORAGE_KEY, sanitizeCharacterPreferences(this.characterUiState, true));
+        this.options?.onCharacterPrefsUpdated?.();
       },
       onScanChange: (nextScan) => {
         if (nextScan) {
@@ -4677,17 +6290,23 @@ class MediaLocalizerDrawerPanel {
   }
   renderGalleryTab(body) {
     const host = document.createElement("div");
+    this.galleryHostEl = host;
     body.appendChild(host);
+    const onOpenCharacterEditor = this.callbacks.onOpenCharacterEditor ?? (canOpenNativeCharacterEditor(this.ctx) ? (characterId) => {
+      openNativeCharacterEditor(this.ctx, characterId);
+    } : undefined);
     const gallery = new LibraryGalleryView(host, {
       onLoadLibraryMedia: this.callbacks.onListLibraryMedia,
       onPurgeAsset: async (characterId, normalizedUrl) => {
         await this.callbacks.onPurgeCharacterCache(characterId, [normalizedUrl]);
+        clearWarmGalleryThumbs();
         this.invalidateCharacterCache(characterId);
         this.invalidateLibrarySummaries();
       },
       onOpenCharacterTab: (characterId) => {
         this.setActiveTab("character", characterId);
       },
+      onOpenCharacterEditor,
       onStateChange: (nextState) => {
         this.galleryState = {
           ...nextState,
@@ -4699,8 +6318,25 @@ class MediaLocalizerDrawerPanel {
         this.galleryCache = nextCache;
       },
       onScrollToTop: () => {
-        if (this.bodyEl) {
-          this.bodyEl.scrollTop = 0;
+        this.tabScrollTops.gallery = 0;
+        this.cachedScrollContainer = null;
+        if (this.bodyEl && this.renderedTab === "gallery") {
+          this.applyTabScrollTop(0);
+        }
+      },
+      onGetScrollTop: () => {
+        const bodyEl = this.bodyEl;
+        if (bodyEl && this.renderedTab === "gallery" && !this.isRenderingBody && !this.isShowingPlaceholder(bodyEl)) {
+          return this.readTabScrollTop();
+        }
+        return this.tabScrollTops.gallery;
+      },
+      onSetScrollTop: (scrollTop) => {
+        const next = Number.isFinite(scrollTop) && scrollTop >= 0 ? scrollTop : 0;
+        this.tabScrollTops.gallery = next;
+        this.cachedScrollContainer = null;
+        if (this.bodyEl && this.renderedTab === "gallery") {
+          this.applyTabScrollTop(next);
         }
       }
     }, {
@@ -4712,22 +6348,20 @@ class MediaLocalizerDrawerPanel {
     gallery.ensureLoaded();
   }
   renderLibraryTab(body) {
-    const scanBox = document.createElement("div");
-    scanBox.className = "ml-section-box";
     const topBar = document.createElement("div");
     topBar.className = "ml-header-bar";
     const info = document.createElement("div");
     info.className = "ml-inline-title";
     const title = document.createElement("span");
     title.className = "ml-title";
-    title.textContent = "Library Scanner & Batch Operations";
-    info.append(title, createInfoTip("Scans characters, World Books, and Regex scripts locally with zero network traffic so you can batch-download or clear storage."));
+    title.textContent = "Library Scanner & Batch";
+    info.append(createIcon("layers", 14), title, createInfoTip("Scans characters, World Books, and Regex scripts locally with zero network traffic so you can batch-download or clear storage."));
     const scanBtn = createIconButton({
       icon: "refresh",
       label: this.libraryScanning ? "Scanning..." : this.librarySummaries ? "Rescan Library" : "Scan Library",
       title: "Scan all characters, linked World Books, and Regex scripts locally",
-      className: `ml-btn is-primary ${this.libraryScanning ? "is-busy" : ""}`,
-      size: 14,
+      className: `ml-btn is-primary is-sm ${this.libraryScanning ? "is-busy" : ""}`,
+      size: 13,
       disabled: this.libraryScanning,
       onClick: async () => {
         const mountGen = this.mountGen;
@@ -4744,6 +6378,8 @@ class MediaLocalizerDrawerPanel {
           this.librarySummariesStale = false;
           this.libraryTotalRemote = res.totalUniqueRemote;
           this.libraryPage = 1;
+          this.tabScrollTops.library = 0;
+          this.innerScrollTops.set("library-char-list", 0);
           this.librarySelectedCharIds = new Set(res.characters.filter((c) => c.remoteCount + c.failedCount > 0).map((c) => c.characterId));
         } catch (err) {
           if (this.bodyEl && this.mountGen === mountGen && this.activeTab === "library") {
@@ -4758,31 +6394,73 @@ class MediaLocalizerDrawerPanel {
       }
     });
     topBar.append(info, scanBtn);
-    scanBox.appendChild(topBar);
-    body.appendChild(scanBox);
-    if (!this.librarySummaries)
+    if (!this.librarySummaries) {
+      const scanSection = document.createElement("div");
+      scanSection.className = "ml-section";
+      const intro = document.createElement("div");
+      intro.className = "ml-lib-intro";
+      intro.textContent = "Scan your character cards, linked World Books, and Regex scripts locally with zero network traffic to filter by section, batch-download, or purge cached media.";
+      scanSection.append(topBar, intro);
+      body.appendChild(scanSection);
       return;
+    }
+    const scanSection = document.createElement("div");
+    scanSection.className = "ml-section";
+    scanSection.appendChild(topBar);
+    const summaryStrip = document.createElement("div");
+    summaryStrip.className = "ml-stat-strip";
+    const totalLocal = this.librarySummaries.reduce((sum, c) => sum + c.localizedCount, 0);
+    const totalFailed = this.librarySummaries.reduce((sum, c) => sum + c.failedCount, 0);
+    const totalBytes = this.librarySummaries.reduce((sum, c) => sum + c.localizedBytes, 0);
+    const addLibChip = (label, variant) => {
+      const chip = document.createElement("span");
+      chip.className = `ml-stat-chip ${variant}`;
+      chip.textContent = label;
+      summaryStrip.appendChild(chip);
+    };
+    addLibChip(`${this.librarySummaries.length} chars`, "is-muted");
+    addLibChip(`${this.libraryTotalRemote} remote`, this.libraryTotalRemote > 0 ? "is-warn" : "is-muted");
+    addLibChip(`${totalLocal} local${totalBytes > 0 ? ` (${formatBytes(totalBytes)})` : ""}`, totalLocal > 0 ? "is-success" : "is-muted");
+    if (totalFailed > 0) {
+      addLibChip(`${totalFailed} failed`, "is-danger");
+    }
+    scanSection.appendChild(summaryStrip);
     if (this.librarySummariesStale) {
       const staleNote = document.createElement("div");
-      staleNote.className = "ml-section-box ml-subtitle";
-      staleNote.textContent = "Library media changed since last scan. Click Rescan Library to refresh counts.";
-      body.appendChild(staleNote);
+      staleNote.className = "ml-warn-banner";
+      const staleText = document.createElement("span");
+      staleText.textContent = "Library media changed since last scan. Click Rescan Library to refresh counts.";
+      staleNote.append(createIcon("alert", 14), staleText);
+      scanSection.appendChild(staleNote);
     }
-    const filterBox = document.createElement("div");
-    filterBox.className = "ml-section-box";
+    body.appendChild(scanSection);
+    const filterSection = document.createElement("div");
+    filterSection.className = "ml-section";
     const secHeader = document.createElement("div");
     secHeader.className = "ml-section-title";
     const secLeft = document.createElement("div");
     secLeft.className = "ml-inline-title";
-    secLeft.append(document.createTextNode("1. Sections to Download"), createInfoTip("Only remote items found inside checked sections are queued across selected characters."));
+    const secStep = document.createElement("span");
+    secStep.className = "ml-step-num";
+    secStep.textContent = "1";
+    const secText = document.createElement("span");
+    secText.textContent = "Sections to Download";
+    secLeft.append(secStep, secText, createInfoTip("Only remote items found inside checked sections are queued across selected characters."));
     secHeader.appendChild(secLeft);
-    filterBox.appendChild(secHeader);
+    filterSection.appendChild(secHeader);
     let charHeaderTitle;
+    let charHeaderText;
     let listSlotEl;
     let footerSlotEl;
     const cardCheckboxes = new Map;
+    const cardElements = new Map;
     const updateHeaderSummary = () => {
-      charHeaderTitle.textContent = `2. Characters (${this.librarySelectedCharIds.size} selected · ${this.libraryTotalRemote} unique remote)`;
+      const text = `Characters (${this.librarySelectedCharIds.size} sel · ${this.libraryTotalRemote} remote)`;
+      if (charHeaderText) {
+        charHeaderText.textContent = text;
+      } else {
+        charHeaderTitle.textContent = `2. ${text}`;
+      }
     };
     const buildCharDetails = (c) => {
       const details = document.createElement("div");
@@ -4904,6 +6582,7 @@ class MediaLocalizerDrawerPanel {
               for (const id of targetIds) {
                 this.invalidateCharacterCache(id);
               }
+              clearWarmGalleryThumbs();
               this.invalidateGalleryCache();
             }, "library");
             if (purgeSucceeded && this.activeTab === "library" && this.bodyEl && this.mountGen === mountGen) {
@@ -4964,6 +6643,7 @@ class MediaLocalizerDrawerPanel {
       const slot = document.createElement("div");
       slot.className = "ml-stack";
       cardCheckboxes.clear();
+      cardElements.clear();
       const visibleChars = (this.librarySummaries ?? []).filter((c) => !this.libraryOnlyWithRemote || c.remoteCount + c.failedCount > 0);
       const totalItems = visibleChars.length;
       const totalPages = Math.max(1, Math.ceil(totalItems / LIBRARY_BATCH_PAGE_SIZE));
@@ -4972,57 +6652,68 @@ class MediaLocalizerDrawerPanel {
       const startIndex = (page - 1) * LIBRARY_BATCH_PAGE_SIZE;
       const endIndex = Math.min(totalItems, startIndex + LIBRARY_BATCH_PAGE_SIZE);
       const pageChars = visibleChars.slice(startIndex, endIndex);
-      if (totalItems > 0) {
+      if (totalPages > 1) {
         const pagBar = document.createElement("div");
         pagBar.className = "ml-gallery-pagination";
         const pagInfo = document.createElement("div");
         pagInfo.className = "ml-gallery-pagination-info";
         const pagText = document.createElement("span");
-        pagText.textContent = totalPages > 1 ? `Showing ${startIndex + 1}–${endIndex} of ${totalItems} characters` : `${totalItems} character${totalItems === 1 ? "" : "s"}`;
+        pagText.textContent = `Showing ${startIndex + 1}–${endIndex} of ${totalItems} characters`;
         pagInfo.appendChild(pagText);
         pagBar.appendChild(pagInfo);
-        if (totalPages > 1) {
-          const pagActions = document.createElement("div");
-          pagActions.className = "ml-gallery-pagination-actions";
-          const prevBtn = createIconButton({
-            icon: "chevron-left",
-            label: "Prev",
-            title: "Previous page",
-            className: "ml-btn is-sm",
-            size: 12,
-            disabled: page <= 1,
-            onClick: () => {
-              this.libraryPage = Math.max(1, page - 1);
-              rerenderCharList();
-            }
-          });
-          const pageLabel = document.createElement("span");
-          pageLabel.className = "ml-url-sources";
-          pageLabel.textContent = `Page ${page} / ${totalPages}`;
-          const nextBtn = createIconButton({
-            icon: "chevron-right",
-            label: "Next",
-            title: "Next page",
-            className: "ml-btn is-sm",
-            size: 12,
-            disabled: page >= totalPages,
-            onClick: () => {
-              this.libraryPage = Math.min(totalPages, page + 1);
-              rerenderCharList();
-            }
-          });
-          pagActions.append(prevBtn, pageLabel, nextBtn);
-          pagBar.appendChild(pagActions);
-        }
+        const pagActions = document.createElement("div");
+        pagActions.className = "ml-gallery-pagination-actions";
+        const prevBtn = createIconButton({
+          icon: "chevron-left",
+          label: "Prev",
+          title: "Previous page",
+          className: "ml-btn is-sm",
+          size: 12,
+          disabled: page <= 1,
+          onClick: () => {
+            this.libraryPage = Math.max(1, page - 1);
+            rerenderCharList({ resetListScroll: true });
+          }
+        });
+        const pageLabel = document.createElement("span");
+        pageLabel.className = "ml-url-sources";
+        pageLabel.textContent = `Page ${page} / ${totalPages}`;
+        const nextBtn = createIconButton({
+          icon: "chevron-right",
+          label: "Next",
+          title: "Next page",
+          className: "ml-btn is-sm",
+          size: 12,
+          disabled: page >= totalPages,
+          onClick: () => {
+            this.libraryPage = Math.min(totalPages, page + 1);
+            rerenderCharList({ resetListScroll: true });
+          }
+        });
+        pagActions.append(prevBtn, pageLabel, nextBtn);
+        pagBar.appendChild(pagActions);
         slot.appendChild(pagBar);
       }
       const charList = document.createElement("div");
-      charList.className = "ml-url-list";
+      charList.className = "ml-url-list is-tall";
       charList.dataset.scrollId = "library-char-list";
+      charList.addEventListener("scroll", () => {
+        if (!this.isRenderingBody && typeof charList.scrollTop === "number" && Number.isFinite(charList.scrollTop)) {
+          this.innerScrollTops.set("library-char-list", Math.max(0, charList.scrollTop));
+        }
+      }, { passive: true });
+      if (pageChars.length === 0) {
+        const emptyList = document.createElement("div");
+        emptyList.className = "ml-empty";
+        emptyList.textContent = (this.librarySummaries?.length ?? 0) === 0 ? "No character cards found in your library." : 'All scanned characters are localized. Uncheck "Remote only" to view them.';
+        charList.appendChild(emptyList);
+      }
       for (const c of pageChars) {
         const isExpanded = this.libraryExpandedCharIds.has(c.characterId);
+        const isSelected = this.librarySelectedCharIds.has(c.characterId);
         const card = document.createElement("div");
-        card.className = `ml-lib-item-card ${isExpanded ? "is-expanded" : ""}`;
+        card.className = `ml-lib-item-card ${isExpanded ? "is-expanded" : ""} ${isSelected ? "is-selected" : ""}`.trim();
+        cardElements.set(c.characterId, card);
         const row = document.createElement("div");
         row.className = "ml-lib-row";
         const left = document.createElement("div");
@@ -5030,30 +6721,39 @@ class MediaLocalizerDrawerPanel {
         const cb = document.createElement("input");
         cb.type = "checkbox";
         cb.className = "ml-row-checkbox";
-        cb.checked = this.librarySelectedCharIds.has(c.characterId);
+        cb.checked = isSelected;
         cb.addEventListener("click", (e) => e.stopPropagation());
         cb.addEventListener("change", () => {
-          if (cb.checked)
+          if (cb.checked) {
             this.librarySelectedCharIds.add(c.characterId);
-          else
+            card.classList.add("is-selected");
+          } else {
             this.librarySelectedCharIds.delete(c.characterId);
+            card.classList.remove("is-selected");
+          }
           updateSummaryAndFooter();
         });
         cardCheckboxes.set(c.characterId, cb);
+        const dot = document.createElement("span");
+        const dotVariant = c.failedCount > 0 ? "is-danger" : c.remoteCount > 0 ? "is-warn" : c.localizedCount > 0 ? "is-success" : "is-muted";
+        dot.className = `ml-status-dot ${dotVariant}`;
+        dot.setAttribute("aria-hidden", "true");
         const nameSpan = document.createElement("span");
-        nameSpan.style.fontWeight = "500";
+        nameSpan.className = "ml-lib-char-name";
         nameSpan.textContent = c.characterName;
-        left.append(cb, nameSpan);
+        nameSpan.title = c.characterName;
+        left.append(cb, dot, nameSpan);
         const right = document.createElement("div");
         right.className = "ml-header-actions";
         const badge = document.createElement("span");
         const pending = c.remoteCount + c.failedCount;
         badge.className = `ml-badge ${pending > 0 ? "is-warn" : "is-success"}`;
-        badge.textContent = pending > 0 ? `${pending} remote (${c.localizedCount}/${c.totalUnique} local)` : `${c.localizedCount}/${c.totalUnique} local`;
+        badge.textContent = pending > 0 ? `${pending} rem · ${c.localizedCount}/${c.totalUnique}` : `${c.localizedCount}/${c.totalUnique} local`;
+        badge.title = pending > 0 ? `${pending} remote/failed, ${c.localizedCount} of ${c.totalUnique} localized` : `${c.localizedCount} of ${c.totalUnique} localized`;
         right.appendChild(badge);
         if (c.localizedBytes > 0) {
           const sizeBadge = document.createElement("span");
-          sizeBadge.className = "ml-badge";
+          sizeBadge.className = "ml-badge is-muted";
           sizeBadge.textContent = formatBytes(c.localizedBytes);
           right.appendChild(sizeBadge);
         }
@@ -5090,10 +6790,19 @@ class MediaLocalizerDrawerPanel {
       slot.appendChild(charList);
       return slot;
     };
-    const rerenderCharList = () => {
+    const rerenderCharList = (options) => {
+      const prevBodyScroll = this.readTabScrollTop();
+      const prevCharList = listSlotEl.querySelector('[data-scroll-id="library-char-list"]');
+      const prevListScroll = options?.resetListScroll ? 0 : prevCharList && typeof prevCharList.scrollTop === "number" ? Math.max(0, prevCharList.scrollTop) : this.innerScrollTops.get("library-char-list") ?? 0;
       const nextSlot = buildCharListSlot();
       listSlotEl.replaceWith(nextSlot);
       listSlotEl = nextSlot;
+      this.innerScrollTops.set("library-char-list", prevListScroll);
+      const nextCharList = nextSlot.querySelector('[data-scroll-id="library-char-list"]');
+      if (nextCharList) {
+        nextCharList.scrollTop = prevListScroll;
+      }
+      this.applyTabScrollTop(prevBodyScroll);
     };
     const secRow = document.createElement("div");
     secRow.className = "ml-pill-row";
@@ -5115,10 +6824,19 @@ class MediaLocalizerDrawerPanel {
       });
       secRow.appendChild(pill);
     }
-    filterBox.appendChild(secRow);
+    filterSection.appendChild(secRow);
+    body.appendChild(filterSection);
+    const charsSection = document.createElement("div");
+    charsSection.className = "ml-section";
     const charHeader = document.createElement("div");
-    charHeader.className = "ml-section-title";
+    charHeader.className = "ml-batch-char-header";
     charHeaderTitle = document.createElement("span");
+    charHeaderTitle.className = "ml-section-title";
+    const charStep = document.createElement("span");
+    charStep.className = "ml-step-num";
+    charStep.textContent = "2";
+    charHeaderText = document.createElement("span");
+    charHeaderTitle.append(charStep, charHeaderText);
     updateHeaderSummary();
     const charHeaderBtns = document.createElement("div");
     charHeaderBtns.className = "ml-header-actions";
@@ -5133,7 +6851,7 @@ class MediaLocalizerDrawerPanel {
         return;
       this.libraryOnlyWithRemote = onlyRemoteCb.checked;
       this.libraryPage = 1;
-      rerenderCharList();
+      rerenderCharList({ resetListScroll: true });
       updateSummaryAndFooter();
     });
     onlyRemoteLabel.append(onlyRemoteCb, document.createTextNode("Remote only"));
@@ -5148,6 +6866,7 @@ class MediaLocalizerDrawerPanel {
           const cb = cardCheckboxes.get(c.characterId);
           if (cb)
             cb.checked = true;
+          cardElements.get(c.characterId)?.classList.add("is-selected");
         }
       }
       updateSummaryAndFooter();
@@ -5161,64 +6880,125 @@ class MediaLocalizerDrawerPanel {
       for (const cb of cardCheckboxes.values()) {
         cb.checked = false;
       }
+      for (const card of cardElements.values()) {
+        card.classList.remove("is-selected");
+      }
       updateSummaryAndFooter();
     });
     charHeaderBtns.append(onlyRemoteLabel, selAllBtn, clearAllBtn);
     charHeader.append(charHeaderTitle, charHeaderBtns);
-    filterBox.appendChild(charHeader);
+    charsSection.appendChild(charHeader);
     listSlotEl = buildCharListSlot();
-    filterBox.appendChild(listSlotEl);
+    charsSection.appendChild(listSlotEl);
     footerSlotEl = buildFooter();
-    filterBox.appendChild(footerSlotEl);
-    body.appendChild(filterBox);
+    charsSection.appendChild(footerSlotEl);
+    body.appendChild(charsSection);
   }
   renderSettingsTab(body) {
-    const statsBox = document.createElement("div");
-    statsBox.className = "ml-section-box";
-    const statsTitle = document.createElement("div");
-    statsTitle.className = "ml-section-title";
-    statsTitle.textContent = "Localized Cache Summary";
+    const statsSection = document.createElement("div");
+    statsSection.className = "ml-section";
     const statsRow = document.createElement("div");
     statsRow.className = "ml-header-bar";
-    const statsInfo = document.createElement("div");
-    statsInfo.textContent = `${this.stats.totalAssets} cached URLs · ${formatBytes(this.stats.totalSizeBytes)} total · ${this.stats.totalFailedUrls} failed`;
-    const clearFailedBtn = document.createElement("button");
-    clearFailedBtn.type = "button";
-    clearFailedBtn.className = "ml-btn is-sm";
-    clearFailedBtn.disabled = this.stats.totalFailedUrls === 0;
-    clearFailedBtn.textContent = `Clear Failed (${this.stats.totalFailedUrls})`;
-    clearFailedBtn.addEventListener("click", async () => {
-      const mountGen = this.mountGen;
-      await this.guard(async () => {
-        await this.callbacks.onClearFailed();
-        this.invalidateCharacterCache();
-        if (this.librarySummaries !== null) {
-          this.librarySummariesStale = true;
+    const statsLeft = document.createElement("div");
+    statsLeft.className = "ml-inline-stats";
+    const statsTitle = document.createElement("span");
+    statsTitle.className = "ml-section-title";
+    const statsTitleText = document.createElement("span");
+    statsTitleText.textContent = "Localized Cache Summary";
+    statsTitle.append(createIcon("database", 14), statsTitleText);
+    const statsStrip = document.createElement("div");
+    statsStrip.className = "ml-stat-strip";
+    const addStatChip = (label, variant) => {
+      const chip = document.createElement("span");
+      chip.className = `ml-stat-chip ${variant}`;
+      chip.textContent = label;
+      statsStrip.appendChild(chip);
+    };
+    addStatChip(`${this.stats.totalAssets} URLs`, "is-info");
+    addStatChip(formatBytes(this.stats.totalSizeBytes), "is-muted");
+    addStatChip(`${this.stats.totalFailedUrls} failed`, this.stats.totalFailedUrls > 0 ? "is-danger" : "is-muted");
+    statsLeft.append(statsTitle, statsStrip);
+    const clearFailedBtn = createIconButton({
+      icon: "trash",
+      label: `Clear Failed (${this.stats.totalFailedUrls})`,
+      title: "Clear all recorded failed download URLs",
+      className: "ml-btn is-sm",
+      size: 12,
+      disabled: this.stats.totalFailedUrls === 0,
+      onClick: async () => {
+        const mountGen = this.mountGen;
+        await this.guard(async () => {
+          await this.callbacks.onClearFailed();
+          this.invalidateCharacterCache();
+          if (this.librarySummaries !== null) {
+            this.librarySummariesStale = true;
+          }
+        }, "settings");
+        if (this.activeTab === "settings" && this.bodyEl && this.mountGen === mountGen) {
+          this.renderBody();
         }
-      }, "settings");
-      if (this.activeTab === "settings" && this.bodyEl && this.mountGen === mountGen) {
-        this.renderBody();
       }
     });
-    statsRow.append(statsInfo, clearFailedBtn);
-    statsBox.append(statsTitle, statsRow);
-    body.appendChild(statsBox);
-    const defaultsBox = document.createElement("div");
-    defaultsBox.className = "ml-section-box";
+    statsRow.append(statsLeft, clearFailedBtn);
+    statsSection.appendChild(statsRow);
+    body.appendChild(statsSection);
+    const displaySection = document.createElement("div");
+    displaySection.className = "ml-section";
+    const displayTitleRow = document.createElement("div");
+    displayTitleRow.className = "ml-section-title";
+    const displayTitleLeft = document.createElement("div");
+    displayTitleLeft.className = "ml-inline-title";
+    const displayTitleText = document.createElement("span");
+    displayTitleText.textContent = "Display & Thumbnails";
+    displayTitleLeft.append(createIcon("image", 14), displayTitleText, createInfoTip("Choose Small (S), Medium (M), or Large (L) thumbnail presets independently for Gallery and Character Media views. Large also loads higher-resolution thumbnails for local images."));
+    displayTitleRow.appendChild(displayTitleLeft);
+    displaySection.appendChild(displayTitleRow);
+    const displayGrid = document.createElement("div");
+    displayGrid.className = "ml-check-grid";
+    const addThumbSizeCard = (label, control) => {
+      const card = document.createElement("div");
+      card.className = "ml-check-card";
+      const lbl = document.createElement("span");
+      lbl.textContent = label;
+      card.append(lbl, control);
+      displayGrid.appendChild(card);
+    };
+    addThumbSizeCard("Gallery Thumbnails", createThumbnailSizeSegmented(this.galleryState.thumbnailSize, (nextSize) => {
+      this.galleryState = {
+        ...this.galleryState,
+        thumbnailSize: nextSize
+      };
+      savePrefsToStorage(GALLERY_PREFS_STORAGE_KEY, sanitizeGalleryPreferences(this.galleryState));
+    }));
+    addThumbSizeCard("Character Media Thumbnails", createThumbnailSizeSegmented(this.characterUiState.thumbnailSize, (nextSize) => {
+      this.characterUiState = {
+        ...this.characterUiState,
+        thumbnailSize: nextSize
+      };
+      savePrefsToStorage(CHARACTER_PREFS_STORAGE_KEY, sanitizeCharacterPreferences(this.characterUiState, true));
+      this.characterWidget?.applySharedPreferences({ thumbnailSize: nextSize });
+      this.options?.onCharacterPrefsUpdated?.();
+    }));
+    displaySection.appendChild(displayGrid);
+    body.appendChild(displaySection);
+    const defaultsSection = document.createElement("div");
+    defaultsSection.className = "ml-section";
     const defTitleRow = document.createElement("div");
     defTitleRow.className = "ml-section-title";
     const defTitleLeft = document.createElement("div");
     defTitleLeft.className = "ml-inline-title";
-    defTitleLeft.append(document.createTextNode("Global Download Defaults"), createInfoTip("Used by the one-click Localize button across Character tabs and Portrait Panel unless a card defines Custom overrides."));
+    const defTitleText = document.createElement("span");
+    defTitleText.textContent = "Global Download Defaults";
+    defTitleLeft.append(createIcon("sliders", 14), defTitleText, createInfoTip("Used by the one-click Localize button across Character tabs and Portrait Panel unless a card defines Custom overrides."));
     defTitleRow.appendChild(defTitleLeft);
-    defaultsBox.appendChild(defTitleRow);
+    defaultsSection.appendChild(defTitleRow);
     const sharedState = {
       sections: new Set(this.settings.defaultSections),
       mediaKinds: new Set(this.settings.defaultMediaKinds),
       includeFailed: this.settings.defaultIncludeFailed,
       batchCap: this.settings.defaultBatchCap
     };
-    defaultsBox.appendChild(renderSharedDownloadConfigControls({
+    defaultsSection.appendChild(renderSharedDownloadConfigControls({
       state: sharedState,
       sectionTip: "Default card sections included for one-click media localization.",
       onChange: () => {
@@ -5230,16 +7010,20 @@ class MediaLocalizerDrawerPanel {
         }), "settings");
       }
     }));
-    body.appendChild(defaultsBox);
-    const formBox = document.createElement("div");
-    formBox.className = "ml-section-box";
+    body.appendChild(defaultsSection);
+    const formSection = document.createElement("div");
+    formSection.className = "ml-section";
     const formTitle = document.createElement("div");
     formTitle.className = "ml-section-title";
-    formTitle.textContent = "Automation & Guardrails";
-    formBox.appendChild(formTitle);
-    const addToggleSetting = (label, tip, key) => {
+    const formTitleText = document.createElement("span");
+    formTitleText.textContent = "Automation & Guardrails";
+    formTitle.append(createIcon("shield", 14), formTitleText);
+    formSection.appendChild(formTitle);
+    const toggleGrid = document.createElement("div");
+    toggleGrid.className = "ml-setting-toggle-grid";
+    const addToggleSetting = (label, tip, key, isCaution = false) => {
       const row = document.createElement("div");
-      row.className = "ml-setting-toggle-row";
+      row.className = isCaution ? "ml-setting-toggle-row is-caution" : "ml-setting-toggle-row";
       const lbl = document.createElement("label");
       lbl.className = "ml-toggle-label";
       const cb = document.createElement("input");
@@ -5250,13 +7034,18 @@ class MediaLocalizerDrawerPanel {
       });
       lbl.append(cb, document.createTextNode(label));
       row.append(lbl, createInfoTip(tip));
-      formBox.appendChild(row);
+      toggleGrid.appendChild(row);
     };
     addToggleSetting("Auto-localize on character open", "Automatically runs one-click localization once per character when opening a chat, obeying global or custom defaults.", "autoLocalizeOnOpen");
     addToggleSetting("Detect bare media URLs", "Also scan bare http/https image & video URLs in addition to Markdown, HTML, and CSS tags.", "scanBareUrls");
     addToggleSetting("Sync localized assets to native Gallery & Portrait Panel", "Automatically adds downloaded images into Lumiverse's Character Gallery and Portrait Panel.", "autoLinkGallery");
     addToggleSetting("Adopt matching images already in native Gallery", "Reuses existing Character Gallery images that match a card URL instead of re-downloading.", "adoptNativeGalleryImages");
-    addToggleSetting("Delete images from native Gallery & storage when purging", "When off, removing localized media only unlinks it from Media Localizer while keeping Gallery items.", "deleteImagesOnPurge");
+    addToggleSetting("Delete images from native Gallery & storage when purging", "When off, removing localized media only unlinks it from Media Localizer while keeping Gallery items.", "deleteImagesOnPurge", true);
+    formSection.appendChild(toggleGrid);
+    const limitsLabel = document.createElement("div");
+    limitsLabel.className = "ml-subsection-label";
+    limitsLabel.textContent = "Queue & Safety Limits";
+    formSection.appendChild(limitsLabel);
     const numGrid = document.createElement("div");
     numGrid.className = "ml-check-grid";
     const addNumberSetting = (label, value, min, max, onChange) => {
@@ -5283,8 +7072,8 @@ class MediaLocalizerDrawerPanel {
     addNumberSetting("Max File Size (MB)", this.settings.maxFileSizeMb, 1, 200, (v) => void this.guard(() => this.callbacks.onUpdateSettings({ maxFileSizeMb: v }), "settings"));
     addNumberSetting("Timeout per File (s)", this.settings.timeoutSeconds, 5, 120, (v) => void this.guard(() => this.callbacks.onUpdateSettings({ timeoutSeconds: v }), "settings"));
     addNumberSetting("Concurrent Downloads", this.settings.concurrency, 1, 5, (v) => void this.guard(() => this.callbacks.onUpdateSettings({ concurrency: v }), "settings"));
-    formBox.appendChild(numGrid);
-    body.appendChild(formBox);
+    formSection.appendChild(numGrid);
+    body.appendChild(formSection);
   }
 }
 
@@ -5296,12 +7085,14 @@ class NativeGalleryTabIntegrator {
   settings;
   queueProgress;
   callbacks;
+  options;
   unsubscribeEditor = null;
   domWaitObserver = null;
   domWaitTimer = null;
   galleryContentObserver = null;
   galleryRefreshTimer = null;
   lastKnownGalleryCardCount = -1;
+  pendingExternalRefreshWhileQueueActive = false;
   hostEl = null;
   mountedTabEl = null;
   widget = null;
@@ -5312,11 +7103,12 @@ class NativeGalleryTabIntegrator {
     activeTabId: null,
     extensions: {}
   };
-  constructor(ctx, settings, queueProgress, callbacks) {
+  constructor(ctx, settings, queueProgress, callbacks, options = {}) {
     this.ctx = ctx;
     this.settings = settings;
     this.queueProgress = queueProgress;
     this.callbacks = callbacks;
+    this.options = options;
   }
   start() {
     this.stopped = false;
@@ -5347,11 +7139,31 @@ class NativeGalleryTabIntegrator {
     this.unmountHost();
   }
   updateExternalState(settings, queueProgress) {
+    const wasActive = isQueueActiveStatus(this.queueProgress.status);
+    const nowActive = isQueueActiveStatus(queueProgress.status);
+    const shouldForceRefresh = wasActive && !nowActive && this.pendingExternalRefreshWhileQueueActive;
     this.settings = settings;
     this.queueProgress = queueProgress;
+    if (wasActive && !nowActive) {
+      this.pendingExternalRefreshWhileQueueActive = false;
+    }
     if (this.stopped)
       return;
-    this.widget?.updateExternalState(settings, queueProgress);
+    this.widget?.updateExternalState(settings, queueProgress, shouldForceRefresh);
+  }
+  syncPreferencesFromStorage() {
+    if (this.stopped || !this.widget)
+      return;
+    const prefs = loadPrefsFromStorage(CHARACTER_PREFS_STORAGE_KEY, (raw) => sanitizeCharacterPreferences(raw, false), () => getDefaultCharacterPreferences(false));
+    this.widget.applySharedPreferences({
+      thumbnailSize: prefs.thumbnailSize,
+      mediaViewMode: prefs.mediaViewMode,
+      mediaFilter: prefs.mediaFilter,
+      showGreetingSubfilter: prefs.showGreetingSubfilter,
+      showWorldBookSubfilter: prefs.showWorldBookSubfilter,
+      showUrlPicker: prefs.showUrlPicker,
+      showRemoteThumbnails: prefs.showRemoteThumbnails
+    });
   }
   refreshActiveScan(characterId) {
     if (this.stopped || !this.widget)
@@ -5380,6 +7192,7 @@ class NativeGalleryTabIntegrator {
       this.galleryRefreshTimer = null;
     }
     this.lastKnownGalleryCardCount = -1;
+    this.pendingExternalRefreshWhileQueueActive = false;
   }
   unmountHost() {
     this.disconnectGalleryContentObserver();
@@ -5443,13 +7256,39 @@ class NativeGalleryTabIntegrator {
     }
     this.unmountHost();
     const host = document.createElement("div");
-    host.className = "ml-gallery-host";
+    host.className = "ml-gallery-host is-embedded";
+    host.setAttribute("role", "region");
+    host.setAttribute("aria-label", "Media Localizer");
     galleryTab.classList.add("ml-gallery-tab-active");
     galleryTab.appendChild(host);
+    const storedPrefs = loadPrefsFromStorage(CHARACTER_PREFS_STORAGE_KEY, (raw) => sanitizeCharacterPreferences(raw, false), () => getDefaultCharacterPreferences(false));
     const widget = new CharacterMediaWidget(host, this.ctx, characterId, this.settings, this.queueProgress, this.callbacks, {
       inDrawer: false,
       defaultExpandConfig: false,
-      defaultExpandDownloadedMedia: false
+      defaultExpandDownloadedMedia: false,
+      initialUiState: {
+        ...storedPrefs,
+        showDownloadConfig: false,
+        showDownloadedMedia: false,
+        expandedUrls: []
+      },
+      onUiStateChange: (state) => {
+        const existing = loadPrefsFromStorage(CHARACTER_PREFS_STORAGE_KEY, (raw) => sanitizeCharacterPreferences(raw, true), () => getDefaultCharacterPreferences(true));
+        const changed = existing.thumbnailSize !== state.thumbnailSize || existing.mediaViewMode !== state.mediaViewMode || existing.mediaFilter !== state.mediaFilter || existing.showGreetingSubfilter !== state.showGreetingSubfilter || existing.showWorldBookSubfilter !== state.showWorldBookSubfilter || existing.showUrlPicker !== state.showUrlPicker || existing.showRemoteThumbnails !== state.showRemoteThumbnails;
+        if (!changed)
+          return;
+        savePrefsToStorage(CHARACTER_PREFS_STORAGE_KEY, {
+          ...existing,
+          thumbnailSize: state.thumbnailSize,
+          mediaViewMode: state.mediaViewMode,
+          mediaFilter: state.mediaFilter,
+          showGreetingSubfilter: state.showGreetingSubfilter,
+          showWorldBookSubfilter: state.showWorldBookSubfilter,
+          showUrlPicker: state.showUrlPicker,
+          showRemoteThumbnails: state.showRemoteThumbnails
+        });
+        this.options.onCharacterPrefsUpdated?.();
+      }
     });
     this.mountedTabEl = galleryTab;
     this.hostEl = host;
@@ -5481,8 +7320,13 @@ class NativeGalleryTabIntegrator {
         this.galleryRefreshTimer = null;
         if (this.stopped || !this.widget)
           return;
+        if (isQueueActiveStatus(this.queueProgress.status)) {
+          this.pendingExternalRefreshWhileQueueActive = true;
+          return;
+        }
+        this.pendingExternalRefreshWhileQueueActive = false;
         this.widget.refreshScan(true);
-      }, 250);
+      }, 600);
     });
     this.galleryContentObserver.observe(galleryTab, {
       childList: true,
@@ -5541,7 +7385,8 @@ class PortraitPanelLocalizeController {
       return false;
     }
     const mountedPanel = this.wrapEl?.parentElement ?? null;
-    if (mountedPanel && mountedPanel.isConnected !== false && (mountedPanel.contains(target) || target.contains?.(mountedPanel))) {
+    const isMountedConnected = Boolean(mountedPanel && mountedPanel.isConnected !== false);
+    if (isMountedConnected && mountedPanel && (mountedPanel.contains(target) || target.contains?.(mountedPanel))) {
       return true;
     }
     if (targetEl?.closest?.('[class*="panelOuter"] [class*="panel"]')) {
@@ -5555,6 +7400,8 @@ class PortraitPanelLocalizeController {
         return true;
       if (el.matches?.('[class*="panelOuter"], [class*="panel"]'))
         return true;
+      if (isMountedConnected)
+        return false;
       return el.querySelector?.('[class*="panelOuter"] [class*="panel"]') !== null;
     };
     for (const node of Array.from(m.addedNodes)) {
@@ -5844,259 +7691,631 @@ var MEDIA_LOCALIZER_STYLES = `
 }
 
 .ml-gallery-host {
-  margin-top: 12px;
-  border: 1px solid var(--lumiverse-border, rgba(255, 255, 255, 0.12));
-  border-radius: 10px;
-  background: var(--lumiverse-bg-elevated, rgba(20, 22, 28, 0.85));
-  color: var(--lumiverse-text, #f1f5f9);
-  font-size: 12.5px;
-  line-height: 1.45;
+  margin-top: 0;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: var(--lumiverse-text, rgba(255, 255, 255, 0.92));
+  font-family: var(--lumiverse-font-family, inherit);
+  font-size: 12px;
+  line-height: 1.4;
+  width: 100%;
+  min-width: 0;
   flex-shrink: 0;
   overflow: visible;
+  box-shadow: none;
+}
+
+.ml-gallery-host.is-embedded {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--lumiverse-border, rgba(147, 112, 219, 0.16));
+  background: transparent;
+  box-shadow: none;
+}
+
+.ml-gallery-host.is-embedded .ml-widget,
+.ml-widget.is-embedded {
+  padding: 0;
+}
+
+.ml-drawer-root .ml-gallery-host {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: none;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+[data-spindle-drawer-tab]:has(> .ml-drawer-root) {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
 }
 
 .ml-drawer-root {
   display: flex;
   flex-direction: column;
+  width: 100%;
   height: 100%;
-  color: var(--lumiverse-text, #f1f5f9);
-  font-size: 12.5px;
-  line-height: 1.45;
+  min-height: 0;
+  color: var(--lumiverse-text, rgba(255, 255, 255, 0.92));
+  font-family: var(--lumiverse-font-family, inherit);
+  font-size: 12px;
+  line-height: 1.4;
   overflow: visible;
 }
 
+/* Focus & Native Control Accents */
+.ml-drawer-root :focus-visible,
+.ml-gallery-host :focus-visible,
+.ml-lightbox-backdrop :focus-visible,
+.ml-portrait-localize-wrap :focus-visible {
+  outline: 1.5px solid var(--lumiverse-primary-050, rgba(147, 112, 219, 0.55));
+  outline-offset: 1px;
+}
+
+.ml-drawer-root input[type="checkbox"],
+.ml-gallery-host input[type="checkbox"] {
+  accent-color: var(--lumiverse-primary, rgba(147, 112, 219, 0.9));
+}
+
+/* Custom Thin Scrollbars */
+.ml-drawer-body,
+.ml-url-list,
+.ml-subfilter-list,
+.ml-asset-grid,
+.ml-media-list {
+  scrollbar-width: thin;
+  scrollbar-color: var(--lumiverse-primary-020, rgba(147, 112, 219, 0.22)) transparent;
+}
+
+.ml-drawer-body::-webkit-scrollbar,
+.ml-url-list::-webkit-scrollbar,
+.ml-subfilter-list::-webkit-scrollbar,
+.ml-asset-grid::-webkit-scrollbar,
+.ml-media-list::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+
+.ml-drawer-body::-webkit-scrollbar-track,
+.ml-url-list::-webkit-scrollbar-track,
+.ml-subfilter-list::-webkit-scrollbar-track,
+.ml-asset-grid::-webkit-scrollbar-track,
+.ml-media-list::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.ml-drawer-body::-webkit-scrollbar-thumb,
+.ml-url-list::-webkit-scrollbar-thumb,
+.ml-subfilter-list::-webkit-scrollbar-thumb,
+.ml-asset-grid::-webkit-scrollbar-thumb,
+.ml-media-list::-webkit-scrollbar-thumb {
+  background: var(--lumiverse-primary-020, rgba(147, 112, 219, 0.22));
+  border-radius: 999px;
+}
+
+.ml-drawer-body::-webkit-scrollbar-thumb:hover,
+.ml-url-list::-webkit-scrollbar-thumb:hover,
+.ml-subfilter-list::-webkit-scrollbar-thumb:hover,
+.ml-asset-grid::-webkit-scrollbar-thumb:hover,
+.ml-media-list::-webkit-scrollbar-thumb:hover {
+  background: var(--lumiverse-primary-050, rgba(147, 112, 219, 0.5));
+}
+
+/* Segmented Drawer Navigation */
 .ml-drawer-nav {
   display: flex;
   flex-wrap: wrap;
-  gap: 4px;
+  gap: 3px;
   min-width: 0;
-  padding: 8px 12px;
-  border-bottom: 1px solid var(--lumiverse-border, rgba(255, 255, 255, 0.1));
-  background: var(--lumiverse-bg-surface, rgba(15, 17, 23, 0.6));
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--lumiverse-border, rgba(147, 112, 219, 0.14));
+  background: var(--lumiverse-bg-darker, rgba(0, 0, 0, 0.18));
   flex-shrink: 0;
 }
 
 .ml-drawer-nav-btn {
+  position: relative;
   flex: 1 1 auto;
   min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
   white-space: nowrap;
-  padding: 6px 8px;
+  padding: 4px 7px;
   border-radius: 6px;
   border: 1px solid transparent;
   background: transparent;
-  color: var(--lumiverse-text-muted, #94a3b8);
-  font-size: 12px;
+  color: var(--lumiverse-text-muted, rgba(255, 255, 255, 0.65));
+  font-family: inherit;
+  font-size: 11.5px;
   font-weight: 500;
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition:
+    color var(--lumiverse-transition-fast, 150ms ease),
+    background var(--lumiverse-transition-fast, 150ms ease),
+    border-color var(--lumiverse-transition-fast, 150ms ease),
+    box-shadow var(--lumiverse-transition-fast, 150ms ease);
 }
 
 .ml-drawer-nav-btn:hover {
-  color: var(--lumiverse-text, #f1f5f9);
-  background: rgba(255, 255, 255, 0.05);
+  color: var(--lumiverse-text, rgba(255, 255, 255, 0.92));
+  background: var(--lumiverse-fill-subtle, rgba(255, 255, 255, 0.05));
 }
 
 .ml-drawer-nav-btn.is-active {
   color: var(--lumiverse-text, #ffffff);
-  background: var(--lumiverse-bg-elevated, rgba(255, 255, 255, 0.1));
-  border-color: var(--lumiverse-border, rgba(255, 255, 255, 0.16));
+  font-weight: 600;
+  background: var(--lumiverse-primary-015, rgba(147, 112, 219, 0.16));
+  border-color: var(--lumiverse-primary-050, rgba(147, 112, 219, 0.42));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.1),
+    0 1px 4px rgba(0, 0, 0, 0.2);
+}
+
+.ml-drawer-nav-btn.is-active .ml-icon {
+  color: var(--lumiverse-primary-text, rgba(186, 135, 255, 0.95));
 }
 
 .ml-drawer-body {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  padding: 12px;
+  padding: 8px 10px;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 8px;
 }
 
 .ml-widget {
+  --ml-char-card-min: 104px;
+  --ml-asset-tile-min: 98px;
+  --ml-gallery-tile-min: 96px;
+  --ml-asset-thumb-height: 78px;
+  --ml-asset-grid-max-height: 260px;
+  --ml-list-thumb-size: 34px;
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  padding: 12px;
+  gap: 7px;
+  min-width: 0;
+  padding: 8px;
+}
+
+.ml-widget.is-thumb-sm {
+  --ml-char-card-min: 76px;
+  --ml-asset-tile-min: 74px;
+  --ml-gallery-tile-min: 72px;
+  --ml-asset-thumb-height: 58px;
+  --ml-asset-grid-max-height: 240px;
+  --ml-list-thumb-size: 26px;
+}
+
+.ml-widget.is-thumb-md {
+  --ml-char-card-min: 104px;
+  --ml-asset-tile-min: 98px;
+  --ml-gallery-tile-min: 96px;
+  --ml-asset-thumb-height: 78px;
+  --ml-asset-grid-max-height: 260px;
+  --ml-list-thumb-size: 34px;
+}
+
+.ml-widget.is-thumb-lg {
+  --ml-char-card-min: 148px;
+  --ml-asset-tile-min: 142px;
+  --ml-gallery-tile-min: 140px;
+  --ml-asset-thumb-height: 116px;
+  --ml-asset-grid-max-height: 320px;
+  --ml-list-thumb-size: 48px;
+}
+
+.ml-drawer-root .ml-widget,
+.ml-widget.is-drawer {
+  padding: 0;
+  gap: 8px;
 }
 
 .ml-header-bar {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
+  gap: 6px 8px;
   flex-wrap: wrap;
 }
 
-.ml-header-info {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  min-width: 180px;
-}
-
-.ml-title-row {
+.ml-compact-row {
   display: flex;
   align-items: center;
-  gap: 8px;
-  font-weight: 600;
-  font-size: 13px;
-  color: var(--lumiverse-text, #f8fafc);
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.ml-inline-stats {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  font-size: 11.5px;
+  color: var(--lumiverse-text, rgba(255, 255, 255, 0.9));
 }
 
 .ml-subtitle {
-  font-size: 11.5px;
-  color: var(--lumiverse-text-muted, #94a3b8);
+  font-size: 11px;
+  color: var(--lumiverse-text-muted, rgba(255, 255, 255, 0.65));
 }
 
 .ml-header-actions {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 4px;
   flex-wrap: wrap;
 }
 
+/* Badges & Status Indicators */
 .ml-badge {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  padding: 2px 7px;
+  gap: 3px;
+  padding: 1px 6px;
   border-radius: 999px;
-  font-size: 11px;
+  border: 1px solid var(--lumiverse-border-neutral, rgba(255, 255, 255, 0.1));
+  font-size: 10.5px;
   font-weight: 600;
-  background: rgba(255, 255, 255, 0.08);
-  color: var(--lumiverse-text, #e2e8f0);
+  line-height: 1.35;
+  background: var(--lumiverse-fill, rgba(255, 255, 255, 0.08));
+  color: var(--lumiverse-text, rgba(255, 255, 255, 0.9));
+  font-variant-numeric: tabular-nums;
 }
 
-.ml-badge.is-success {
-  background: rgba(16, 185, 129, 0.16);
-  color: #34d399;
+.ml-badge.is-success,
+.ml-badge.is-local {
+  background: var(--lumiverse-success-015, rgba(34, 197, 94, 0.16));
+  border-color: var(--lumiverse-success-050, rgba(34, 197, 94, 0.35));
+  color: #4ade80;
 }
 
-.ml-badge.is-warn {
-  background: rgba(245, 158, 11, 0.16);
+.ml-badge.is-warn,
+.ml-badge.is-remote {
+  background: var(--lumiverse-warning-015, rgba(245, 158, 11, 0.16));
+  border-color: var(--lumiverse-warning-050, rgba(245, 158, 11, 0.35));
   color: #fbbf24;
 }
 
-.ml-badge.is-danger {
-  background: rgba(239, 68, 68, 0.16);
+.ml-badge.is-danger,
+.ml-badge.is-failed {
+  background: var(--lumiverse-danger-015, rgba(239, 68, 68, 0.16));
+  border-color: var(--lumiverse-danger-050, rgba(239, 68, 68, 0.38));
   color: #f87171;
 }
 
+.ml-badge.is-info {
+  background: var(--lumiverse-primary-015, rgba(147, 112, 219, 0.18));
+  border-color: var(--lumiverse-primary-050, rgba(147, 112, 219, 0.38));
+  color: var(--lumiverse-primary-text, #c4b5fd);
+}
+
+.ml-badge.is-muted {
+  background: var(--lumiverse-fill-subtle, rgba(255, 255, 255, 0.05));
+  border-color: var(--lumiverse-border-neutral, rgba(255, 255, 255, 0.1));
+  color: var(--lumiverse-text-muted, rgba(255, 255, 255, 0.65));
+}
+
+.ml-badge.is-type {
+  background: var(--lumiverse-fill-medium, rgba(0, 0, 0, 0.25));
+  border-color: var(--lumiverse-border, rgba(147, 112, 219, 0.2));
+  color: var(--lumiverse-text-muted, rgba(255, 255, 255, 0.78));
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  font-size: 9.5px;
+}
+
+.ml-stat-strip {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.ml-stat-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 6px;
+  border-radius: 5px;
+  border: 1px solid var(--lumiverse-border-neutral, rgba(255, 255, 255, 0.1));
+  background: var(--lumiverse-fill, rgba(0, 0, 0, 0.18));
+  color: var(--lumiverse-text, rgba(255, 255, 255, 0.9));
+  font-size: 10.5px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+.ml-stat-chip.is-success {
+  background: var(--lumiverse-success-015, rgba(34, 197, 94, 0.14));
+  border-color: rgba(34, 197, 94, 0.28);
+  color: #4ade80;
+}
+
+.ml-stat-chip.is-warn {
+  background: var(--lumiverse-warning-015, rgba(245, 158, 11, 0.14));
+  border-color: rgba(245, 158, 11, 0.28);
+  color: #fbbf24;
+}
+
+.ml-stat-chip.is-danger {
+  background: var(--lumiverse-danger-015, rgba(239, 68, 68, 0.14));
+  border-color: rgba(239, 68, 68, 0.3);
+  color: #fca5a5;
+}
+
+.ml-stat-chip.is-info {
+  background: var(--lumiverse-primary-015, rgba(147, 112, 219, 0.15));
+  border-color: rgba(147, 112, 219, 0.32);
+  color: var(--lumiverse-primary-text, #c4b5fd);
+}
+
+.ml-stat-chip.is-muted {
+  color: var(--lumiverse-text-muted, rgba(255, 255, 255, 0.62));
+}
+
+.ml-status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  flex-shrink: 0;
+  display: inline-block;
+  background: var(--lumiverse-text-dim, rgba(255, 255, 255, 0.4));
+}
+
+.ml-status-dot.is-success {
+  background: var(--lumiverse-success, #22c55e);
+  box-shadow: 0 0 6px var(--lumiverse-success-050, rgba(34, 197, 94, 0.5));
+}
+
+.ml-status-dot.is-warn {
+  background: var(--lumiverse-warning, #f59e0b);
+  box-shadow: 0 0 6px var(--lumiverse-warning-050, rgba(245, 158, 11, 0.5));
+}
+
+.ml-status-dot.is-danger {
+  background: var(--lumiverse-danger, #ef4444);
+  box-shadow: 0 0 6px var(--lumiverse-danger-050, rgba(239, 68, 68, 0.5));
+}
+
+.ml-status-dot.is-muted {
+  background: var(--lumiverse-text-dim, rgba(255, 255, 255, 0.35));
+}
+
+/* Button Hierarchy */
 .ml-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 5px;
-  padding: 5px 10px;
+  gap: 4px;
+  padding: 4px 8px;
   border-radius: 6px;
-  border: 1px solid var(--lumiverse-border, rgba(255, 255, 255, 0.14));
-  background: var(--lumiverse-bg-surface, rgba(255, 255, 255, 0.06));
-  color: var(--lumiverse-text, #f1f5f9);
-  font-size: 12px;
+  border: 1px solid var(--lumiverse-border, rgba(147, 112, 219, 0.18));
+  background: var(--lumiverse-fill, rgba(255, 255, 255, 0.06));
+  color: var(--lumiverse-text, rgba(255, 255, 255, 0.9));
+  font-family: inherit;
+  font-size: 11.5px;
   font-weight: 500;
   cursor: pointer;
-  transition: all 0.15s ease;
+  white-space: nowrap;
+  transition:
+    background var(--lumiverse-transition-fast, 150ms ease),
+    border-color var(--lumiverse-transition-fast, 150ms ease),
+    color var(--lumiverse-transition-fast, 150ms ease),
+    transform 100ms ease,
+    box-shadow var(--lumiverse-transition-fast, 150ms ease);
 }
 
 .ml-btn:hover:not(:disabled) {
-  background: rgba(255, 255, 255, 0.12);
+  background: var(--lumiverse-bg-hover, rgba(255, 255, 255, 0.12));
+  border-color: var(--lumiverse-border-hover, rgba(147, 112, 219, 0.32));
+}
+
+.ml-btn:active:not(:disabled) {
+  transform: translateY(0.5px);
 }
 
 .ml-btn:disabled {
-  opacity: 0.45;
+  opacity: 0.42;
   cursor: not-allowed;
 }
 
 .ml-btn.is-primary {
-  background: var(--lumiverse-primary, #6366f1);
-  border-color: var(--lumiverse-primary, #6366f1);
+  background: var(--lumiverse-primary, rgba(147, 112, 219, 0.9));
+  border-color: var(--lumiverse-primary, rgba(147, 112, 219, 0.9));
   color: #ffffff;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.18),
+    0 1px 4px rgba(0, 0, 0, 0.25);
 }
 
 .ml-btn.is-primary:hover:not(:disabled) {
-  filter: brightness(1.1);
+  background: var(--lumiverse-primary-hover, rgba(167, 132, 239, 0.95));
+  border-color: var(--lumiverse-primary-hover, rgba(167, 132, 239, 0.95));
 }
 
 .ml-btn.is-danger {
-  background: rgba(239, 68, 68, 0.15);
-  border-color: rgba(239, 68, 68, 0.35);
+  background: var(--lumiverse-danger-015, rgba(239, 68, 68, 0.15));
+  border-color: var(--lumiverse-danger-050, rgba(239, 68, 68, 0.4));
   color: #fca5a5;
 }
 
 .ml-btn.is-danger:hover:not(:disabled) {
-  background: rgba(239, 68, 68, 0.25);
+  background: var(--lumiverse-danger-020, rgba(239, 68, 68, 0.26));
+  border-color: var(--lumiverse-danger, #ef4444);
+  color: #fecaca;
+}
+
+.ml-btn.is-active {
+  background: var(--lumiverse-primary-020, rgba(147, 112, 219, 0.24));
+  border-color: var(--lumiverse-primary-050, rgba(147, 112, 219, 0.55));
+  color: var(--lumiverse-text, #ffffff);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.1);
 }
 
 .ml-btn.is-sm {
-  padding: 3px 7px;
+  padding: 2.5px 6.5px;
   font-size: 11px;
 }
 
-.ml-collapse-btn {
-  border-color: transparent;
-  background: transparent;
-  color: var(--lumiverse-text-muted, #94a3b8);
+.ml-btn.is-xs {
+  padding: 1.5px 5px;
+  font-size: 10px;
+}
+
+.ml-icon-btn {
+  padding: 3px 5px;
+}
+
+.ml-icon-btn.is-sm {
   padding: 2px 4px;
 }
 
-.ml-collapse-btn:hover:not(:disabled) {
-  background: rgba(255, 255, 255, 0.08);
-  border-color: rgba(255, 255, 255, 0.14);
-  color: var(--lumiverse-text, #f1f5f9);
+.ml-icon {
+  display: block;
+  flex-shrink: 0;
+}
+
+@keyframes ml-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.ml-btn.is-busy .ml-icon {
+  animation: ml-spin 0.9s linear infinite;
+}
+
+/* Segmented Control Wrapper */
+.ml-segmented {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 7px;
+  background: var(--lumiverse-bg-darker, rgba(0, 0, 0, 0.28));
+  border: 1px solid var(--lumiverse-border, rgba(147, 112, 219, 0.14));
+}
+
+.ml-segmented .ml-btn {
+  border-color: transparent;
+  background: transparent;
+  color: var(--lumiverse-text-muted, rgba(255, 255, 255, 0.65));
+  box-shadow: none;
+}
+
+.ml-segmented .ml-btn:hover:not(:disabled) {
+  background: var(--lumiverse-fill-subtle, rgba(255, 255, 255, 0.06));
+  color: var(--lumiverse-text, rgba(255, 255, 255, 0.92));
+}
+
+.ml-segmented .ml-btn.is-active {
+  background: var(--lumiverse-primary-020, rgba(147, 112, 219, 0.24));
+  border-color: var(--lumiverse-primary-050, rgba(147, 112, 219, 0.45));
+  color: var(--lumiverse-text, #ffffff);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.1);
+}
+
+.ml-thumb-size-segmented {
+  flex-shrink: 0;
+}
+
+.ml-thumb-size-segmented .ml-btn {
+  min-width: 20px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
 }
 
 .ml-toggle-label {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  font-size: 12px;
+  gap: 5px;
+  font-size: 11.5px;
   cursor: pointer;
   user-select: none;
-  color: var(--lumiverse-text, #e2e8f0);
+  color: var(--lumiverse-text, rgba(255, 255, 255, 0.9));
 }
 
-.ml-section,
-.ml-section-box {
-  border: 1px solid var(--lumiverse-border, rgba(255, 255, 255, 0.1));
-  border-radius: 8px;
-  padding: 10px;
-  background: rgba(0, 0, 0, 0.18);
+/* Flat Borderless Flow Sections */
+.ml-section {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 6px;
+  min-width: 0;
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.ml-section + .ml-section {
+  padding-top: 8px;
+  border-top: 1px solid var(--lumiverse-border, rgba(147, 112, 219, 0.14));
 }
 
 .ml-section-title {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  font-size: 11.5px;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-size: 11px;
   font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: 0.03em;
-  color: var(--lumiverse-text-muted, #94a3b8);
+  letter-spacing: 0.04em;
+  color: var(--lumiverse-text-muted, rgba(255, 255, 255, 0.65));
+}
+
+.ml-subsection-label {
+  font-size: 10.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--lumiverse-text-dim, rgba(255, 255, 255, 0.45));
+  padding-top: 4px;
+  margin-top: 2px;
+  border-top: 1px solid var(--lumiverse-border-neutral, rgba(255, 255, 255, 0.08));
+}
+
+.ml-batch-char-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px 8px;
+  flex-wrap: wrap;
 }
 
 .ml-check-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(195px, 1fr));
-  gap: 6px;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 155px), 1fr));
+  gap: 5px;
 }
 
 .ml-check-card {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 6px;
-  padding: 6px 8px;
+  gap: 5px;
+  padding: 4px 7px;
   border-radius: 6px;
-  border: 1px solid var(--lumiverse-border, rgba(255, 255, 255, 0.08));
-  background: rgba(255, 255, 255, 0.03);
-  font-size: 12px;
+  border: 1px solid var(--lumiverse-border-neutral, rgba(255, 255, 255, 0.08));
+  background: var(--lumiverse-fill-subtle, rgba(255, 255, 255, 0.03));
+  font-size: 11.5px;
+  min-width: 0;
+  transition: border-color var(--lumiverse-transition-fast, 150ms ease), background var(--lumiverse-transition-fast, 150ms ease);
 }
 
-.ml-check-card.is-empty {
-  opacity: 0.5;
+.ml-check-card:hover {
+  border-color: var(--lumiverse-border, rgba(147, 112, 219, 0.22));
+  background: var(--lumiverse-fill, rgba(255, 255, 255, 0.05));
 }
 
 .ml-check-card-left {
@@ -6118,63 +8337,99 @@ var MEDIA_LOCALIZER_STYLES = `
 }
 
 .ml-subfilter-box {
-  margin-top: 4px;
-  padding: 8px;
-  border-radius: 6px;
-  background: rgba(0, 0, 0, 0.25);
-  border: 1px dashed var(--lumiverse-border, rgba(255, 255, 255, 0.12));
+  margin-top: 2px;
+  padding-top: 6px;
+  border-top: 1px solid var(--lumiverse-border-neutral, rgba(255, 255, 255, 0.08));
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 5px;
 }
 
 .ml-subfilter-list {
-  max-height: 150px;
+  max-height: 130px;
   overflow-y: auto;
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
-  gap: 4px;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 145px), 1fr));
+  gap: 3px 6px;
 }
 
+/* Filter Pills */
 .ml-pill-row {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
+  gap: 4px;
 }
 
 .ml-pill {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
-  padding: 3px 8px;
+  gap: 4px;
+  padding: 2.5px 8px;
   border-radius: 999px;
-  border: 1px solid var(--lumiverse-border, rgba(255, 255, 255, 0.14));
-  background: rgba(255, 255, 255, 0.04);
-  color: var(--lumiverse-text, #f1f5f9);
+  border: 1px solid var(--lumiverse-border, rgba(147, 112, 219, 0.18));
+  background: var(--lumiverse-fill-subtle, rgba(255, 255, 255, 0.04));
+  color: var(--lumiverse-text-muted, rgba(255, 255, 255, 0.78));
   font-family: inherit;
-  font-size: 11.5px;
+  font-size: 11px;
+  font-weight: 500;
   cursor: pointer;
   user-select: none;
-  transition: background 0.12s ease, border-color 0.12s ease;
+  transition:
+    background var(--lumiverse-transition-fast, 150ms ease),
+    border-color var(--lumiverse-transition-fast, 150ms ease),
+    color var(--lumiverse-transition-fast, 150ms ease);
 }
 
 .ml-pill:hover {
-  background: rgba(255, 255, 255, 0.09);
+  background: var(--lumiverse-fill-hover, rgba(255, 255, 255, 0.09));
+  border-color: var(--lumiverse-border-hover, rgba(147, 112, 219, 0.3));
+  color: var(--lumiverse-text, #ffffff);
 }
 
 .ml-pill.is-selected {
-  background: rgba(99, 102, 241, 0.2);
-  border-color: rgba(99, 102, 241, 0.55);
-  color: #e0e7ff;
+  background: var(--lumiverse-primary-020, rgba(147, 112, 219, 0.22));
+  border-color: var(--lumiverse-primary-050, rgba(147, 112, 219, 0.55));
+  color: var(--lumiverse-text, #ffffff);
+  font-weight: 600;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.1);
 }
 
+.ml-pill.is-video.is-selected {
+  background: rgba(56, 189, 248, 0.18);
+  border-color: rgba(56, 189, 248, 0.48);
+  color: #bae6fd;
+}
+
+.ml-pill.is-expression.is-selected {
+  background: rgba(244, 114, 182, 0.18);
+  border-color: rgba(244, 114, 182, 0.48);
+  color: #fbcfe8;
+}
+
+.ml-pill.is-avatar.is-selected {
+  background: var(--lumiverse-success-015, rgba(34, 197, 94, 0.18));
+  border-color: var(--lumiverse-success-050, rgba(34, 197, 94, 0.48));
+  color: #bbf7d0;
+}
+
+.ml-pill.is-image.is-selected {
+  background: var(--lumiverse-primary-020, rgba(147, 112, 219, 0.22));
+  border-color: var(--lumiverse-primary-050, rgba(147, 112, 219, 0.55));
+  color: var(--lumiverse-primary-text, #e9d5ff);
+}
+
+/* URL & Batch Lists */
 .ml-url-list {
-  max-height: 280px;
+  max-height: clamp(210px, 42vh, 420px);
   overflow-y: auto;
   display: flex;
   flex-direction: column;
-  gap: 5px;
+  gap: 4px;
   padding-right: 2px;
+}
+
+.ml-url-list.is-tall {
+  max-height: clamp(240px, 56vh, 600px);
 }
 
 .ml-url-item-card,
@@ -6182,28 +8437,35 @@ var MEDIA_LOCALIZER_STYLES = `
   display: flex;
   flex-direction: column;
   border-radius: 6px;
-  background: rgba(255, 255, 255, 0.03);
-  border: 1px solid rgba(255, 255, 255, 0.07);
-  transition: border-color 0.15s ease, background 0.15s ease;
+  background: var(--lumiverse-fill-subtle, rgba(255, 255, 255, 0.03));
+  border: 1px solid var(--lumiverse-border-neutral, rgba(255, 255, 255, 0.08));
+  transition:
+    border-color var(--lumiverse-transition-fast, 150ms ease),
+    background var(--lumiverse-transition-fast, 150ms ease);
 }
 
 .ml-url-item-card:hover,
 .ml-lib-item-card:hover {
-  border-color: rgba(255, 255, 255, 0.15);
-  background: rgba(255, 255, 255, 0.045);
+  border-color: var(--lumiverse-border-hover, rgba(147, 112, 219, 0.25));
+  background: var(--lumiverse-fill, rgba(255, 255, 255, 0.05));
 }
 
 .ml-url-item-card.is-expanded,
 .ml-lib-item-card.is-expanded {
-  border-color: rgba(99, 102, 241, 0.45);
-  background: rgba(99, 102, 241, 0.06);
+  border-color: var(--lumiverse-primary-050, rgba(147, 112, 219, 0.45));
+  background: var(--lumiverse-primary-010, rgba(147, 112, 219, 0.07));
+}
+
+.ml-lib-item-card.is-selected {
+  border-color: var(--lumiverse-primary-050, rgba(147, 112, 219, 0.42));
+  background: var(--lumiverse-primary-010, rgba(147, 112, 219, 0.08));
 }
 
 .ml-url-item {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 6px 8px;
+  gap: 6px;
+  padding: 4px 6px;
   font-size: 11.5px;
   cursor: pointer;
   user-select: none;
@@ -6211,18 +8473,19 @@ var MEDIA_LOCALIZER_STYLES = `
 
 .ml-row-checkbox {
   cursor: pointer;
-  width: 15px;
-  height: 15px;
+  width: 14px;
+  height: 14px;
   flex-shrink: 0;
   margin: 0;
 }
 
 .ml-url-thumb {
-  width: 34px;
-  height: 34px;
-  border-radius: 4px;
+  width: 28px;
+  height: 28px;
+  border-radius: 5px;
   object-fit: cover;
-  background: rgba(0, 0, 0, 0.4);
+  border: 1px solid var(--lumiverse-border-neutral, rgba(255, 255, 255, 0.1));
+  background: var(--lumiverse-bg-darker, rgba(0, 0, 0, 0.4));
   flex-shrink: 0;
 }
 
@@ -6238,54 +8501,88 @@ var MEDIA_LOCALIZER_STYLES = `
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: var(--lumiverse-text, #f1f5f9);
-  font-family: monospace;
+  color: var(--lumiverse-text, rgba(255, 255, 255, 0.92));
+  font-family: var(--lumiverse-font-mono, monospace);
   font-size: 11px;
 }
 
 .ml-url-sources {
   font-size: 10.5px;
-  color: var(--lumiverse-text-muted, #94a3b8);
+  color: var(--lumiverse-text-muted, rgba(255, 255, 255, 0.65));
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
+.ml-kind-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 9.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  flex-shrink: 0;
+  background: var(--lumiverse-fill, rgba(255, 255, 255, 0.08));
+  color: var(--lumiverse-text-muted, rgba(255, 255, 255, 0.75));
+  border: 1px solid var(--lumiverse-border-neutral, rgba(255, 255, 255, 0.1));
+}
+
+.ml-kind-chip.is-image {
+  background: var(--lumiverse-primary-010, rgba(147, 112, 219, 0.14));
+  border-color: var(--lumiverse-primary-020, rgba(147, 112, 219, 0.3));
+  color: var(--lumiverse-primary-text, #d8b4fe);
+}
+
+.ml-kind-chip.is-video {
+  background: rgba(56, 189, 248, 0.14);
+  border-color: rgba(56, 189, 248, 0.3);
+  color: #7dd3fc;
+}
+
+.ml-kind-chip.is-failed {
+  background: var(--lumiverse-danger-015, rgba(239, 68, 68, 0.16));
+  border-color: var(--lumiverse-danger-050, rgba(239, 68, 68, 0.38));
+  color: #fca5a5;
+}
+
 .ml-expand-hint {
   font-size: 10.5px;
-  color: var(--lumiverse-text-muted, #94a3b8);
+  color: var(--lumiverse-text-muted, rgba(255, 255, 255, 0.65));
   padding: 2px 5px;
   border-radius: 4px;
-  background: rgba(255, 255, 255, 0.05);
+  background: var(--lumiverse-fill-subtle, rgba(255, 255, 255, 0.05));
   flex-shrink: 0;
 }
 
 .ml-item-details {
-  padding: 8px 10px 10px 10px;
-  border-top: 1px solid rgba(255, 255, 255, 0.08);
-  background: rgba(0, 0, 0, 0.28);
+  padding: 6px 8px;
+  border-top: 1px solid var(--lumiverse-border, rgba(147, 112, 219, 0.14));
+  background: var(--lumiverse-bg-darker, rgba(0, 0, 0, 0.28));
   border-bottom-left-radius: 6px;
   border-bottom-right-radius: 6px;
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  font-size: 11.5px;
+  gap: 6px;
+  font-size: 11px;
 }
 
 .ml-detail-top {
   display: flex;
-  gap: 10px;
+  gap: 8px;
   align-items: flex-start;
   flex-wrap: wrap;
 }
 
 .ml-detail-preview-box {
-  width: 120px;
-  min-height: 76px;
-  max-height: 140px;
+  width: 88px;
+  min-height: 58px;
+  max-height: 104px;
   border-radius: 6px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  background: rgba(0, 0, 0, 0.45);
+  border: 1px solid var(--lumiverse-border, rgba(147, 112, 219, 0.16));
+  background: var(--lumiverse-bg-deep, rgba(10, 8, 18, 0.8));
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -6296,8 +8593,8 @@ var MEDIA_LOCALIZER_STYLES = `
 }
 
 .ml-detail-preview-media {
-  max-width: 120px;
-  max-height: 120px;
+  max-width: 88px;
+  max-height: 88px;
   object-fit: contain;
   display: block;
   cursor: pointer;
@@ -6305,7 +8602,7 @@ var MEDIA_LOCALIZER_STYLES = `
 
 .ml-detail-preview-caption {
   font-size: 10px;
-  color: var(--lumiverse-text-muted, #94a3b8);
+  color: var(--lumiverse-text-muted, rgba(255, 255, 255, 0.65));
   padding: 2px 4px;
   text-align: center;
   width: 100%;
@@ -6314,20 +8611,20 @@ var MEDIA_LOCALIZER_STYLES = `
 
 .ml-detail-info-col {
   flex: 1;
-  min-width: 180px;
+  min-width: min(100%, 140px);
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 4px;
 }
 
 .ml-detail-url-box {
-  font-family: monospace;
-  font-size: 11px;
+  font-family: var(--lumiverse-font-mono, monospace);
+  font-size: 10.5px;
   word-break: break-all;
-  padding: 5px 7px;
+  padding: 4px 6px;
   border-radius: 5px;
-  background: rgba(0, 0, 0, 0.35);
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: var(--lumiverse-bg-deep, rgba(10, 8, 18, 0.65));
+  border: 1px solid var(--lumiverse-border-neutral, rgba(255, 255, 255, 0.1));
   color: var(--lumiverse-text, #f8fafc);
   user-select: text;
 }
@@ -6335,35 +8632,35 @@ var MEDIA_LOCALIZER_STYLES = `
 .ml-detail-kv-row {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
+  gap: 4px;
   align-items: center;
 }
 
 .ml-detail-source-list {
   display: flex;
   flex-wrap: wrap;
-  gap: 4px;
+  gap: 3px;
 }
 
 .ml-detail-source-chip {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  padding: 2px 6px;
+  gap: 3px;
+  padding: 1px 5px;
   border-radius: 4px;
-  font-size: 10.5px;
-  background: rgba(255, 255, 255, 0.07);
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  color: var(--lumiverse-text, #e2e8f0);
+  font-size: 10px;
+  background: var(--lumiverse-fill, rgba(255, 255, 255, 0.07));
+  border: 1px solid var(--lumiverse-border-neutral, rgba(255, 255, 255, 0.1));
+  color: var(--lumiverse-text, rgba(255, 255, 255, 0.88));
 }
 
 .ml-detail-error-box {
-  padding: 5px 7px;
+  padding: 4px 6px;
   border-radius: 5px;
-  background: rgba(239, 68, 68, 0.14);
-  border: 1px solid rgba(239, 68, 68, 0.35);
+  background: var(--lumiverse-danger-015, rgba(239, 68, 68, 0.14));
+  border: 1px solid var(--lumiverse-danger-050, rgba(239, 68, 68, 0.35));
   color: #fca5a5;
-  font-size: 11px;
+  font-size: 10.5px;
   overflow-wrap: anywhere;
   word-break: break-word;
 }
@@ -6372,109 +8669,302 @@ var MEDIA_LOCALIZER_STYLES = `
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
+  gap: 6px;
   flex-wrap: wrap;
-  padding-top: 6px;
-  border-top: 1px solid var(--lumiverse-border, rgba(255, 255, 255, 0.1));
+  padding-top: 5px;
+  border-top: 1px solid var(--lumiverse-border, rgba(147, 112, 219, 0.12));
 }
 
+/* Inputs & Selects */
 .ml-select {
-  padding: 4px 8px;
+  padding: 3.5px 7px;
   border-radius: 6px;
-  border: 1px solid var(--lumiverse-border, rgba(255, 255, 255, 0.16));
-  background: var(--lumiverse-bg-surface, #1e293b);
-  color: var(--lumiverse-text, #f1f5f9);
-  font-size: 12px;
+  border: 1px solid var(--lumiverse-border, rgba(147, 112, 219, 0.2));
+  background: var(--lumiverse-bg-deep, rgba(10, 8, 18, 0.85));
+  color: var(--lumiverse-text, rgba(255, 255, 255, 0.92));
+  font-family: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+  transition: border-color var(--lumiverse-transition-fast, 150ms ease), box-shadow var(--lumiverse-transition-fast, 150ms ease);
+}
+
+.ml-select:hover {
+  border-color: var(--lumiverse-border-hover, rgba(147, 112, 219, 0.35));
+}
+
+.ml-select:focus {
+  outline: none;
+  border-color: var(--lumiverse-primary-muted, rgba(147, 112, 219, 0.6));
+  box-shadow: 0 0 0 2px var(--lumiverse-primary-010, rgba(147, 112, 219, 0.12));
 }
 
 .ml-input-num {
-  width: 68px;
-  padding: 4px 6px;
+  width: 58px;
+  padding: 3px 6px;
   border-radius: 6px;
-  border: 1px solid var(--lumiverse-border, rgba(255, 255, 255, 0.16));
-  background: var(--lumiverse-bg-surface, #1e293b);
-  color: var(--lumiverse-text, #f1f5f9);
-  font-size: 12px;
+  border: 1px solid var(--lumiverse-border, rgba(147, 112, 219, 0.2));
+  background: var(--lumiverse-input-bg, var(--lumiverse-fill, rgba(0, 0, 0, 0.2)));
+  color: var(--lumiverse-text, rgba(255, 255, 255, 0.92));
+  font-family: inherit;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  transition: border-color var(--lumiverse-transition-fast, 150ms ease), box-shadow var(--lumiverse-transition-fast, 150ms ease);
+}
+
+.ml-input-num:focus {
+  outline: none;
+  border-color: var(--lumiverse-primary-muted, rgba(147, 112, 219, 0.6));
+  box-shadow: 0 0 0 2px var(--lumiverse-primary-010, rgba(147, 112, 219, 0.12));
+}
+
+.ml-input-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+  flex: 1 1 120px;
+  min-width: 100px;
+}
+
+.ml-input-icon {
+  position: absolute;
+  left: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--lumiverse-text-dim, rgba(255, 255, 255, 0.45));
+  pointer-events: none;
+}
+
+.ml-input-text {
+  flex: 1;
+  min-width: min(100%, 100px);
+  padding: 4px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--lumiverse-border, rgba(147, 112, 219, 0.2));
+  background: var(--lumiverse-input-bg, var(--lumiverse-fill, rgba(0, 0, 0, 0.2)));
+  color: var(--lumiverse-text, rgba(255, 255, 255, 0.92));
+  font-family: inherit;
+  font-size: 11.5px;
+  transition: border-color var(--lumiverse-transition-fast, 150ms ease), box-shadow var(--lumiverse-transition-fast, 150ms ease);
+}
+
+.ml-input-text.has-icon {
+  padding-left: 26px;
+}
+
+.ml-input-text::placeholder {
+  color: var(--lumiverse-text-dim, rgba(255, 255, 255, 0.4));
+}
+
+.ml-input-text:focus {
+  outline: none;
+  border-color: var(--lumiverse-primary-muted, rgba(147, 112, 219, 0.6));
+  box-shadow: 0 0 0 2px var(--lumiverse-primary-010, rgba(147, 112, 219, 0.14));
+}
+
+/* Active Queue Banner & Progress */
+@keyframes ml-progress-shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
 }
 
 .ml-queue-banner {
-  border: 1px solid rgba(99, 102, 241, 0.45);
-  background: rgba(99, 102, 241, 0.1);
-  border-radius: 8px;
-  padding: 10px;
+  border: 1px solid var(--lumiverse-primary-050, rgba(147, 112, 219, 0.45));
+  background: linear-gradient(
+    180deg,
+    var(--lumiverse-primary-015, rgba(147, 112, 219, 0.16)) 0%,
+    var(--lumiverse-primary-010, rgba(147, 112, 219, 0.08)) 100%
+  );
+  border-radius: var(--lumiverse-radius, 8px);
+  padding: 7px 8px;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 5px;
+  box-shadow: var(--lumiverse-highlight-inset, inset 0 1px 0 rgba(255, 255, 255, 0.08));
+}
+
+.ml-queue-banner.is-paused {
+  border-color: var(--lumiverse-warning-050, rgba(245, 158, 11, 0.45));
+  background: linear-gradient(
+    180deg,
+    var(--lumiverse-warning-015, rgba(245, 158, 11, 0.14)) 0%,
+    rgba(245, 158, 11, 0.06) 100%
+  );
+}
+
+.ml-queue-banner.is-cancelling {
+  border-color: var(--lumiverse-danger-050, rgba(239, 68, 68, 0.45));
+  background: linear-gradient(
+    180deg,
+    var(--lumiverse-danger-015, rgba(239, 68, 68, 0.14)) 0%,
+    rgba(239, 68, 68, 0.06) 100%
+  );
+}
+
+.ml-queue-status-text {
+  font-weight: 600;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--lumiverse-text, #ffffff);
 }
 
 .ml-progress-track {
   width: 100%;
-  height: 7px;
+  height: 6px;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.1);
+  background: var(--lumiverse-bg-darker, rgba(0, 0, 0, 0.35));
+  border: 1px solid var(--lumiverse-border-neutral, rgba(255, 255, 255, 0.08));
   overflow: hidden;
 }
 
 .ml-progress-fill {
   height: 100%;
-  background: var(--lumiverse-primary, #6366f1);
-  transition: width 0.2s ease;
+  border-radius: 999px;
+  background: var(--lumiverse-primary, rgba(147, 112, 219, 0.9));
+  transition: width 0.25s ease;
 }
 
+.ml-progress-fill.is-active {
+  background: linear-gradient(
+    90deg,
+    var(--lumiverse-primary, rgba(147, 112, 219, 0.9)) 0%,
+    var(--lumiverse-primary-hover, rgba(186, 135, 255, 0.98)) 50%,
+    var(--lumiverse-primary, rgba(147, 112, 219, 0.9)) 100%
+  );
+  background-size: 200% 100%;
+  animation: ml-progress-shimmer 2.2s linear infinite;
+}
+
+.ml-queue-banner.is-paused .ml-progress-fill {
+  background: var(--lumiverse-warning, #f59e0b);
+}
+
+.ml-queue-banner.is-cancelling .ml-progress-fill {
+  background: var(--lumiverse-danger, #ef4444);
+}
+
+.ml-mini-progress {
+  width: 100%;
+  height: 3px;
+  border-radius: 999px;
+  background: var(--lumiverse-bg-darker, rgba(0, 0, 0, 0.32));
+  overflow: hidden;
+}
+
+.ml-mini-progress-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(
+    90deg,
+    var(--lumiverse-success, #22c55e) 0%,
+    #4ade80 100%
+  );
+  transition: width 0.25s ease;
+}
+
+/* Asset Grid & Cards */
 .ml-asset-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(115px, 1fr));
-  gap: 8px;
-  max-height: 280px;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, var(--ml-asset-tile-min, 98px)), 1fr));
+  grid-auto-rows: max-content;
+  align-content: start;
+  gap: 6px;
+  max-height: var(--ml-asset-grid-max-height, 260px);
   overflow-y: auto;
-  padding: 2px;
+  flex-shrink: 0;
+  min-width: 0;
+  padding: 1px;
 }
 
 .ml-asset-card {
-  border: 1px solid var(--lumiverse-border, rgba(255, 255, 255, 0.1));
+  border: 1px solid var(--lumiverse-border, rgba(147, 112, 219, 0.14));
   border-radius: 7px;
-  background: rgba(0, 0, 0, 0.25);
+  background: var(--lumiverse-bg-dark, rgba(0, 0, 0, 0.25));
   overflow: hidden;
   display: flex;
   flex-direction: column;
+  min-width: 0;
+  min-height: max-content;
+  contain: layout paint style;
+  transition:
+    transform var(--lumiverse-transition-fast, 150ms ease),
+    border-color var(--lumiverse-transition-fast, 150ms ease);
+}
+
+.ml-asset-card:hover {
+  border-color: var(--lumiverse-border-hover, rgba(147, 112, 219, 0.35));
+  box-shadow: var(--lumiverse-shadow-sm, 0 2px 8px rgba(0, 0, 0, 0.25));
 }
 
 .ml-asset-preview {
+  display: block;
   width: 100%;
-  height: 84px;
+  height: var(--ml-asset-thumb-height, 78px);
   object-fit: cover;
-  background: rgba(0, 0, 0, 0.4);
+  background: var(--lumiverse-bg-deep, rgba(0, 0, 0, 0.4));
   cursor: pointer;
+  transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.ml-asset-card:hover .ml-asset-preview {
+  transform: scale(1.04);
 }
 
 .ml-asset-footer {
-  padding: 5px 6px;
+  padding: 4px 5px;
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  font-size: 10.5px;
-}
-
-.ml-asset-actions {
-  display: flex;
-  gap: 4px;
-}
-
-.ml-asset-actions .ml-btn {
-  flex: 1;
-  padding: 2px 4px;
+  gap: 2px;
+  flex-shrink: 0;
+  min-width: 0;
   font-size: 10px;
+  border-top: 1px solid var(--lumiverse-border-neutral, rgba(255, 255, 255, 0.06));
+}
+
+.ml-lib-intro {
+  font-size: 11px;
+  color: var(--lumiverse-text-muted, rgba(255, 255, 255, 0.68));
+  line-height: 1.4;
+}
+
+.ml-step-num {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 999px;
+  background: var(--lumiverse-primary-020, rgba(147, 112, 219, 0.22));
+  border: 1px solid var(--lumiverse-primary-050, rgba(147, 112, 219, 0.4));
+  color: var(--lumiverse-primary-text, #e9d5ff);
+  font-size: 10px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
 }
 
 .ml-lib-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: 6px;
   min-width: 0;
-  padding: 7px 9px;
+  padding: 5px 7px;
   cursor: pointer;
   user-select: none;
+}
+
+.ml-lib-char-name {
+  font-weight: 600;
+  color: var(--lumiverse-text, rgba(255, 255, 255, 0.92));
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
 }
 
 .ml-lib-row .ml-header-actions {
@@ -6482,7 +8972,7 @@ var MEDIA_LOCALIZER_STYLES = `
 }
 
 .ml-drawer-sticky-banner {
-  padding: 8px 12px 0;
+  padding: 6px 10px 0;
   flex-shrink: 0;
 }
 
@@ -6490,82 +8980,43 @@ var MEDIA_LOCALIZER_STYLES = `
   display: none;
 }
 
-.ml-badge.is-info {
-  background: rgba(99, 102, 241, 0.18);
-  color: #a5b4fc;
-}
-
-.ml-btn.is-active {
-  background: rgba(99, 102, 241, 0.24);
-  border-color: rgba(99, 102, 241, 0.55);
-  color: #ffffff;
-}
-
-.ml-btn.is-xs {
-  padding: 2px 5px;
-  font-size: 10px;
-}
-
-.ml-icon-btn {
-  padding: 4px 6px;
-}
-
-.ml-icon-btn.is-sm {
-  padding: 3px 5px;
-}
-
-.ml-icon {
-  display: block;
-  flex-shrink: 0;
-}
-
-@keyframes ml-spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
-
-.ml-btn.is-busy .ml-icon {
-  animation: ml-spin 0.9s linear infinite;
-}
-
 .ml-inline-title {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 5px;
   flex-wrap: wrap;
 }
 
 .ml-title {
   font-weight: 600;
-  font-size: 13px;
+  font-size: 12.5px;
   color: var(--lumiverse-text, #f8fafc);
 }
 
 .ml-stack {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 6px;
 }
 
 .ml-config-label-row {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 5px;
 }
 
 .ml-config-label {
   font-size: 11px;
   font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: 0.03em;
-  color: var(--lumiverse-text-muted, #94a3b8);
+  letter-spacing: 0.04em;
+  color: var(--lumiverse-text-muted, rgba(255, 255, 255, 0.65));
 }
 
 .ml-checkbox-grid {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px 12px;
+  gap: 4px 10px;
   align-items: center;
 }
 
@@ -6573,51 +9024,121 @@ var MEDIA_LOCALIZER_STYLES = `
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  font-size: 12px;
-  color: var(--lumiverse-text, #e2e8f0);
+  font-size: 11.5px;
+  color: var(--lumiverse-text, rgba(255, 255, 255, 0.9));
   cursor: pointer;
   user-select: none;
+}
+
+.ml-setting-toggle-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 220px), 1fr));
+  gap: 4px 8px;
 }
 
 .ml-setting-toggle-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: 6px;
+  min-width: 0;
+  padding: 4px 7px;
+  border-radius: 6px;
+  background: var(--lumiverse-fill-subtle, rgba(255, 255, 255, 0.025));
+  border: 1px solid var(--lumiverse-border-neutral, rgba(255, 255, 255, 0.07));
+  transition: border-color var(--lumiverse-transition-fast, 150ms ease), background var(--lumiverse-transition-fast, 150ms ease);
+}
+
+.ml-setting-toggle-row:hover {
+  border-color: var(--lumiverse-border, rgba(147, 112, 219, 0.2));
+  background: var(--lumiverse-fill, rgba(255, 255, 255, 0.04));
+}
+
+.ml-setting-toggle-row.is-caution {
+  border-color: rgba(239, 68, 68, 0.25);
+  background: rgba(239, 68, 68, 0.06);
+}
+
+.ml-setting-toggle-row.is-caution:hover {
+  border-color: var(--lumiverse-danger-050, rgba(239, 68, 68, 0.42));
 }
 
 .ml-select.is-sm {
-  padding: 3px 6px;
+  padding: 2px 5px;
   font-size: 11px;
 }
 
-.ml-input-text {
-  flex: 1;
-  min-width: 140px;
-  padding: 4px 8px;
-  border-radius: 6px;
-  border: 1px solid var(--lumiverse-border, rgba(255, 255, 255, 0.16));
-  background: var(--lumiverse-bg-surface, #1e293b);
-  color: var(--lumiverse-text, #f1f5f9);
-  font-size: 12px;
-}
-
+/* Banners & Empty States */
 .ml-error-banner {
-  padding: 8px 10px;
-  border-radius: 7px;
-  background: rgba(239, 68, 68, 0.14);
-  border: 1px solid rgba(239, 68, 68, 0.35);
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--lumiverse-danger-015, rgba(239, 68, 68, 0.14));
+  border: 1px solid var(--lumiverse-danger-050, rgba(239, 68, 68, 0.35));
   color: #fca5a5;
-  font-size: 12px;
+  font-size: 11.5px;
   overflow-wrap: anywhere;
   word-break: break-word;
 }
 
+.ml-warn-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 5px 8px;
+  border-radius: 6px;
+  background: var(--lumiverse-warning-015, rgba(245, 158, 11, 0.12));
+  border: 1px solid var(--lumiverse-warning-050, rgba(245, 158, 11, 0.3));
+  color: #fcd34d;
+  font-size: 11px;
+}
+
+.ml-error-banner .ml-icon,
+.ml-warn-banner .ml-icon {
+  margin-top: 1px;
+}
+
 .ml-empty {
   text-align: center;
-  color: var(--lumiverse-text-muted, #94a3b8);
-  padding: 16px 10px;
-  font-size: 12px;
+  color: var(--lumiverse-text-muted, rgba(255, 255, 255, 0.62));
+  padding: 12px 10px;
+  font-size: 11.5px;
+}
+
+.ml-empty-card,
+.ml-loading-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 20px 12px;
+  border: none;
+  background: transparent;
+}
+
+.ml-empty-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 999px;
+  background: var(--lumiverse-primary-010, rgba(147, 112, 219, 0.12));
+  color: var(--lumiverse-primary-text, rgba(186, 135, 255, 0.85));
+}
+
+.ml-loading-card .ml-empty-icon .ml-icon {
+  animation: ml-spin 1.2s linear infinite;
+}
+
+.ml-empty-text {
+  font-size: 11.5px;
+  color: var(--lumiverse-text-muted, rgba(255, 255, 255, 0.65));
+  max-width: 280px;
+  line-height: 1.4;
 }
 
 /* Info tooltips (hover + click popover for mobile) */
@@ -6637,16 +9158,17 @@ var MEDIA_LOCALIZER_STYLES = `
   border: none;
   border-radius: 999px;
   background: transparent;
-  color: var(--lumiverse-text-muted, #94a3b8);
+  color: var(--lumiverse-text-muted, rgba(255, 255, 255, 0.6));
   cursor: pointer;
   opacity: 0.8;
+  transition: opacity var(--lumiverse-transition-fast, 150ms ease), color var(--lumiverse-transition-fast, 150ms ease), background var(--lumiverse-transition-fast, 150ms ease);
 }
 
 .ml-tip-btn:hover,
 .ml-tip-wrap.is-open .ml-tip-btn {
   opacity: 1;
   color: var(--lumiverse-text, #f8fafc);
-  background: rgba(255, 255, 255, 0.08);
+  background: var(--lumiverse-fill, rgba(255, 255, 255, 0.1));
 }
 
 .ml-tip-popover {
@@ -6657,17 +9179,18 @@ var MEDIA_LOCALIZER_STYLES = `
   width: max-content;
   max-width: min(240px, 65vw);
   padding: 6px 8px;
-  border-radius: 6px;
-  background: rgba(15, 23, 42, 0.97);
-  border: 1px solid rgba(255, 255, 255, 0.16);
-  color: #f1f5f9;
+  border-radius: 7px;
+  background: var(--lumiverse-bg-elevated, rgba(24, 20, 34, 0.97));
+  border: 1px solid var(--lumiverse-border-hover, rgba(147, 112, 219, 0.28));
+  color: var(--lumiverse-text, #f1f5f9);
   font-size: 11px;
   font-weight: 400;
   text-transform: none;
   letter-spacing: normal;
   line-height: 1.4;
   white-space: normal;
-  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.45);
+  box-shadow: var(--lumiverse-shadow-md, 0 8px 24px rgba(0, 0, 0, 0.45));
+  backdrop-filter: blur(8px);
   z-index: 40;
   pointer-events: none;
 }
@@ -6682,26 +9205,49 @@ var MEDIA_LOCALIZER_STYLES = `
 }
 
 .ml-setting-toggle-row .ml-tip-popover,
-.ml-header-bar > .ml-tip-wrap:last-child .ml-tip-popover {
+.ml-header-bar > .ml-tip-wrap:last-child .ml-tip-popover,
+.ml-combined-bar .ml-tip-popover,
+.ml-checkbox-item:last-child .ml-tip-popover,
+.ml-tip-wrap.is-align-right .ml-tip-popover {
   left: auto;
   right: 0;
 }
 
 /* Active Character Header */
+.ml-char-header {
+  gap: 6px;
+}
+
 .ml-char-identity {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
 }
 
 .ml-char-avatar {
-  width: 42px;
-  height: 42px;
+  width: 36px;
+  height: 36px;
   border-radius: 8px;
   object-fit: cover;
-  border: 1px solid rgba(255, 255, 255, 0.15);
+  border: 1px solid var(--lumiverse-border-hover, rgba(147, 112, 219, 0.26));
   flex-shrink: 0;
-  background: rgba(0, 0, 0, 0.35);
+  background: var(--lumiverse-bg-deep, rgba(0, 0, 0, 0.35));
+}
+
+.ml-char-avatar-fallback {
+  width: 36px;
+  height: 36px;
+  border-radius: 8px;
+  border: 1px solid var(--lumiverse-border, rgba(147, 112, 219, 0.22));
+  background: var(--lumiverse-card-image-bg, linear-gradient(135deg, rgba(20, 17, 28, 1) 0%, rgba(36, 26, 54, 1) 100%));
+  color: var(--lumiverse-primary-text, rgba(186, 135, 255, 0.9));
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 600;
+  font-size: 13px;
+  flex-shrink: 0;
+  user-select: none;
 }
 
 .ml-char-meta {
@@ -6709,30 +9255,114 @@ var MEDIA_LOCALIZER_STYLES = `
   min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 4px;
+}
+
+.ml-char-name {
+  font-weight: 600;
+  font-size: 12.5px;
+  color: var(--lumiverse-text, #f8fafc);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
 }
 
 .ml-status-row {
   display: flex;
   flex-wrap: wrap;
+  gap: 4px;
+}
+
+/* Combined Character Options & Downloaded Media Bar */
+.ml-combined-drawer {
+  gap: 6px;
+}
+
+.ml-combined-bar {
+  display: flex;
+  align-items: center;
   gap: 5px;
+  flex-wrap: wrap;
+}
+
+.ml-combined-trigger {
+  flex: 1 1 110px;
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--lumiverse-border-neutral, rgba(255, 255, 255, 0.08));
+  background: var(--lumiverse-fill-subtle, rgba(255, 255, 255, 0.03));
+  color: var(--lumiverse-text-muted, rgba(255, 255, 255, 0.78));
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    background var(--lumiverse-transition-fast, 150ms ease),
+    border-color var(--lumiverse-transition-fast, 150ms ease),
+    color var(--lumiverse-transition-fast, 150ms ease);
+}
+
+.ml-combined-trigger:hover {
+  background: var(--lumiverse-fill, rgba(255, 255, 255, 0.07));
+  border-color: var(--lumiverse-border-hover, rgba(147, 112, 219, 0.3));
+  color: var(--lumiverse-text, rgba(255, 255, 255, 0.94));
+}
+
+.ml-combined-trigger.is-active {
+  background: var(--lumiverse-primary-015, rgba(147, 112, 219, 0.16));
+  border-color: var(--lumiverse-primary-050, rgba(147, 112, 219, 0.45));
+  color: var(--lumiverse-text, #ffffff);
+  font-weight: 600;
+}
+
+.ml-combined-trigger > span:not(.ml-badge) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.ml-combined-pane {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  padding-top: 2px;
+}
+
+.ml-combined-pane + .ml-combined-pane {
+  padding-top: 8px;
+  margin-top: 2px;
+  border-top: 1px solid var(--lumiverse-border, rgba(147, 112, 219, 0.14));
 }
 
 .ml-options-panel {
-  border-color: rgba(99, 102, 241, 0.35);
-  background: rgba(99, 102, 241, 0.05);
+  gap: 6px;
+}
+
+.ml-media-pane {
+  gap: 6px;
+}
+
+.ml-media-toolbar {
+  gap: 5px;
 }
 
 /* Failed Items Recovery Panel */
 .ml-failed-panel {
-  border-color: rgba(239, 68, 68, 0.32);
-  background: rgba(239, 68, 68, 0.05);
+  border-top-color: var(--lumiverse-danger-050, rgba(239, 68, 68, 0.32));
 }
 
 .ml-failed-group {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 3px;
 }
 
 .ml-failed-group-title {
@@ -6745,11 +9375,11 @@ var MEDIA_LOCALIZER_STYLES = `
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
-  padding: 5px 7px;
+  gap: 6px;
+  padding: 4px 6px;
   border-radius: 6px;
-  background: rgba(0, 0, 0, 0.28);
-  border: 1px solid rgba(255, 255, 255, 0.07);
+  background: var(--lumiverse-bg-darker, rgba(0, 0, 0, 0.28));
+  border: 1px solid var(--lumiverse-border-neutral, rgba(255, 255, 255, 0.07));
 }
 
 .ml-failed-url-col {
@@ -6761,10 +9391,13 @@ var MEDIA_LOCALIZER_STYLES = `
 .ml-asset-thumb-wrap {
   position: relative;
   width: 100%;
-  height: 92px;
-  background: rgba(0, 0, 0, 0.4);
+  height: var(--ml-asset-thumb-height, 78px);
+  min-height: var(--ml-asset-thumb-height, 78px);
+  flex-shrink: 0;
+  background: var(--lumiverse-bg-deep, rgba(0, 0, 0, 0.42));
   cursor: pointer;
   overflow: hidden;
+  contain: layout paint style;
 }
 
 .ml-asset-thumb-wrap .ml-asset-preview {
@@ -6773,21 +9406,50 @@ var MEDIA_LOCALIZER_STYLES = `
 
 .ml-tile-badge {
   position: absolute;
-  top: 4px;
+  bottom: 4px;
   left: 4px;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
   padding: 1px 5px;
   border-radius: 4px;
   font-size: 9.5px;
   font-weight: 600;
-  background: rgba(15, 23, 42, 0.82);
-  color: #e2e8f0;
-  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(12, 10, 20, 0.88);
+  color: #f1f5f9;
+  border: 1px solid rgba(255, 255, 255, 0.16);
   pointer-events: none;
+  z-index: 2;
 }
 
 .ml-tile-badge.is-info {
-  background: rgba(79, 70, 229, 0.86);
+  background: rgba(124, 58, 237, 0.84);
+  border-color: rgba(196, 181, 253, 0.35);
   color: #ffffff;
+}
+
+.ml-tile-badge.is-video {
+  background: rgba(14, 116, 144, 0.86);
+  border-color: rgba(125, 211, 252, 0.35);
+  color: #e0f2fe;
+}
+
+.ml-tile-badge.is-expression {
+  background: rgba(157, 23, 77, 0.84);
+  border-color: rgba(249, 168, 212, 0.35);
+  color: #fce7f3;
+}
+
+.ml-tile-badge.is-avatar {
+  background: rgba(21, 128, 61, 0.84);
+  border-color: rgba(134, 239, 172, 0.35);
+  color: #dcfce7;
+}
+
+.ml-tile-badge.is-local {
+  background: rgba(21, 128, 61, 0.84);
+  border-color: rgba(134, 239, 172, 0.35);
+  color: #dcfce7;
 }
 
 .ml-asset-cap-row {
@@ -6808,41 +9470,106 @@ var MEDIA_LOCALIZER_STYLES = `
 .ml-media-list {
   display: flex;
   flex-direction: column;
-  gap: 5px;
+  gap: 4px;
   max-height: 460px;
   overflow-y: auto;
+  flex-shrink: 0;
+  min-width: 0;
 }
 
 .ml-media-list-row {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 7px;
+  flex-shrink: 0;
+  min-width: 0;
   padding: 5px 7px;
-  border-radius: 6px;
-  border: 1px solid var(--lumiverse-border, rgba(255, 255, 255, 0.08));
-  background: rgba(255, 255, 255, 0.03);
+  border-radius: 7px;
+  border: 1px solid var(--lumiverse-border-neutral, rgba(255, 255, 255, 0.08));
+  background: var(--lumiverse-fill-subtle, rgba(255, 255, 255, 0.03));
   cursor: pointer;
+  contain: layout paint style;
+  transition:
+    background var(--lumiverse-transition-fast, 150ms ease),
+    border-color var(--lumiverse-transition-fast, 150ms ease);
 }
 
 .ml-media-list-row:hover {
-  background: rgba(255, 255, 255, 0.07);
+  background: var(--lumiverse-fill, rgba(255, 255, 255, 0.07));
+  border-color: var(--lumiverse-border-hover, rgba(147, 112, 219, 0.28));
+}
+
+.ml-media-list-thumb-wrap {
+  position: relative;
+  width: var(--ml-list-thumb-size, 34px);
+  height: var(--ml-list-thumb-size, 34px);
+  border-radius: 6px;
+  overflow: hidden;
+  flex-shrink: 0;
+  border: 1px solid var(--lumiverse-border-neutral, rgba(255, 255, 255, 0.1));
+  background: var(--lumiverse-bg-deep, rgba(0, 0, 0, 0.35));
 }
 
 .ml-media-list-thumb {
-  width: 40px;
-  height: 40px;
+  width: var(--ml-list-thumb-size, 34px);
+  height: var(--ml-list-thumb-size, 34px);
   border-radius: 5px;
   object-fit: cover;
   flex-shrink: 0;
-  background: rgba(0, 0, 0, 0.35);
+  background: var(--lumiverse-bg-deep, rgba(0, 0, 0, 0.35));
+  display: block;
+}
+
+.ml-media-list-placeholder {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--lumiverse-card-image-bg, linear-gradient(135deg, rgba(20, 17, 28, 1) 0%, rgba(36, 26, 54, 1) 100%));
+  color: var(--lumiverse-primary-text, rgba(186, 135, 255, 0.8));
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.ml-media-list-kind-badge {
+  position: absolute;
+  bottom: 1px;
+  right: 1px;
+  width: 14px;
+  height: 14px;
+  border-radius: 3px;
+  background: rgba(10, 8, 18, 0.82);
+  color: #e0f2fe;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
 }
 
 /* Whole-Library Gallery */
+.ml-gallery-toolbar {
+  padding: 0;
+  gap: 5px;
+}
+
+.ml-gallery-content-slot {
+  padding-left: 0;
+  padding-right: 0;
+  padding-bottom: 0;
+  gap: 6px;
+}
+
 .ml-gallery-controls {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 5px;
   flex-wrap: wrap;
+}
+
+.ml-gallery-controls .ml-input-text {
+  min-width: 100px;
+  flex: 1 1 120px;
 }
 
 .ml-sort-group {
@@ -6852,7 +9579,46 @@ var MEDIA_LOCALIZER_STYLES = `
 }
 
 .ml-gallery-type-pills {
-  margin-top: 6px;
+  margin-top: 0;
+  gap: 4px;
+}
+
+.ml-gallery-drilldown-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px 6px;
+  flex-wrap: wrap;
+  padding-bottom: 5px;
+  border-bottom: 1px solid var(--lumiverse-border, rgba(147, 112, 219, 0.14));
+}
+
+.ml-gallery-drilldown-title {
+  flex: 1 1 110px;
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.ml-gallery-drilldown-avatar {
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  object-fit: cover;
+  border: 1px solid var(--lumiverse-border-hover, rgba(147, 112, 219, 0.28));
+  flex-shrink: 0;
+  background: var(--lumiverse-bg-deep, rgba(0, 0, 0, 0.35));
+}
+
+.ml-gallery-drilldown-name {
+  font-weight: 600;
+  font-size: 12.5px;
+  color: var(--lumiverse-text, #f8fafc);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
 }
 
 .ml-drawer-root .ml-asset-grid,
@@ -6862,37 +9628,127 @@ var MEDIA_LOCALIZER_STYLES = `
   overflow-y: visible;
 }
 
+.ml-gallery-grid {
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, var(--ml-gallery-tile-min, 96px)), 1fr));
+  gap: 6px;
+}
+
+.ml-gallery-grid .ml-asset-footer {
+  padding: 3.5px 5px;
+}
+
+.ml-gallery-grid .ml-url-sources {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .ml-char-card-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(124px, 1fr));
-  gap: 8px;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, var(--ml-char-card-min, 104px)), 1fr));
+  gap: 6px;
 }
 
 .ml-char-card {
+  position: relative;
   display: flex;
   flex-direction: column;
   padding: 0;
-  border: 1px solid var(--lumiverse-border, rgba(255, 255, 255, 0.12));
-  border-radius: 8px;
-  background: rgba(0, 0, 0, 0.28);
+  border: 1px solid var(--lumiverse-border, rgba(147, 112, 219, 0.16));
+  border-radius: 9px;
+  background: var(--lumiverse-card-bg, rgba(24, 20, 34, 0.92));
   color: inherit;
   text-align: left;
   overflow: hidden;
   cursor: pointer;
-  transition: transform 0.12s ease, border-color 0.12s ease;
+  contain: layout paint style;
+  box-shadow: var(--lumiverse-shadow-sm, 0 2px 8px rgba(0, 0, 0, 0.22));
+  transition:
+    transform 0.16s cubic-bezier(0.4, 0, 0.2, 1),
+    border-color 0.16s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
 .ml-char-card:hover {
-  border-color: var(--lumiverse-primary, #6366f1);
-  transform: translateY(-1px);
+  border-color: var(--lumiverse-border-hover, rgba(147, 112, 219, 0.45));
+  transform: translateY(-2px);
+  box-shadow:
+    var(--lumiverse-shadow-md, 0 8px 20px rgba(0, 0, 0, 0.36)),
+    0 0 0 1px var(--lumiverse-primary-015, rgba(147, 112, 219, 0.2));
 }
 
 .ml-char-card-thumb-wrap {
   position: relative;
   width: 100%;
-  aspect-ratio: 3 / 4;
-  background: rgba(0, 0, 0, 0.45);
+  aspect-ratio: 4 / 5;
+  background: var(--lumiverse-card-image-bg, linear-gradient(135deg, rgba(20, 17, 28, 1) 0%, rgba(28, 22, 40, 1) 100%));
   overflow: hidden;
+  contain: layout paint style;
+}
+
+.ml-char-card-scrim {
+  position: absolute;
+  inset: auto 0 0 0;
+  height: 52%;
+  pointer-events: none;
+  background: linear-gradient(
+    to top,
+    rgba(10, 8, 18, 0.94) 0%,
+    rgba(10, 8, 18, 0.72) 45%,
+    transparent 100%
+  );
+  z-index: 1;
+}
+
+.ml-char-card-badges {
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  z-index: 2;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  max-width: calc(100% - 30px);
+  pointer-events: none;
+}
+
+.ml-char-card-badges .ml-tile-badge {
+  position: static;
+}
+
+.ml-char-card-edit-btn {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  z-index: 3;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(10, 8, 18, 0.84);
+  color: #f1f5f9;
+  cursor: pointer;
+  opacity: 0.72;
+  transition:
+    background var(--lumiverse-transition-fast, 150ms ease),
+    border-color var(--lumiverse-transition-fast, 150ms ease),
+    color var(--lumiverse-transition-fast, 150ms ease),
+    opacity var(--lumiverse-transition-fast, 150ms ease);
+}
+
+.ml-char-card:hover .ml-char-card-edit-btn,
+.ml-char-card:focus-within .ml-char-card-edit-btn {
+  opacity: 1;
+}
+
+.ml-char-card-edit-btn:hover {
+  opacity: 1;
+  background: var(--lumiverse-primary, rgba(147, 112, 219, 0.92));
+  border-color: rgba(255, 255, 255, 0.45);
+  color: #ffffff;
 }
 
 .ml-char-card-thumb {
@@ -6900,91 +9756,164 @@ var MEDIA_LOCALIZER_STYLES = `
   height: 100%;
   object-fit: cover;
   display: block;
+  transition: transform 0.28s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.ml-char-card:hover .ml-char-card-thumb {
+  transform: scale(1.05);
 }
 
 .ml-char-card-placeholder {
   width: 100%;
   height: 100%;
+  padding-bottom: 22px;
   display: flex;
   align-items: center;
   justify-content: center;
-  color: var(--lumiverse-text-muted, #64748b);
+  color: var(--lumiverse-primary-muted, rgba(147, 112, 219, 0.65));
 }
 
 .ml-char-card-footer {
-  padding: 6px 7px;
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  z-index: 2;
+  padding: 5px 6px;
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 1px;
+  pointer-events: none;
+}
+
+.ml-char-card-footer .ml-url-sources {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: rgba(255, 255, 255, 0.76);
+  font-size: 10px;
 }
 
 .ml-char-card-name {
   font-weight: 600;
-  font-size: 11.5px;
+  font-size: 11px;
+  color: #ffffff;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.ml-widget.is-thumb-sm .ml-char-card-badges {
+  top: 3px;
+  left: 3px;
+  gap: 2px;
+  max-width: calc(100% - 24px);
+}
+
+.ml-widget.is-thumb-sm .ml-tile-badge {
+  bottom: 3px;
+  left: 3px;
+  padding: 1px 4px;
+  font-size: 9px;
+}
+
+.ml-widget.is-thumb-sm .ml-char-card-edit-btn {
+  top: 3px;
+  right: 3px;
+  width: 19px;
+  height: 19px;
+}
+
+.ml-widget.is-thumb-sm .ml-char-card-footer {
+  padding: 4px 5px;
+}
+
+.ml-widget.is-thumb-sm .ml-char-card-name {
+  font-size: 10.5px;
+}
+
+.ml-widget.is-thumb-sm .ml-char-card-footer .ml-url-sources {
+  font-size: 9.5px;
+}
+
+.ml-widget.is-thumb-sm .ml-media-list-kind-badge {
+  width: 12px;
+  height: 12px;
+}
+
+.ml-widget.is-thumb-lg .ml-char-card-footer {
+  padding: 6px 8px;
+  gap: 2px;
+}
+
+.ml-widget.is-thumb-lg .ml-char-card-name {
+  font-size: 12px;
 }
 
 .ml-gallery-pagination {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: 4px 6px;
   flex-wrap: wrap;
-  padding: 2px 0;
+  padding: 2px 0 0;
 }
 
 .ml-gallery-pagination-info {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  font-size: 11.5px;
-  color: var(--lumiverse-text-muted, #94a3b8);
+  gap: 6px;
+  font-size: 11px;
+  color: var(--lumiverse-text-muted, rgba(255, 255, 255, 0.65));
+  font-variant-numeric: tabular-nums;
 }
 
 .ml-gallery-pagination-actions {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 4px;
 }
 
 /* Shared Lightbox */
 .ml-lightbox-backdrop {
   position: fixed;
   inset: 0;
-  z-index: var(--lumiverse-z-lightbox, 2200);
-  background: rgba(5, 8, 16, 0.88);
-  backdrop-filter: blur(4px);
+  z-index: var(--lumiverse-z-lightbox, 10005);
+  background: var(--lumiverse-modal-backdrop, rgba(5, 4, 12, 0.86));
+  backdrop-filter: blur(8px);
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 16px;
+  padding: 12px;
 }
 
 .ml-lightbox-dialog {
   width: min(92vw, 920px);
   max-height: 92vh;
-  background: var(--lumiverse-bg-elevated, #0f172a);
-  border: 1px solid rgba(255, 255, 255, 0.16);
-  border-radius: 10px;
+  background: var(--lumiverse-gradient-modal, linear-gradient(135deg, rgba(35, 30, 48, 0.98), rgba(20, 17, 28, 0.98)));
+  border: 1px solid var(--lumiverse-border-hover, rgba(147, 112, 219, 0.25));
+  border-radius: var(--lumiverse-radius-lg, 12px);
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.65);
+  box-shadow: var(--lumiverse-shadow-xl, 0 20px 60px rgba(0, 0, 0, 0.6));
 }
 
 .ml-lightbox-topbar {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 8px 12px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--lumiverse-border, rgba(147, 112, 219, 0.14));
+  background: var(--lumiverse-bg-dark, rgba(0, 0, 0, 0.2));
 }
 
 .ml-lightbox-counter {
-  font-size: 12px;
-  color: var(--lumiverse-text-muted, #94a3b8);
+  font-size: 11.5px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--lumiverse-text-muted, rgba(255, 255, 255, 0.7));
 }
 
 .ml-lightbox-stage {
@@ -6994,8 +9923,8 @@ var MEDIA_LOCALIZER_STYLES = `
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding: 12px;
-  background: rgba(0, 0, 0, 0.45);
+  padding: 10px;
+  background: radial-gradient(circle at center, rgba(24, 20, 36, 0.9) 0%, rgba(8, 6, 14, 0.95) 100%);
   overflow: hidden;
 }
 
@@ -7011,30 +9940,36 @@ var MEDIA_LOCALIZER_STYLES = `
   max-width: 100%;
   max-height: 68vh;
   object-fit: contain;
-  border-radius: 6px;
+  border-radius: var(--lumiverse-radius, 8px);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
 }
 
 .ml-lightbox-nav {
   flex-shrink: 0;
-  padding: 8px;
+  padding: 7px;
+  border-radius: 999px;
+  background: rgba(15, 12, 24, 0.72);
+  border-color: rgba(255, 255, 255, 0.16);
+  backdrop-filter: blur(4px);
 }
 
 .ml-lightbox-footer {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
+  gap: 8px;
   flex-wrap: wrap;
-  padding: 10px 12px;
-  border-top: 1px solid rgba(255, 255, 255, 0.1);
+  padding: 8px 10px;
+  border-top: 1px solid var(--lumiverse-border, rgba(147, 112, 219, 0.14));
+  background: var(--lumiverse-bg-dark, rgba(0, 0, 0, 0.22));
 }
 
 .ml-lightbox-meta {
   flex: 1;
-  min-width: 180px;
+  min-width: min(100%, 150px);
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 2px;
 }
 
 .ml-lightbox-title {
@@ -7059,32 +9994,38 @@ var MEDIA_LOCALIZER_STYLES = `
   align-items: center;
   justify-content: center;
   gap: 5px;
-  padding: 3px 10px;
+  padding: 3.5px 11px;
   border-radius: 999px;
-  border: 1px solid rgba(99, 102, 241, 0.48);
-  background: rgba(99, 102, 241, 0.18);
-  color: #e0e7ff;
+  border: 1px solid var(--lumiverse-primary-050, rgba(147, 112, 219, 0.48));
+  background: var(--lumiverse-primary-015, rgba(147, 112, 219, 0.18));
+  color: var(--lumiverse-primary-text, #e9d5ff);
+  font-family: inherit;
   font-size: 11px;
   font-weight: 600;
   cursor: pointer;
-  transition: all 0.15s ease;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12);
+  transition:
+    background-color var(--lumiverse-transition-fast, 150ms ease),
+    border-color var(--lumiverse-transition-fast, 150ms ease),
+    color var(--lumiverse-transition-fast, 150ms ease),
+    opacity var(--lumiverse-transition-fast, 150ms ease);
 }
 
 .ml-portrait-localize-btn:hover {
-  background: rgba(99, 102, 241, 0.34);
-  border-color: rgba(129, 140, 248, 0.8);
+  background: var(--lumiverse-primary-020, rgba(147, 112, 219, 0.3));
+  border-color: var(--lumiverse-primary-hover, rgba(167, 132, 239, 0.8));
   color: #ffffff;
 }
 
 .ml-portrait-localize-btn.is-running {
-  border-color: rgba(99, 102, 241, 0.7);
-  background: rgba(99, 102, 241, 0.25);
+  border-color: var(--lumiverse-primary, rgba(147, 112, 219, 0.7));
+  background: var(--lumiverse-primary-020, rgba(147, 112, 219, 0.25));
 }
 
 .ml-portrait-localize-btn.is-done {
-  border-color: rgba(16, 185, 129, 0.55);
-  background: rgba(16, 185, 129, 0.2);
-  color: #6ee7b7;
+  border-color: var(--lumiverse-success-050, rgba(34, 197, 94, 0.55));
+  background: var(--lumiverse-success-020, rgba(34, 197, 94, 0.2));
+  color: #86efac;
 }
 `;
 
@@ -7263,9 +10204,15 @@ function setup(ctx) {
     });
   }
   let uiRefreshTimer = null;
-  function scheduleNativeGalleryUiRefresh() {
+  let pendingNativeGalleryRefreshWhenQueueIdle = false;
+  function scheduleNativeGalleryUiRefresh(delayMs = 150) {
     if (unloaded)
       return;
+    if (isQueueActiveStatus(currentQueueProgress.status)) {
+      pendingNativeGalleryRefreshWhenQueueIdle = true;
+      return;
+    }
+    pendingNativeGalleryRefreshWhenQueueIdle = false;
     if (uiRefreshTimer !== null) {
       clearTimeout(uiRefreshTimer);
     }
@@ -7273,19 +10220,28 @@ function setup(ctx) {
       uiRefreshTimer = null;
       if (unloaded)
         return;
+      if (isQueueActiveStatus(currentQueueProgress.status)) {
+        pendingNativeGalleryRefreshWhenQueueIdle = true;
+        return;
+      }
       try {
         triggerNativeGalleryAndPortraitReactRefresh();
       } catch {}
-    }, 150);
+    }, delayMs);
   }
+  const pendingGalleryLinkItemsByCharacter = new Map;
+  const inFlightGalleryLinkDrainByCharacter = new Map;
+  const knownLinkedGalleryRowByCharacter = new Map;
   cleanups.push(() => {
     if (uiRefreshTimer !== null) {
       clearTimeout(uiRefreshTimer);
       uiRefreshTimer = null;
     }
+    pendingNativeGalleryRefreshWhenQueueIdle = false;
+    pendingGalleryLinkItemsByCharacter.clear();
+    inFlightGalleryLinkDrainByCharacter.clear();
+    knownLinkedGalleryRowByCharacter.clear();
   });
-  const inFlightGalleryLinks = new Set;
-  const characterLinkLocks = new Map;
   const activeFetchControllers = new Set;
   const NATIVE_GALLERY_FETCH_TIMEOUT_MS = 15000;
   async function fetchWithTimeout(input, init, timeoutMs = NATIVE_GALLERY_FETCH_TIMEOUT_MS) {
@@ -7351,104 +10307,161 @@ function setup(ctx) {
     if (typeof fetch !== "function" || !characterId || items.length === 0 || unloaded) {
       return;
     }
-    const filtered = items.filter((item) => {
+    let pendingMap = pendingGalleryLinkItemsByCharacter.get(characterId);
+    if (!pendingMap) {
+      pendingMap = new Map;
+      pendingGalleryLinkItemsByCharacter.set(characterId, pendingMap);
+    }
+    let addedAny = false;
+    for (const item of items) {
       if (!item.imageId)
-        return false;
-      const key = `${characterId}:${item.imageId}`;
-      if (inFlightGalleryLinks.has(key))
-        return false;
-      inFlightGalleryLinks.add(key);
-      return true;
-    });
-    if (filtered.length === 0)
+        continue;
+      pendingMap.set(`${item.imageId}\x00${item.normalizedUrl}`, item);
+      addedAny = true;
+    }
+    const existingDrain = inFlightGalleryLinkDrainByCharacter.get(characterId);
+    if (existingDrain) {
+      return existingDrain;
+    }
+    if (!addedAny) {
+      if (pendingMap.size === 0) {
+        pendingGalleryLinkItemsByCharacter.delete(characterId);
+      }
       return;
-    const prevLock = characterLinkLocks.get(characterId) ?? Promise.resolve();
-    const run = async () => {
-      const recordedLinks = [];
-      let addedNewGalleryRow = false;
-      try {
+    }
+    const drainPromise = (async () => {
+      while (!unloaded) {
+        await Promise.resolve();
         if (unloaded)
-          return;
-        const existingGallery = await fetchNativeCharacterGallery(characterId) ?? [];
-        const existingByImageId = new Map;
-        for (const gItem of existingGallery) {
-          existingByImageId.set(gItem.image_id, gItem);
+          break;
+        const charPending = pendingGalleryLinkItemsByCharacter.get(characterId);
+        if (!charPending || charPending.size === 0) {
+          break;
         }
-        for (const item of filtered) {
-          if (unloaded)
-            break;
-          const already = existingByImageId.get(item.imageId);
-          if (already) {
-            recordedLinks.push({
-              characterId,
-              normalizedUrl: item.normalizedUrl,
-              imageId: item.imageId,
-              galleryItemId: already.id
-            });
-            continue;
-          }
-          try {
-            const response = await fetchWithTimeout(`/api/v1/characters/${encodeURIComponent(characterId)}/gallery/link`, {
-              method: "POST",
-              credentials: "include",
-              headers: {
-                Accept: "application/json",
-                "Content-Type": "application/json"
-              },
-              body: JSON.stringify({
-                image_id: item.imageId,
-                ...item.caption ? { caption: item.caption } : {}
-              })
-            });
-            if (!response.ok) {
-              console.warn(`[media_localizer] Failed linking gallery image (${response.status} ${response.statusText})`);
-              continue;
-            }
-            const body = await response.json();
-            const created = body && typeof body.id === "string" ? body : body?.data;
-            if (created?.id) {
-              existingByImageId.set(item.imageId, created);
+        let batchAddedNewGalleryRow = false;
+        const batch = Array.from(charPending.values());
+        charPending.clear();
+        let knownRows = knownLinkedGalleryRowByCharacter.get(characterId);
+        if (!knownRows) {
+          knownRows = new Map;
+          knownLinkedGalleryRowByCharacter.set(characterId, knownRows);
+        }
+        const recordedLinks = [];
+        const unlinkedItems = [];
+        for (const item of batch) {
+          const known = knownRows.get(item.imageId);
+          if (known) {
+            if (!item.normalizedUrl || !known.recordedUrls.has(item.normalizedUrl)) {
               recordedLinks.push({
                 characterId,
                 normalizedUrl: item.normalizedUrl,
                 imageId: item.imageId,
-                galleryItemId: created.id
+                galleryItemId: known.galleryItemId
               });
-              addedNewGalleryRow = true;
+              if (item.normalizedUrl) {
+                known.recordedUrls.add(item.normalizedUrl);
+              }
             }
-          } catch (err) {
-            if (!unloaded) {
-              console.warn("[media_localizer] Network error linking gallery image:", err);
+          } else {
+            unlinkedItems.push(item);
+          }
+        }
+        if (unlinkedItems.length > 0 && !unloaded) {
+          const existingGallery = await fetchNativeCharacterGallery(characterId) ?? [];
+          const existingByImageId = new Map;
+          for (const gItem of existingGallery) {
+            existingByImageId.set(gItem.image_id, gItem);
+            if (!knownRows.has(gItem.image_id)) {
+              knownRows.set(gItem.image_id, {
+                galleryItemId: gItem.id,
+                recordedUrls: new Set
+              });
+            }
+          }
+          for (const item of unlinkedItems) {
+            if (unloaded)
+              break;
+            const already = existingByImageId.get(item.imageId);
+            if (already) {
+              const known = knownRows.get(item.imageId);
+              if (known && item.normalizedUrl) {
+                known.recordedUrls.add(item.normalizedUrl);
+              }
+              recordedLinks.push({
+                characterId,
+                normalizedUrl: item.normalizedUrl,
+                imageId: item.imageId,
+                galleryItemId: already.id
+              });
+              continue;
+            }
+            try {
+              const response = await fetchWithTimeout(`/api/v1/characters/${encodeURIComponent(characterId)}/gallery/link`, {
+                method: "POST",
+                credentials: "include",
+                headers: {
+                  Accept: "application/json",
+                  "Content-Type": "application/json"
+                },
+                body: JSON.stringify({
+                  image_id: item.imageId,
+                  ...item.caption ? { caption: item.caption } : {}
+                })
+              });
+              if (!response.ok) {
+                console.warn(`[media_localizer] Failed linking gallery image (${response.status} ${response.statusText})`);
+                continue;
+              }
+              const body = await response.json();
+              const created = body && typeof body.id === "string" ? body : body?.data;
+              if (created?.id) {
+                existingByImageId.set(item.imageId, created);
+                const recordedUrls = new Set;
+                if (item.normalizedUrl) {
+                  recordedUrls.add(item.normalizedUrl);
+                }
+                knownRows.set(item.imageId, {
+                  galleryItemId: created.id,
+                  recordedUrls
+                });
+                recordedLinks.push({
+                  characterId,
+                  normalizedUrl: item.normalizedUrl,
+                  imageId: item.imageId,
+                  galleryItemId: created.id
+                });
+                batchAddedNewGalleryRow = true;
+              }
+            } catch (err) {
+              if (!unloaded) {
+                console.warn("[media_localizer] Network error linking gallery image:", err);
+              }
             }
           }
         }
-      } finally {
-        for (const item of filtered) {
-          inFlightGalleryLinks.delete(`${characterId}:${item.imageId}`);
+        if (unloaded)
+          break;
+        if (batchAddedNewGalleryRow && !unloaded) {
+          scheduleNativeGalleryUiRefresh();
+        }
+        if (recordedLinks.length > 0) {
+          try {
+            await callBackend("record_gallery_links", { links: recordedLinks });
+          } catch (err) {
+            console.warn("[media_localizer] Failed recording gallery links:", err);
+          }
         }
       }
-      if (unloaded)
-        return;
-      if (recordedLinks.length > 0) {
-        try {
-          await callBackend("record_gallery_links", { links: recordedLinks });
-        } catch (err) {
-          console.warn("[media_localizer] Failed recording gallery links:", err);
-        }
+    })().finally(() => {
+      if (inFlightGalleryLinkDrainByCharacter.get(characterId) === drainPromise) {
+        inFlightGalleryLinkDrainByCharacter.delete(characterId);
       }
-      if ((addedNewGalleryRow || recordedLinks.length > 0) && !unloaded) {
-        scheduleNativeGalleryUiRefresh();
+      if (pendingGalleryLinkItemsByCharacter.get(characterId)?.size === 0) {
+        pendingGalleryLinkItemsByCharacter.delete(characterId);
       }
-    };
-    const nextLock = prevLock.then(run, run);
-    characterLinkLocks.set(characterId, nextLock);
-    try {
-      await nextLock;
-    } finally {
-      if (characterLinkLocks.get(characterId) === nextLock) {
-        characterLinkLocks.delete(characterId);
-      }
-    }
+    });
+    inFlightGalleryLinkDrainByCharacter.set(characterId, drainPromise);
+    await drainPromise;
   }
   async function removeItemsFromNativeGallery(characterId, galleryItemIds, imageIds, options) {
     if (typeof fetch !== "function" || !characterId || unloaded || galleryItemIds.length === 0 && imageIds.length === 0) {
@@ -7500,6 +10513,7 @@ function setup(ctx) {
       }
     }
     if (deletedAny && !unloaded) {
+      knownLinkedGalleryRowByCharacter.delete(characterId);
       scheduleNativeGalleryUiRefresh();
     }
   }
@@ -7582,16 +10596,16 @@ function setup(ctx) {
         const res = await callBackend("scan_character", { characterId, forceRefresh });
         if (unloaded)
           return res.scan;
-        if (res.urlMapPayload) {
+        const isLatestForChar = latestScanSeqByChar.get(characterId) === mySeq;
+        if (isLatestForChar && res.urlMapPayload) {
           displaySwapper.updateMap(res.urlMapPayload);
         }
-        const isLatestForChar = latestScanSeqByChar.get(characterId) === mySeq;
         const activeCharId = resolveActiveContextCharacterId();
         if (isLatestForChar && activeCharId && activeCharId === characterId && res.scan) {
           lastActiveCharacterScan = res.scan;
           refreshPendingCountsFromActiveScan();
         }
-        if (currentSettings.autoLinkGallery && Array.isArray(res.pendingGalleryLinks) && res.pendingGalleryLinks.length > 0) {
+        if (isLatestForChar && currentSettings.autoLinkGallery && Array.isArray(res.pendingGalleryLinks) && res.pendingGalleryLinks.length > 0) {
           ensureGalleryLinksForCharacter(characterId, res.pendingGalleryLinks);
         }
         return res.scan;
@@ -7650,13 +10664,34 @@ function setup(ctx) {
         displaySwapper.updateMap(res.urlMapPayload);
       }
       latestScanSeqByChar.set(characterId, ++scanSeq);
+      inFlightScans.delete(`${characterId}:0`);
+      inFlightScans.delete(`${characterId}:1`);
+      knownLinkedGalleryRowByCharacter.delete(characterId);
+      if (urls && urls.length > 0) {
+        const urlSet = new Set(urls);
+        const pendingForChar = pendingGalleryLinkItemsByCharacter.get(characterId);
+        if (pendingForChar) {
+          for (const [k, item] of pendingForChar.entries()) {
+            if (urlSet.has(item.normalizedUrl)) {
+              pendingForChar.delete(k);
+            }
+          }
+          if (pendingForChar.size === 0) {
+            pendingGalleryLinkItemsByCharacter.delete(characterId);
+          }
+        }
+      } else {
+        pendingGalleryLinkItemsByCharacter.delete(characterId);
+      }
+      drawerPanel.invalidateCharacterCache(characterId);
+      clearWarmGalleryThumbs();
       if (lastActiveCharacterScan?.characterId === characterId) {
         lastActiveCharacterScan = null;
       }
       notifyUiStateChanged();
       const activeCharId = resolveActiveContextCharacterId() ?? lastObservedContextCharId;
       if (!unloaded && activeCharId && activeCharId === characterId) {
-        await callbacks.onScanCharacter(activeCharId, true).catch(() => {});
+        callbacks.onScanCharacter(activeCharId, true).catch(() => {});
       }
       if (!unloaded) {
         galleryIntegrator.refreshActiveScan(characterId);
@@ -7686,7 +10721,13 @@ function setup(ctx) {
       }
       for (const charId of uniqueCharIds) {
         latestScanSeqByChar.set(charId, ++scanSeq);
+        inFlightScans.delete(`${charId}:0`);
+        inFlightScans.delete(`${charId}:1`);
+        knownLinkedGalleryRowByCharacter.delete(charId);
+        pendingGalleryLinkItemsByCharacter.delete(charId);
+        drawerPanel.invalidateCharacterCache(charId);
       }
+      clearWarmGalleryThumbs();
       if (lastActiveCharacterScan && uniqueCharIds.includes(lastActiveCharacterScan.characterId)) {
         lastActiveCharacterScan = null;
       }
@@ -7735,9 +10776,14 @@ function setup(ctx) {
       return res;
     }
   };
-  const galleryIntegrator = new NativeGalleryTabIntegrator(ctx, currentSettings, currentQueueProgress, callbacks);
+  const galleryIntegrator = new NativeGalleryTabIntegrator(ctx, currentSettings, currentQueueProgress, callbacks, {
+    onCharacterPrefsUpdated: () => drawerPanel.syncPreferencesFromStorage()
+  });
   cleanups.push(() => galleryIntegrator.stop());
-  const drawerPanel = new MediaLocalizerDrawerPanel(ctx, currentSettings, currentStats, currentQueueProgress, callbacks);
+  cleanups.push(() => clearWarmGalleryThumbs());
+  const drawerPanel = new MediaLocalizerDrawerPanel(ctx, currentSettings, currentStats, currentQueueProgress, callbacks, {
+    onCharacterPrefsUpdated: () => galleryIntegrator.syncPreferencesFromStorage()
+  });
   let drawerTabRegistered = false;
   function tryRegisterDrawerTab() {
     if (unloaded || drawerTabRegistered || !ctx.ui?.registerDrawerTab)
@@ -7842,6 +10888,12 @@ function setup(ctx) {
     }
     if (msg.type === "URL_MAP_UPDATED" && msg.urlMapPayload) {
       displaySwapper.updateMap(msg.urlMapPayload);
+      if (msg.stats) {
+        hasLiveStatsUpdate = true;
+        currentStats = msg.stats;
+        currentSettings = currentStats.settings;
+        notifyUiStateChanged();
+      }
       return;
     }
     if (msg.type === "ENSURE_GALLERY_LINKS" && Array.isArray(msg.links) && currentSettings.autoLinkGallery) {
@@ -7853,6 +10905,11 @@ function setup(ctx) {
     }
     if (msg.type === "GALLERY_SYNC_CHANGED") {
       const characterId = typeof msg.characterId === "string" ? msg.characterId : undefined;
+      if (characterId) {
+        knownLinkedGalleryRowByCharacter.delete(characterId);
+      } else {
+        knownLinkedGalleryRowByCharacter.clear();
+      }
       galleryIntegrator.refreshActiveScan(characterId);
       drawerPanel.refreshActiveScan(characterId);
       return;
@@ -7861,10 +10918,21 @@ function setup(ctx) {
       const wasActive = isQueueActiveStatus(currentQueueProgress.status);
       hasLiveQueueUpdate = true;
       currentQueueProgress = msg.progress;
+      if (msg.stats) {
+        hasLiveStatsUpdate = true;
+        currentStats = msg.stats;
+        currentSettings = currentStats.settings;
+      }
       const nowActive = isQueueActiveStatus(currentQueueProgress.status);
       notifyUiStateChanged();
-      if (wasActive && !nowActive && lastObservedContextCharId) {
-        callbacks.onScanCharacter(lastObservedContextCharId, false).catch(() => {});
+      if (wasActive && !nowActive) {
+        if (pendingNativeGalleryRefreshWhenQueueIdle) {
+          pendingNativeGalleryRefreshWhenQueueIdle = false;
+          scheduleNativeGalleryUiRefresh(150);
+        }
+        if (lastObservedContextCharId) {
+          callbacks.onScanCharacter(lastObservedContextCharId, false).catch(() => {});
+        }
       }
       if (msg.newAsset && currentSettings.autoLinkGallery) {
         const asset = msg.newAsset;
@@ -7873,7 +10941,6 @@ function setup(ctx) {
             if (!charId)
               continue;
             if (asset.galleryItemIds?.[charId]) {
-              scheduleNativeGalleryUiRefresh();
               continue;
             }
             ensureGalleryLinksForCharacter(charId, [
@@ -7956,6 +11023,7 @@ function setup(ctx) {
         const offDrawerChange = ctx.ui?.events?.onDrawerChange?.((state) => {
           if (state.open && state.tabId === "media_localizer") {
             handleActiveCharacterContextChanged();
+            drawerPanel.restoreScrollIfReset();
           }
         });
         if (typeof offDrawerChange === "function") {

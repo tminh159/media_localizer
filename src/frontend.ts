@@ -21,6 +21,7 @@ import {
   type DrawerPanelCallbacks,
 } from "./ui/drawer-panel.ts";
 import { NativeGalleryTabIntegrator } from "./ui/gallery-integrator.ts";
+import { clearWarmGalleryThumbs } from "./ui/library-gallery.ts";
 import { PortraitPanelLocalizeController } from "./ui/portrait-button.ts";
 import { MEDIA_LOCALIZER_STYLES } from "./ui/styles.ts";
 import { cleanupUiHelpers, isQueueActiveStatus } from "./ui/ui-helpers.ts";
@@ -277,31 +278,54 @@ export function setup(ctx: SpindleFrontendContext): () => void {
 
   // Debounced native Gallery & Portrait Panel UI refresh
   let uiRefreshTimer: ReturnType<typeof setTimeout> | null = null;
-  function scheduleNativeGalleryUiRefresh(): void {
+  let pendingNativeGalleryRefreshWhenQueueIdle = false;
+  function scheduleNativeGalleryUiRefresh(delayMs = 150): void {
     if (unloaded) return;
+    if (isQueueActiveStatus(currentQueueProgress.status)) {
+      pendingNativeGalleryRefreshWhenQueueIdle = true;
+      return;
+    }
+    pendingNativeGalleryRefreshWhenQueueIdle = false;
     if (uiRefreshTimer !== null) {
       clearTimeout(uiRefreshTimer);
     }
     uiRefreshTimer = setTimeout(() => {
       uiRefreshTimer = null;
       if (unloaded) return;
+      if (isQueueActiveStatus(currentQueueProgress.status)) {
+        pendingNativeGalleryRefreshWhenQueueIdle = true;
+        return;
+      }
       try {
         triggerNativeGalleryAndPortraitReactRefresh();
       } catch {
         // ignore
       }
-    }, 150);
+    }, delayMs);
   }
+
+  // Coalesce gallery link requests per character and track session-linked imageIds
+  const pendingGalleryLinkItemsByCharacter = new Map<
+    string,
+    Map<string, PendingGalleryLinkItem>
+  >();
+  const inFlightGalleryLinkDrainByCharacter = new Map<string, Promise<void>>();
+  const knownLinkedGalleryRowByCharacter = new Map<
+    string,
+    Map<string, { galleryItemId: string; recordedUrls: Set<string> }>
+  >();
+
   cleanups.push(() => {
     if (uiRefreshTimer !== null) {
       clearTimeout(uiRefreshTimer);
       uiRefreshTimer = null;
     }
+    pendingNativeGalleryRefreshWhenQueueIdle = false;
+    pendingGalleryLinkItemsByCharacter.clear();
+    inFlightGalleryLinkDrainByCharacter.clear();
+    knownLinkedGalleryRowByCharacter.clear();
   });
 
-  // Track in-flight gallery link operations per `characterId:imageId` to prevent duplicates
-  const inFlightGalleryLinks = new Set<string>();
-  const characterLinkLocks = new Map<string, Promise<void>>();
   const activeFetchControllers = new Set<AbortController>();
   const NATIVE_GALLERY_FETCH_TIMEOUT_MS = 15_000;
 
@@ -416,124 +440,190 @@ export function setup(ctx: SpindleFrontendContext): () => void {
       return;
     }
 
-    const filtered = items.filter((item) => {
-      if (!item.imageId) return false;
-      const key = `${characterId}:${item.imageId}`;
-      if (inFlightGalleryLinks.has(key)) return false;
-      inFlightGalleryLinks.add(key);
-      return true;
-    });
-    if (filtered.length === 0) return;
+    let pendingMap = pendingGalleryLinkItemsByCharacter.get(characterId);
+    if (!pendingMap) {
+      pendingMap = new Map<string, PendingGalleryLinkItem>();
+      pendingGalleryLinkItemsByCharacter.set(characterId, pendingMap);
+    }
+    let addedAny = false;
+    for (const item of items) {
+      if (!item.imageId) continue;
+      pendingMap.set(`${item.imageId}\u0000${item.normalizedUrl}`, item);
+      addedAny = true;
+    }
 
-    const prevLock = characterLinkLocks.get(characterId) ?? Promise.resolve();
-    const run = async () => {
-      const recordedLinks: Array<{
-        characterId: string;
-        normalizedUrl?: string;
-        imageId: string;
-        galleryItemId: string;
-      }> = [];
-      let addedNewGalleryRow = false;
+    const existingDrain = inFlightGalleryLinkDrainByCharacter.get(characterId);
+    if (existingDrain) {
+      return existingDrain;
+    }
+    if (!addedAny) {
+      if (pendingMap.size === 0) {
+        pendingGalleryLinkItemsByCharacter.delete(characterId);
+      }
+      return;
+    }
 
-      try {
-        if (unloaded) return;
-        const existingGallery = (await fetchNativeCharacterGallery(characterId)) ?? [];
-        const existingByImageId = new Map<string, NativeGalleryApiItem>();
-        for (const gItem of existingGallery) {
-          existingByImageId.set(gItem.image_id, gItem);
+    const drainPromise = (async () => {
+      while (!unloaded) {
+        await Promise.resolve();
+        if (unloaded) break;
+        const charPending = pendingGalleryLinkItemsByCharacter.get(characterId);
+        if (!charPending || charPending.size === 0) {
+          break;
+        }
+        let batchAddedNewGalleryRow = false;
+        const batch = Array.from(charPending.values());
+        charPending.clear();
+
+        let knownRows = knownLinkedGalleryRowByCharacter.get(characterId);
+        if (!knownRows) {
+          knownRows = new Map<
+            string,
+            { galleryItemId: string; recordedUrls: Set<string> }
+          >();
+          knownLinkedGalleryRowByCharacter.set(characterId, knownRows);
         }
 
-        for (const item of filtered) {
-          if (unloaded) break;
-          const already = existingByImageId.get(item.imageId);
-          if (already) {
-            recordedLinks.push({
-              characterId,
-              normalizedUrl: item.normalizedUrl,
-              imageId: item.imageId,
-              galleryItemId: already.id,
-            });
-            continue;
-          }
+        const recordedLinks: Array<{
+          characterId: string;
+          normalizedUrl?: string;
+          imageId: string;
+          galleryItemId: string;
+        }> = [];
+        const unlinkedItems: PendingGalleryLinkItem[] = [];
 
-          try {
-            const response = await fetchWithTimeout(
-              `/api/v1/characters/${encodeURIComponent(characterId)}/gallery/link`,
-              {
-                method: "POST",
-                credentials: "include",
-                headers: {
-                  Accept: "application/json",
-                  "Content-Type": "application/json",
-                },
-                body: JSON.stringify({
-                  image_id: item.imageId,
-                  ...(item.caption ? { caption: item.caption } : {}),
-                }),
-              },
-            );
-            if (!response.ok) {
-              console.warn(
-                `[media_localizer] Failed linking gallery image (${response.status} ${response.statusText})`,
-              );
-              continue;
-            }
-            const body = (await response.json()) as
-              | NativeGalleryApiItem
-              | { data?: NativeGalleryApiItem }
-              | null;
-            const created =
-              body && typeof (body as NativeGalleryApiItem).id === "string"
-                ? (body as NativeGalleryApiItem)
-                : (body as { data?: NativeGalleryApiItem } | null)?.data;
-            if (created?.id) {
-              existingByImageId.set(item.imageId, created);
+        for (const item of batch) {
+          const known = knownRows.get(item.imageId);
+          if (known) {
+            if (!item.normalizedUrl || !known.recordedUrls.has(item.normalizedUrl)) {
               recordedLinks.push({
                 characterId,
                 normalizedUrl: item.normalizedUrl,
                 imageId: item.imageId,
-                galleryItemId: created.id,
+                galleryItemId: known.galleryItemId,
               });
-              addedNewGalleryRow = true;
+              if (item.normalizedUrl) {
+                known.recordedUrls.add(item.normalizedUrl);
+              }
             }
-          } catch (err) {
-            if (!unloaded) {
-              console.warn(
-                "[media_localizer] Network error linking gallery image:",
-                err,
+          } else {
+            unlinkedItems.push(item);
+          }
+        }
+
+        if (unlinkedItems.length > 0 && !unloaded) {
+          const existingGallery =
+            (await fetchNativeCharacterGallery(characterId)) ?? [];
+          const existingByImageId = new Map<string, NativeGalleryApiItem>();
+          for (const gItem of existingGallery) {
+            existingByImageId.set(gItem.image_id, gItem);
+            if (!knownRows.has(gItem.image_id)) {
+              knownRows.set(gItem.image_id, {
+                galleryItemId: gItem.id,
+                recordedUrls: new Set<string>(),
+              });
+            }
+          }
+
+          for (const item of unlinkedItems) {
+            if (unloaded) break;
+            const already = existingByImageId.get(item.imageId);
+            if (already) {
+              const known = knownRows.get(item.imageId);
+              if (known && item.normalizedUrl) {
+                known.recordedUrls.add(item.normalizedUrl);
+              }
+              recordedLinks.push({
+                characterId,
+                normalizedUrl: item.normalizedUrl,
+                imageId: item.imageId,
+                galleryItemId: already.id,
+              });
+              continue;
+            }
+
+            try {
+              const response = await fetchWithTimeout(
+                `/api/v1/characters/${encodeURIComponent(characterId)}/gallery/link`,
+                {
+                  method: "POST",
+                  credentials: "include",
+                  headers: {
+                    Accept: "application/json",
+                    "Content-Type": "application/json",
+                  },
+                  body: JSON.stringify({
+                    image_id: item.imageId,
+                    ...(item.caption ? { caption: item.caption } : {}),
+                  }),
+                },
               );
+              if (!response.ok) {
+                console.warn(
+                  `[media_localizer] Failed linking gallery image (${response.status} ${response.statusText})`,
+                );
+                continue;
+              }
+              const body = (await response.json()) as
+                | NativeGalleryApiItem
+                | { data?: NativeGalleryApiItem }
+                | null;
+              const created =
+                body && typeof (body as NativeGalleryApiItem).id === "string"
+                  ? (body as NativeGalleryApiItem)
+                  : (body as { data?: NativeGalleryApiItem } | null)?.data;
+              if (created?.id) {
+                existingByImageId.set(item.imageId, created);
+                const recordedUrls = new Set<string>();
+                if (item.normalizedUrl) {
+                  recordedUrls.add(item.normalizedUrl);
+                }
+                knownRows.set(item.imageId, {
+                  galleryItemId: created.id,
+                  recordedUrls,
+                });
+                recordedLinks.push({
+                  characterId,
+                  normalizedUrl: item.normalizedUrl,
+                  imageId: item.imageId,
+                  galleryItemId: created.id,
+                });
+                batchAddedNewGalleryRow = true;
+              }
+            } catch (err) {
+              if (!unloaded) {
+                console.warn(
+                  "[media_localizer] Network error linking gallery image:",
+                  err,
+                );
+              }
             }
           }
         }
-      } finally {
-        for (const item of filtered) {
-          inFlightGalleryLinks.delete(`${characterId}:${item.imageId}`);
+
+        if (unloaded) break;
+        if (batchAddedNewGalleryRow && !unloaded) {
+          scheduleNativeGalleryUiRefresh();
+        }
+        if (recordedLinks.length > 0) {
+          try {
+            await callBackend("record_gallery_links", { links: recordedLinks });
+          } catch (err) {
+            console.warn("[media_localizer] Failed recording gallery links:", err);
+          }
         }
       }
-
-      if (unloaded) return;
-      if (recordedLinks.length > 0) {
-        try {
-          await callBackend("record_gallery_links", { links: recordedLinks });
-        } catch (err) {
-          console.warn("[media_localizer] Failed recording gallery links:", err);
-        }
+    })().finally(() => {
+      if (inFlightGalleryLinkDrainByCharacter.get(characterId) === drainPromise) {
+        inFlightGalleryLinkDrainByCharacter.delete(characterId);
       }
-
-      if ((addedNewGalleryRow || recordedLinks.length > 0) && !unloaded) {
-        scheduleNativeGalleryUiRefresh();
+      if (pendingGalleryLinkItemsByCharacter.get(characterId)?.size === 0) {
+        pendingGalleryLinkItemsByCharacter.delete(characterId);
       }
-    };
+    });
 
-    const nextLock = prevLock.then(run, run);
-    characterLinkLocks.set(characterId, nextLock);
-    try {
-      await nextLock;
-    } finally {
-      if (characterLinkLocks.get(characterId) === nextLock) {
-        characterLinkLocks.delete(characterId);
-      }
-    }
+    inFlightGalleryLinkDrainByCharacter.set(characterId, drainPromise);
+    await drainPromise;
   }
 
   /**
@@ -608,6 +698,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     }
 
     if (deletedAny && !unloaded) {
+      knownLinkedGalleryRowByCharacter.delete(characterId);
       scheduleNativeGalleryUiRefresh();
     }
   }
@@ -723,16 +814,17 @@ export function setup(ctx: SpindleFrontendContext): () => void {
           pendingGalleryLinks?: PendingGalleryLinkItem[];
         }>("scan_character", { characterId, forceRefresh });
         if (unloaded) return res.scan;
-        if (res.urlMapPayload) {
+        const isLatestForChar = latestScanSeqByChar.get(characterId) === mySeq;
+        if (isLatestForChar && res.urlMapPayload) {
           displaySwapper.updateMap(res.urlMapPayload);
         }
-        const isLatestForChar = latestScanSeqByChar.get(characterId) === mySeq;
         const activeCharId = resolveActiveContextCharacterId();
         if (isLatestForChar && activeCharId && activeCharId === characterId && res.scan) {
           lastActiveCharacterScan = res.scan;
           refreshPendingCountsFromActiveScan();
         }
         if (
+          isLatestForChar &&
           currentSettings.autoLinkGallery &&
           Array.isArray(res.pendingGalleryLinks) &&
           res.pendingGalleryLinks.length > 0
@@ -836,6 +928,27 @@ export function setup(ctx: SpindleFrontendContext): () => void {
         displaySwapper.updateMap(res.urlMapPayload);
       }
       latestScanSeqByChar.set(characterId, ++scanSeq);
+      inFlightScans.delete(`${characterId}:0`);
+      inFlightScans.delete(`${characterId}:1`);
+      knownLinkedGalleryRowByCharacter.delete(characterId);
+      if (urls && urls.length > 0) {
+        const urlSet = new Set(urls);
+        const pendingForChar = pendingGalleryLinkItemsByCharacter.get(characterId);
+        if (pendingForChar) {
+          for (const [k, item] of pendingForChar.entries()) {
+            if (urlSet.has(item.normalizedUrl)) {
+              pendingForChar.delete(k);
+            }
+          }
+          if (pendingForChar.size === 0) {
+            pendingGalleryLinkItemsByCharacter.delete(characterId);
+          }
+        }
+      } else {
+        pendingGalleryLinkItemsByCharacter.delete(characterId);
+      }
+      drawerPanel.invalidateCharacterCache(characterId);
+      clearWarmGalleryThumbs();
       if (lastActiveCharacterScan?.characterId === characterId) {
         lastActiveCharacterScan = null;
       }
@@ -843,7 +956,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
       const activeCharId =
         resolveActiveContextCharacterId() ?? lastObservedContextCharId;
       if (!unloaded && activeCharId && activeCharId === characterId) {
-        await callbacks.onScanCharacter(activeCharId, true).catch(() => {});
+        void callbacks.onScanCharacter(activeCharId, true).catch(() => {});
       }
       if (!unloaded) {
         galleryIntegrator.refreshActiveScan(characterId);
@@ -892,7 +1005,13 @@ export function setup(ctx: SpindleFrontendContext): () => void {
       }
       for (const charId of uniqueCharIds) {
         latestScanSeqByChar.set(charId, ++scanSeq);
+        inFlightScans.delete(`${charId}:0`);
+        inFlightScans.delete(`${charId}:1`);
+        knownLinkedGalleryRowByCharacter.delete(charId);
+        pendingGalleryLinkItemsByCharacter.delete(charId);
+        drawerPanel.invalidateCharacterCache(charId);
       }
+      clearWarmGalleryThumbs();
       if (
         lastActiveCharacterScan &&
         uniqueCharIds.includes(lastActiveCharacterScan.characterId)
@@ -978,8 +1097,12 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     currentSettings,
     currentQueueProgress,
     callbacks,
+    {
+      onCharacterPrefsUpdated: () => drawerPanel.syncPreferencesFromStorage(),
+    },
   );
   cleanups.push(() => galleryIntegrator.stop());
+  cleanups.push(() => clearWarmGalleryThumbs());
 
   // 7. Drawer Panel & Portrait Button
   const drawerPanel = new MediaLocalizerDrawerPanel(
@@ -988,6 +1111,9 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     currentStats,
     currentQueueProgress,
     callbacks,
+    {
+      onCharacterPrefsUpdated: () => galleryIntegrator.syncPreferencesFromStorage(),
+    },
   );
 
   let drawerTabRegistered = false;
@@ -1112,6 +1238,12 @@ export function setup(ctx: SpindleFrontendContext): () => void {
 
     if (msg.type === "URL_MAP_UPDATED" && msg.urlMapPayload) {
       displaySwapper.updateMap(msg.urlMapPayload as ActiveDisplayUrlMapPayload);
+      if (msg.stats) {
+        hasLiveStatsUpdate = true;
+        currentStats = msg.stats as StorageStatsSummary;
+        currentSettings = currentStats.settings;
+        notifyUiStateChanged();
+      }
       return;
     }
 
@@ -1133,6 +1265,11 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     if (msg.type === "GALLERY_SYNC_CHANGED") {
       const characterId =
         typeof msg.characterId === "string" ? msg.characterId : undefined;
+      if (characterId) {
+        knownLinkedGalleryRowByCharacter.delete(characterId);
+      } else {
+        knownLinkedGalleryRowByCharacter.clear();
+      }
       galleryIntegrator.refreshActiveScan(characterId);
       drawerPanel.refreshActiveScan(characterId);
       return;
@@ -1142,11 +1279,22 @@ export function setup(ctx: SpindleFrontendContext): () => void {
       const wasActive = isQueueActiveStatus(currentQueueProgress.status);
       hasLiveQueueUpdate = true;
       currentQueueProgress = msg.progress as QueueJobProgress;
+      if (msg.stats) {
+        hasLiveStatsUpdate = true;
+        currentStats = msg.stats as StorageStatsSummary;
+        currentSettings = currentStats.settings;
+      }
       const nowActive = isQueueActiveStatus(currentQueueProgress.status);
       notifyUiStateChanged();
 
-      if (wasActive && !nowActive && lastObservedContextCharId) {
-        void callbacks.onScanCharacter(lastObservedContextCharId, false).catch(() => {});
+      if (wasActive && !nowActive) {
+        if (pendingNativeGalleryRefreshWhenQueueIdle) {
+          pendingNativeGalleryRefreshWhenQueueIdle = false;
+          scheduleNativeGalleryUiRefresh(150);
+        }
+        if (lastObservedContextCharId) {
+          void callbacks.onScanCharacter(lastObservedContextCharId, false).catch(() => {});
+        }
       }
 
       // Automatically link every newly localized image into the character's native Gallery & Portrait Panel
@@ -1155,9 +1303,8 @@ export function setup(ctx: SpindleFrontendContext): () => void {
         if (asset.imageId && asset.mimeType.startsWith("image/")) {
           for (const charId of asset.characterIds) {
             if (!charId) continue;
-            // If already linked in galleryItemIds (e.g. reused existing gallery image), still refresh UI
+            // Already linked in galleryItemIds (e.g. reused existing gallery image); no refresh needed
             if (asset.galleryItemIds?.[charId]) {
-              scheduleNativeGalleryUiRefresh();
               continue;
             }
             void ensureGalleryLinksForCharacter(charId, [
@@ -1254,6 +1401,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
         const offDrawerChange = ctx.ui?.events?.onDrawerChange?.((state) => {
           if (state.open && state.tabId === "media_localizer") {
             handleActiveCharacterContextChanged();
+            drawerPanel.restoreScrollIfReset();
           }
         });
         if (typeof offDrawerChange === "function") {

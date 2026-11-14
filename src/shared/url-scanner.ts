@@ -17,8 +17,8 @@ import {
 } from "./types.ts";
 
 const VIDEO_EXT_RE = /\.(?:mp4|webm|mov|m4v|ogv)$/i;
-const IMAGE_EXT_RE = /\.(?:png|jpe?g|gif|webp|avif|svg|bmp|ico|apng)$/i;
-const EXCLUDED_ASSET_EXT_RE = /\.(?:woff2?|ttf|otf|eot|css|js|mjs|json|xml|html?|txt|pdf|zip|rar|7z|mp3|wav|ogg|flac|m4a)$/i;
+const IMAGE_EXT_RE = /\.(?:png|jpe?g|jfif|pjp|pjpeg|gif|webp|avif|bmp|ico|apng)$/i;
+const EXCLUDED_ASSET_EXT_RE = /\.(?:svg|woff2?|ttf|otf|eot|css|js|mjs|json|xml|html?|txt|pdf|zip|rar|7z|mp3|wav|ogg|flac|m4a)$/i;
 const EXCLUDED_DOMAIN_RE = /^(?:fonts\.googleapis\.com|fonts\.gstatic\.com|use\.fontawesome\.com|cdnjs\.cloudflare\.com)$/i;
 
 const MAX_MD_ALT_LEN = 2048;
@@ -1203,7 +1203,7 @@ export function deriveUrlFilenameParts(normalizedUrl: string): {
     );
     const extMatch = /\.([a-z0-9]{2,5})$/i.exec(rawSeg);
     const queryFormat = parsed.searchParams.get("format")?.trim().toLowerCase() ?? "";
-    const validQueryExt = /^(?:png|jpe?g|gif|webp|avif|svg|bmp|ico|apng|mp4|webm|mov|m4v|ogv)$/i.test(queryFormat)
+    const validQueryExt = /^(?:png|jpe?g|jfif|pjp|pjpeg|gif|webp|avif|bmp|ico|apng|mp4|webm|mov|m4v|ogv)$/i.test(queryFormat)
       ? queryFormat
       : "";
     const ext = extMatch?.[1]?.toLowerCase() || validQueryExt;
@@ -1229,7 +1229,7 @@ export function deriveUrlFilenameParts(normalizedUrl: string): {
 const NATIVE_IMG_TAGS = new Set(["img"]);
 const NATIVE_BARE_URL_RE = /\bhttps?:\/\/[^\s<>"']+/gi;
 const NATIVE_IMAGE_PATH_RE =
-  /\.(?:apng|avif|bmp|gif|heic|heif|ico|jpe?g|jfif|pjp|pjpeg|png|svg|webp)$/i;
+  /\.(?:apng|avif|bmp|gif|heic|heif|ico|jpe?g|jfif|pjp|pjpeg|png|webp)$/i;
 const NATIVE_TRAILING_PUNCTUATION_CHARS = "),.;!?'\"`]}\\";
 
 function normalizeNativeExtractedCandidateUrl(raw: string): string | null {

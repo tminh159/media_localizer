@@ -23,7 +23,12 @@ export interface EnqueueBatchOptions {
   concurrency: number;
 }
 
-type TaskOutcome = "ok" | "failed" | "aborted";
+type TaskOutcome =
+  | "ok"
+  | "failed"
+  | "aborted"
+  | "aborted_character"
+  | "aborted_url";
 
 interface ActiveTaskControl {
   id: string;
@@ -33,6 +38,7 @@ interface ActiveTaskControl {
   startedAt: number;
   controller: AbortController;
   skipped: boolean;
+  abortScope?: "character" | "url" | "all";
 }
 
 function createIdleProgress(): QueueJobProgress {
@@ -80,6 +86,7 @@ export class UserDownloadQueue {
   private enqueueLock: Promise<void> = Promise.resolve();
   private readonly inFlight = new Map<string, Promise<TaskOutcome>>();
   private readonly cancelledCharacterUrls = new Map<string, Set<string> | null>();
+  private readonly activeWorkerLoops = new Set<Promise<void>>();
 
   constructor(
     private readonly userId: string,
@@ -210,6 +217,7 @@ export class UserDownloadQueue {
         this.pendingTasks = [...incoming];
         this.inFlight.clear();
         this.cancelledCharacterUrls.clear();
+        this.activeWorkerLoops.clear();
         const gen = ++this.generation;
         this.progress = {
           status: incoming.length > 0 ? "running" : "completed",
@@ -226,7 +234,7 @@ export class UserDownloadQueue {
         };
         this.emit();
         if (incoming.length > 0) {
-          const run = this.runWorkers(this.currentOptions.concurrency, gen).finally(
+          const run = this.runWorkers(gen).finally(
             () => {
               if (this.runPromise === run) {
                 this.runPromise = null;
@@ -255,6 +263,7 @@ export class UserDownloadQueue {
           this.progress.skippedByCapCount += skippedByCapCount;
         }
         this.emit();
+        this.spawnWorkerLoops(this.currentOptions.concurrency, this.generation);
       }
 
       return this.getProgress();
@@ -279,6 +288,7 @@ export class UserDownloadQueue {
     this.resumeResolver = null;
     resolve?.();
     this.emit();
+    this.spawnWorkerLoops(this.currentOptions.concurrency, this.generation);
     return this.getProgress();
   }
 
@@ -294,6 +304,7 @@ export class UserDownloadQueue {
       for (const ctrl of controls) {
         if (ctrl.url === target.url) {
           ctrl.skipped = true;
+          ctrl.abortScope = "url";
           ctrl.controller.abort(new DOMException("Skipped by user", "AbortError"));
         }
       }
@@ -385,6 +396,7 @@ export class UserDownloadQueue {
       ) {
         if (!active.skipped) {
           active.skipped = true;
+          active.abortScope = "character";
           active.controller.abort(
             new DOMException("Cancelled by character purge", "AbortError"),
           );
@@ -422,6 +434,7 @@ export class UserDownloadQueue {
 
     for (const active of this.activeControls.values()) {
       active.skipped = true;
+      active.abortScope = "all";
       active.controller.abort(new DOMException("Cancelled by user", "AbortError"));
     }
 
@@ -434,19 +447,39 @@ export class UserDownloadQueue {
     return this.getProgress();
   }
 
-  private async runWorkers(concurrency: number, gen: number): Promise<void> {
+  private spawnWorkerLoops(targetCount: number, gen: number): void {
+    if (this.cancelRequested || gen !== this.generation) return;
+    const maxAllowed = Math.min(
+      targetCount,
+      this.activeWorkerLoops.size + this.pendingTasks.length,
+    );
+    while (
+      this.activeWorkerLoops.size < maxAllowed &&
+      this.pendingTasks.length > 0 &&
+      !this.cancelRequested &&
+      gen === this.generation
+    ) {
+      const loopPromise = this.workerLoop(gen).finally(() => {
+        this.activeWorkerLoops.delete(loopPromise);
+      });
+      this.activeWorkerLoops.add(loopPromise);
+    }
+  }
+
+  private async runWorkers(gen: number): Promise<void> {
     while (!this.cancelRequested && gen === this.generation) {
       if (this.pauseGate) {
         await this.pauseGate;
       }
       if (this.cancelRequested || gen !== this.generation) break;
-      if (this.pendingTasks.length === 0) break;
-
-      const workers: Promise<void>[] = [];
-      for (let i = 0; i < concurrency; i++) {
-        workers.push(this.workerLoop(gen));
+      if (this.pendingTasks.length === 0 && this.activeWorkerLoops.size === 0) {
+        break;
       }
-      await Promise.allSettled(workers);
+
+      this.spawnWorkerLoops(this.currentOptions.concurrency, gen);
+      if (this.activeWorkerLoops.size === 0) break;
+
+      await Promise.allSettled(Array.from(this.activeWorkerLoops));
     }
 
     // A newer job owns the progress state now; never overwrite it.
@@ -507,6 +540,7 @@ export class UserDownloadQueue {
         if (
           this.cancelRequested ||
           outcome === "aborted" ||
+          outcome === "aborted_url" ||
           this.isTaskCancelledForCharacter(task.characterId, key)
         ) {
           this.progress.completedCount++;
@@ -584,14 +618,17 @@ export class UserDownloadQueue {
   ): Promise<TaskOutcome> {
     const checkAbortedOrStale = (): TaskOutcome | null => {
       if (gen !== this.generation) return "aborted";
-      if (
-        this.cancelRequested ||
-        this.isTaskCancelledForCharacter(task.characterId, task.normalizedUrl)
-      ) {
+      if (this.cancelRequested) {
         this.progress.completedCount++;
         this.progress.skippedCount++;
         this.emit();
         return "aborted";
+      }
+      if (this.isTaskCancelledForCharacter(task.characterId, task.normalizedUrl)) {
+        this.progress.completedCount++;
+        this.progress.skippedCount++;
+        this.emit();
+        return "aborted_character";
       }
       return null;
     };
@@ -703,12 +740,22 @@ export class UserDownloadQueue {
             // ignore cleanup failure
           }
         }
+        const scope = control.abortScope;
         this.activeControls.delete(controlId);
         controlId = null;
-        if (gen === this.generation) {
-          this.progress.completedCount++;
-          this.progress.skippedCount++;
-          this.emit();
+        if (gen !== this.generation) {
+          return "aborted";
+        }
+        this.progress.completedCount++;
+        this.progress.skippedCount++;
+        this.emit();
+        if (this.cancelRequested || scope === "all") return "aborted";
+        if (scope === "url") return "aborted_url";
+        if (
+          scope === "character" ||
+          this.isTaskCancelledForCharacter(task.characterId, task.normalizedUrl)
+        ) {
+          return "aborted_character";
         }
         return "aborted";
       }
@@ -763,6 +810,15 @@ export class UserDownloadQueue {
       if (isAborted) {
         this.progress.skippedCount++;
         this.emit();
+        const scope = control?.abortScope;
+        if (this.cancelRequested || scope === "all") return "aborted";
+        if (scope === "url") return "aborted_url";
+        if (
+          scope === "character" ||
+          this.isTaskCancelledForCharacter(task.characterId, task.normalizedUrl)
+        ) {
+          return "aborted_character";
+        }
         return "aborted";
       }
 

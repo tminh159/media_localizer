@@ -19,6 +19,7 @@ import {
   type CharacterWidgetUiState,
 } from "./character-media-widget.ts";
 import {
+  clearWarmGalleryThumbs,
   getDefaultGalleryPreferences,
   LibraryGalleryView,
   sanitizeGalleryPreferences,
@@ -26,38 +27,27 @@ import {
   type LibraryGalleryState,
 } from "./library-gallery.ts";
 import {
+  applyScrollTopWithSettlement,
+  canOpenNativeCharacterEditor,
+  CHARACTER_PREFS_STORAGE_KEY,
+  createIcon,
   createIconButton,
   createInfoTip,
+  createThumbnailSizeSegmented,
+  GALLERY_PREFS_STORAGE_KEY,
+  isElementScrollable,
   isQueueActiveStatus,
+  loadPrefsFromStorage,
+  openNativeCharacterEditor,
   renderQueueBanner,
   renderSharedDownloadConfigControls,
+  resolveScrollContainer,
+  savePrefsToStorage,
+  type IconName,
+  type PendingScrollRestore,
 } from "./ui-helpers.ts";
 
-const GALLERY_PREFS_STORAGE_KEY = "lumiverse.media_localizer.gallery_prefs.v1";
-const CHARACTER_PREFS_STORAGE_KEY = "lumiverse.media_localizer.character_prefs.v1";
 const LIBRARY_BATCH_PAGE_SIZE = 50;
-
-function loadPrefsFromStorage<T>(
-  key: string,
-  sanitize: (raw: unknown) => T,
-  fallback: () => T,
-): T {
-  try {
-    const raw = globalThis.localStorage?.getItem?.(key);
-    if (!raw) return fallback();
-    return sanitize(JSON.parse(raw));
-  } catch {
-    return fallback();
-  }
-}
-
-function savePrefsToStorage<T>(key: string, prefs: T): void {
-  try {
-    globalThis.localStorage?.setItem?.(key, JSON.stringify(prefs));
-  } catch {
-    // Ignore storage unavailability (private browsing, test envs)
-  }
-}
 
 export type DrawerTabId = "character" | "gallery" | "library" | "settings";
 
@@ -122,6 +112,21 @@ export class MediaLocalizerDrawerPanel {
   private libraryOnlyWithRemote = true;
   private inspectedCharacterId: string | null = null;
   private expandNextCharacterConfig = false;
+  private renderedTab: DrawerTabId | null = null;
+  private isRenderingBody = false;
+  private rememberedScrollContainer: HTMLElement | null = null;
+  private cachedScrollContainer: HTMLElement | null = null;
+  private galleryHostEl: HTMLElement | null = null;
+  private pendingScrollRestore: PendingScrollRestore | null = null;
+  private isSettlingScrollRestore = false;
+  private scrollSettleRafIds: number[] = [];
+  private tabScrollTops: Record<DrawerTabId, number> = {
+    character: 0,
+    gallery: 0,
+    library: 0,
+    settings: 0,
+  };
+  private innerScrollTops = new Map<string, number>();
 
   constructor(
     private readonly ctx: SpindleFrontendContext,
@@ -129,6 +134,9 @@ export class MediaLocalizerDrawerPanel {
     private stats: StorageStatsSummary,
     private queueProgress: QueueJobProgress,
     private readonly callbacks: DrawerPanelCallbacks,
+    private readonly options?: {
+      onCharacterPrefsUpdated?: () => void;
+    },
   ) {
     this.librarySelectedSections = new Set(settings.defaultSections);
     this.libraryBatchCap = settings.defaultBatchCap;
@@ -136,6 +144,14 @@ export class MediaLocalizerDrawerPanel {
 
   mount(container: HTMLElement): () => void {
     const mountGen = ++this.mountGen;
+    const prevContainerWidth = container.style?.width ?? "";
+    const prevContainerHeight = container.style?.height ?? "";
+    const prevContainerMinHeight = container.style?.minHeight ?? "";
+    if (container.style) {
+      container.style.width = "100%";
+      container.style.height = "100%";
+      container.style.minHeight = "0";
+    }
     container.innerHTML = "";
     const root = document.createElement("div");
     root.className = "ml-drawer-root";
@@ -143,11 +159,11 @@ export class MediaLocalizerDrawerPanel {
     const nav = document.createElement("div");
     nav.className = "ml-drawer-nav";
 
-    const tabs: Array<{ id: DrawerTabId; label: string }> = [
-      { id: "character", label: "Character" },
-      { id: "gallery", label: "Gallery" },
-      { id: "library", label: "Library Batch" },
-      { id: "settings", label: "Settings" },
+    const tabs: Array<{ id: DrawerTabId; label: string; icon: IconName }> = [
+      { id: "character", label: "Character", icon: "user" },
+      { id: "gallery", label: "Gallery", icon: "image" },
+      { id: "library", label: "Library Batch", icon: "layers" },
+      { id: "settings", label: "Settings", icon: "settings" },
     ];
 
     this.navButtons.clear();
@@ -155,7 +171,9 @@ export class MediaLocalizerDrawerPanel {
       const btn = document.createElement("button");
       btn.type = "button";
       btn.className = `ml-drawer-nav-btn ${this.activeTab === t.id ? "is-active" : ""}`;
-      btn.textContent = t.label;
+      const labelSpan = document.createElement("span");
+      labelSpan.textContent = t.label;
+      btn.append(createIcon(t.icon, 13), labelSpan);
       btn.addEventListener("click", () => {
         this.setActiveTab(t.id);
       });
@@ -169,7 +187,92 @@ export class MediaLocalizerDrawerPanel {
 
     const body = document.createElement("div");
     body.className = "ml-drawer-body";
+    const recordScrollFromTarget = (targetEl: HTMLElement | null) => {
+      if (
+        !targetEl ||
+        targetEl.clientHeight === 0 ||
+        this.isRenderingBody ||
+        !this.renderedTab ||
+        this.renderedTab !== this.activeTab ||
+        this.isShowingPlaceholder(body) ||
+        body.isConnected === false
+      ) {
+        return;
+      }
+      if (targetEl !== this.cachedScrollContainer) {
+        this.cachedScrollContainer = null;
+        const activeScroller = this.getActiveScrollContainer();
+        if (activeScroller && targetEl !== activeScroller) {
+          return;
+        }
+      }
+      if (typeof targetEl.scrollTop === "number" && Number.isFinite(targetEl.scrollTop)) {
+        const nextTop = Math.max(0, targetEl.scrollTop);
+        if (
+          this.isSettlingScrollRestore &&
+          nextTop === 0 &&
+          this.tabScrollTops[this.renderedTab] > 0
+        ) {
+          return;
+        }
+        this.rememberedScrollContainer = targetEl;
+        this.tabScrollTops[this.renderedTab] = nextTop;
+      }
+    };
+    body.addEventListener(
+      "scroll",
+      () => {
+        recordScrollFromTarget(body);
+      },
+      { passive: true },
+    );
+
+    let offDocScroll: (() => void) | null = null;
+    if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
+      const onCaptureScroll = (ev: Event) => {
+        if (
+          this.isRenderingBody ||
+          !this.renderedTab ||
+          this.renderedTab !== this.activeTab ||
+          body.isConnected === false
+        ) {
+          return;
+        }
+        const rawTarget = ev.target;
+        if (!rawTarget || rawTarget === body) return;
+        const targetEl =
+          rawTarget === document
+            ? (document.scrollingElement as HTMLElement | null)
+            : (rawTarget as HTMLElement);
+        if (!targetEl || typeof targetEl.contains !== "function") return;
+        if (targetEl === this.cachedScrollContainer || targetEl.contains(body)) {
+          recordScrollFromTarget(targetEl);
+        }
+      };
+      document.addEventListener("scroll", onCaptureScroll, {
+        capture: true,
+        passive: true,
+      });
+      offDocScroll = () => {
+        document.removeEventListener("scroll", onCaptureScroll, {
+          capture: true,
+        });
+      };
+    }
+
+    let offWinResize: (() => void) | null = null;
+    if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+      const onResize = () => {
+        this.cachedScrollContainer = null;
+      };
+      window.addEventListener("resize", onResize, { passive: true });
+      offWinResize = () => {
+        window.removeEventListener("resize", onResize);
+      };
+    }
+
     this.bodyEl = body;
+    this.cachedScrollContainer = null;
 
     root.append(nav, bannerHost, body);
     container.appendChild(root);
@@ -181,6 +284,23 @@ export class MediaLocalizerDrawerPanel {
       if (this.mountGen === mountGen) {
         this.mountGen++;
       }
+      this.captureScrollPositions();
+      this.cancelScrollSettleTracker();
+      this.pendingScrollRestore?.cancel();
+      this.pendingScrollRestore = null;
+      offDocScroll?.();
+      offDocScroll = null;
+      offWinResize?.();
+      offWinResize = null;
+      this.rememberedScrollContainer = null;
+      this.cachedScrollContainer = null;
+      this.galleryHostEl = null;
+      if (container.style) {
+        container.style.width = prevContainerWidth;
+        container.style.height = prevContainerHeight;
+        container.style.minHeight = prevContainerMinHeight;
+      }
+      this.renderedTab = null;
       this.characterWidget?.flushPendingOverrideSave();
       this.characterWidget?.destroy();
       this.characterWidget = null;
@@ -197,16 +317,60 @@ export class MediaLocalizerDrawerPanel {
     characterId?: string | null,
     options?: { expandOptions?: boolean },
   ): void {
+    const prevCharId = this.resolveCurrentCharacterId();
     this.activeTab = tab;
     this.actionError = null;
     if (characterId !== undefined) {
       this.inspectedCharacterId = characterId;
     }
+    const nextCharId = this.resolveCurrentCharacterId();
+    const characterChanged =
+      tab === "character" && characterId !== undefined && nextCharId !== prevCharId;
+    if (characterChanged) {
+      this.tabScrollTops.character = 0;
+      this.clearCharacterInnerScrollTops();
+    }
     this.expandNextCharacterConfig = Boolean(options?.expandOptions);
     for (const [id, b] of this.navButtons.entries()) {
       b.classList.toggle("is-active", id === this.activeTab);
     }
-    this.renderBody();
+    this.renderBody(characterChanged && this.renderedTab === "character");
+  }
+
+  syncPreferencesFromStorage(): void {
+    const loaded = loadPrefsFromStorage(
+      CHARACTER_PREFS_STORAGE_KEY,
+      sanitizeCharacterPreferences,
+      () => getDefaultCharacterPreferences(true),
+    );
+    const prevThumbnailSize = this.characterUiState.thumbnailSize;
+    this.characterUiState = {
+      ...this.characterUiState,
+      showGreetingSubfilter: loaded.showGreetingSubfilter,
+      showWorldBookSubfilter: loaded.showWorldBookSubfilter,
+      showUrlPicker: loaded.showUrlPicker,
+      showRemoteThumbnails: loaded.showRemoteThumbnails,
+      mediaViewMode: loaded.mediaViewMode,
+      mediaFilter: loaded.mediaFilter,
+      thumbnailSize: loaded.thumbnailSize,
+    };
+    if (this.characterWidget) {
+      this.characterWidget.applySharedPreferences({
+        showGreetingSubfilter: loaded.showGreetingSubfilter,
+        showWorldBookSubfilter: loaded.showWorldBookSubfilter,
+        showUrlPicker: loaded.showUrlPicker,
+        showRemoteThumbnails: loaded.showRemoteThumbnails,
+        mediaViewMode: loaded.mediaViewMode,
+        mediaFilter: loaded.mediaFilter,
+        thumbnailSize: loaded.thumbnailSize,
+      });
+    } else if (
+      this.activeTab === "settings" &&
+      this.bodyEl &&
+      loaded.thumbnailSize !== prevThumbnailSize
+    ) {
+      this.renderBody();
+    }
   }
 
   private renderStickyQueueBanner(): void {
@@ -241,15 +405,16 @@ export class MediaLocalizerDrawerPanel {
 
     const wasActive = isQueueActiveStatus(prevStatus);
     const nowActive = isQueueActiveStatus(queueProgress.status);
+    const queueCompleted = wasActive && !nowActive;
 
-    const galleryInvalidated = stats.totalAssets !== prevStatsAssets;
+    const galleryInvalidated = stats.totalAssets !== prevStatsAssets || queueCompleted;
     if (galleryInvalidated) {
       this.invalidateGalleryCache();
     }
     if (
       galleryInvalidated ||
       stats.totalFailedUrls !== prevStatsFailed ||
-      (wasActive && !nowActive) ||
+      queueCompleted ||
       scanSettingsChanged
     ) {
       this.invalidateCharacterCache();
@@ -272,17 +437,21 @@ export class MediaLocalizerDrawerPanel {
     if (!this.bodyEl) return;
 
     if (this.activeTab === "gallery") {
-      if ((wasActive && !nowActive) || galleryInvalidated) {
+      if (queueCompleted || galleryInvalidated) {
         void this.galleryView?.refresh({ reshuffleRandom: false });
       }
       return;
     }
 
-    if (!dataChanged && (prevStatus === queueProgress.status || (wasActive && nowActive))) {
+    if (
+      !dataChanged &&
+      !queueCompleted &&
+      (prevStatus === queueProgress.status || (wasActive && nowActive))
+    ) {
       return;
     }
-    if (this.activeTab === "settings" && !dataChanged) return;
-    if (this.activeTab === "library" && !dataChanged) return;
+    if (this.activeTab === "settings" && !dataChanged && !queueCompleted) return;
+    if (this.activeTab === "library" && !dataChanged && !queueCompleted) return;
     this.renderBody();
   }
 
@@ -306,19 +475,28 @@ export class MediaLocalizerDrawerPanel {
   }
 
   notifyActiveChatChanged(): void {
-    this.inspectedCharacterId = null;
     if (this.activeTab === "character" && this.bodyEl) {
-      const nextId = this.resolveCurrentCharacterId();
       const currentId = this.characterWidget?.getCharacterId() ?? null;
+      const prevInspected = this.inspectedCharacterId;
+      this.inspectedCharacterId = null;
+      const nextId = this.resolveCurrentCharacterId();
       if (this.characterWidget && nextId && currentId === nextId) {
+        this.inspectedCharacterId = prevInspected;
         return;
       }
+      this.tabScrollTops.character = 0;
+      this.clearCharacterInnerScrollTops();
       if (this.characterWidget && nextId) {
+        this.applyTabScrollTop(0);
         this.characterWidget.setCharacterId(nextId);
         return;
       }
-      this.renderBody();
+      this.renderBody(true);
+      return;
     }
+    this.inspectedCharacterId = null;
+    this.tabScrollTops.character = 0;
+    this.clearCharacterInnerScrollTops();
   }
 
   invalidateCharacterCache(characterId?: string): void {
@@ -335,7 +513,13 @@ export class MediaLocalizerDrawerPanel {
       loadedIncludeEmpty: false,
       randomWeights: this.galleryCache.randomWeights,
     };
-    this.galleryView?.invalidateCache();
+    const isGalleryActiveInOpenDrawer =
+      Boolean(this.bodyEl) &&
+      this.activeTab === "gallery" &&
+      Boolean(this.galleryView);
+    if (!isGalleryActiveInOpenDrawer) {
+      this.galleryView?.invalidateCache();
+    }
   }
 
   private invalidateLibrarySummaries(): void {
@@ -400,57 +584,207 @@ export class MediaLocalizerDrawerPanel {
     return null;
   }
 
-  private renderBody(): void {
+  private isShowingPlaceholder(body: HTMLElement): boolean {
+    if (this.renderedTab !== "gallery") return false;
+    const host = this.galleryHostEl;
+    const wrap = host?.firstElementChild ?? host?.children?.[0];
+    if (wrap && wrap.children) {
+      for (let i = 0; i < wrap.children.length; i++) {
+        if (wrap.children[i]?.classList?.contains("ml-placeholder")) {
+          return true;
+        }
+      }
+      return false;
+    }
+    return Boolean(body.querySelector(".ml-placeholder"));
+  }
+
+  private getActiveScrollContainer(): HTMLElement | null {
+    const body = this.bodyEl;
+    if (!body) return null;
+    const cached = this.cachedScrollContainer;
+    if (
+      cached &&
+      cached.isConnected !== false &&
+      (cached === body || (typeof cached.contains === "function" && cached.contains(body)))
+    ) {
+      return cached;
+    }
+    const resolved = resolveScrollContainer(body, this.rememberedScrollContainer, body);
+    if (resolved && isElementScrollable(resolved)) {
+      this.cachedScrollContainer = resolved;
+    } else {
+      this.cachedScrollContainer = null;
+    }
+    return resolved;
+  }
+
+  private readTabScrollTop(): number {
+    const scroller = this.getActiveScrollContainer();
+    if (scroller && typeof scroller.scrollTop === "number" && Number.isFinite(scroller.scrollTop)) {
+      this.rememberedScrollContainer = scroller;
+      return Math.max(0, scroller.scrollTop);
+    }
+    return this.tabScrollTops[this.activeTab] ?? 0;
+  }
+
+  private clearCharacterInnerScrollTops(): void {
+    for (const key of [
+      "localized-asset-grid",
+      "url-picker-list",
+      "greetings-subfilter",
+      "worldbooks-subfilter",
+    ]) {
+      this.innerScrollTops.delete(key);
+    }
+  }
+
+  private cancelScrollSettleTracker(): void {
+    if (typeof cancelAnimationFrame === "function") {
+      for (const id of this.scrollSettleRafIds) {
+        cancelAnimationFrame(id);
+      }
+    }
+    this.scrollSettleRafIds = [];
+    this.isSettlingScrollRestore = false;
+  }
+
+  private applyTabScrollTop(scrollTop: number): void {
+    const mountGen = this.mountGen;
+    this.cancelScrollSettleTracker();
+    this.pendingScrollRestore = applyScrollTopWithSettlement(
+      () => this.getActiveScrollContainer(),
+      scrollTop,
+      this.pendingScrollRestore,
+      () => !this.bodyEl || this.mountGen !== mountGen,
+    );
+    this.isSettlingScrollRestore = Boolean(this.pendingScrollRestore);
+    if (this.pendingScrollRestore && typeof requestAnimationFrame === "function") {
+      const raf1 = requestAnimationFrame(() => {
+        if (this.mountGen !== mountGen) return;
+        const raf2 = requestAnimationFrame(() => {
+          if (this.mountGen !== mountGen) return;
+          this.isSettlingScrollRestore = false;
+          this.scrollSettleRafIds = [];
+        });
+        this.scrollSettleRafIds = [raf2];
+      });
+      this.scrollSettleRafIds = [raf1];
+    }
+  }
+
+  restoreScrollIfReset(): void {
+    const body = this.bodyEl;
+    if (!body || this.isRenderingBody || this.isShowingPlaceholder(body)) return;
+    const saved = this.tabScrollTops[this.activeTab] ?? 0;
+    if (saved > 0 && this.readTabScrollTop() === 0) {
+      this.applyTabScrollTop(saved);
+    }
+  }
+
+  private captureScrollPositions(): void {
+    const body = this.bodyEl;
+    if (!body || !this.renderedTab) return;
+    if (!this.isShowingPlaceholder(body) && body.isConnected !== false && body.clientHeight !== 0) {
+      const scroller = this.getActiveScrollContainer();
+      if (
+        scroller &&
+        scroller.clientHeight !== 0 &&
+        typeof scroller.scrollTop === "number" &&
+        Number.isFinite(scroller.scrollTop)
+      ) {
+        const nextTop = Math.max(0, scroller.scrollTop);
+        if (
+          !(
+            this.isSettlingScrollRestore &&
+            nextTop === 0 &&
+            this.tabScrollTops[this.renderedTab] > 0
+          )
+        ) {
+          this.rememberedScrollContainer = scroller;
+          this.tabScrollTops[this.renderedTab] = nextTop;
+        }
+      }
+    }
+    for (const el of body.querySelectorAll<HTMLElement>("[data-scroll-id]")) {
+      const id = el.dataset.scrollId;
+      if (id && typeof el.scrollTop === "number" && Number.isFinite(el.scrollTop)) {
+        this.innerScrollTops.set(id, Math.max(0, el.scrollTop));
+      }
+    }
+  }
+
+  private restoreScrollPositions(): void {
+    const body = this.bodyEl;
+    if (!body) return;
+    for (const el of body.querySelectorAll<HTMLElement>("[data-scroll-id]")) {
+      const id = el.dataset.scrollId;
+      if (!id) continue;
+      const saved = this.innerScrollTops.get(id);
+      if (saved !== undefined) {
+        el.scrollTop = saved;
+      }
+    }
+    this.applyTabScrollTop(this.tabScrollTops[this.activeTab] ?? 0);
+  }
+
+  private renderBody(skipCaptureScroll = false): void {
     const body = this.bodyEl;
     if (!body) return;
 
-    const savedBodyScrollTop = body.scrollTop;
-    const savedInnerScrolls = new Map<string, number>();
-    for (const el of body.querySelectorAll<HTMLElement>("[data-scroll-id]")) {
-      const id = el.dataset.scrollId;
-      if (id && el.scrollTop > 0) {
-        savedInnerScrolls.set(id, el.scrollTop);
+    if (!skipCaptureScroll) {
+      this.captureScrollPositions();
+    }
+    this.isRenderingBody = true;
+    this.cachedScrollContainer = null;
+    this.galleryHostEl = null;
+    try {
+      this.characterWidget?.flushPendingOverrideSave();
+      this.characterWidget?.destroy();
+      this.characterWidget = null;
+      this.galleryView?.destroy();
+      this.galleryView = null;
+      body.innerHTML = "";
+      this.renderedTab = this.activeTab;
+
+      if (this.actionError) {
+        const errBox = document.createElement("div");
+        errBox.className = "ml-error-banner";
+        const errText = document.createElement("span");
+        errText.textContent = `Error: ${this.actionError}`;
+        errBox.append(createIcon("alert", 14), errText);
+        body.appendChild(errBox);
       }
-    }
 
-    this.characterWidget?.flushPendingOverrideSave();
-    this.characterWidget?.destroy();
-    this.characterWidget = null;
-    this.galleryView?.destroy();
-    this.galleryView = null;
-    body.innerHTML = "";
+      if (this.activeTab === "character") {
+        this.renderCharacterTab(body);
+      } else if (this.activeTab === "gallery") {
+        this.renderGalleryTab(body);
+      } else if (this.activeTab === "library") {
+        this.renderLibraryTab(body);
+      } else {
+        this.renderSettingsTab(body);
+      }
 
-    if (this.actionError) {
-      const errBox = document.createElement("div");
-      errBox.className = "ml-error-banner";
-      errBox.textContent = `Error: ${this.actionError}`;
-      body.appendChild(errBox);
+      this.restoreScrollPositions();
+    } finally {
+      this.isRenderingBody = false;
     }
-
-    if (this.activeTab === "character") {
-      this.renderCharacterTab(body);
-    } else if (this.activeTab === "gallery") {
-      this.renderGalleryTab(body);
-    } else if (this.activeTab === "library") {
-      this.renderLibraryTab(body);
-    } else {
-      this.renderSettingsTab(body);
-    }
-
-    for (const [id, top] of savedInnerScrolls.entries()) {
-      const el = body.querySelector<HTMLElement>(`[data-scroll-id="${id}"]`);
-      if (el) el.scrollTop = top;
-    }
-    body.scrollTop = savedBodyScrollTop;
   }
 
   private renderCharacterTab(body: HTMLElement): void {
     const charId = this.resolveCurrentCharacterId();
     if (!charId) {
       const empty = document.createElement("div");
-      empty.className = "ml-section-box ml-empty";
-      empty.textContent =
+      empty.className = "ml-section ml-empty ml-empty-card";
+      const iconWrap = document.createElement("div");
+      iconWrap.className = "ml-empty-icon";
+      iconWrap.appendChild(createIcon("image", 20));
+      const textEl = document.createElement("div");
+      textEl.className = "ml-empty-text";
+      textEl.textContent =
         "Open a character chat or Character Editor to inspect and localize its media.";
+      empty.append(iconWrap, textEl);
       body.appendChild(empty);
       return;
     }
@@ -475,10 +809,20 @@ export class MediaLocalizerDrawerPanel {
     host.style.marginTop = "0";
     body.appendChild(host);
 
+    const onOpenCharacterEditor =
+      this.callbacks.onOpenCharacterEditor ??
+      (canOpenNativeCharacterEditor(this.ctx)
+        ? (targetCharId: string) => {
+            void openNativeCharacterEditor(this.ctx, targetCharId);
+          }
+        : undefined);
+
     const widgetCallbacks: CharacterMediaWidgetCallbacks = {
       ...this.callbacks,
+      onOpenCharacterEditor,
       onPurgeCharacterCache: async (targetCharId, urls) => {
         await this.callbacks.onPurgeCharacterCache(targetCharId, urls);
+        clearWarmGalleryThumbs();
         this.invalidateGalleryCache();
         this.invalidateLibrarySummaries();
       },
@@ -506,6 +850,7 @@ export class MediaLocalizerDrawerPanel {
             CHARACTER_PREFS_STORAGE_KEY,
             sanitizeCharacterPreferences(this.characterUiState, true),
           );
+          this.options?.onCharacterPrefsUpdated?.();
         },
         onScanChange: (nextScan) => {
           if (nextScan) {
@@ -524,7 +869,16 @@ export class MediaLocalizerDrawerPanel {
 
   private renderGalleryTab(body: HTMLElement): void {
     const host = document.createElement("div");
+    this.galleryHostEl = host;
     body.appendChild(host);
+
+    const onOpenCharacterEditor =
+      this.callbacks.onOpenCharacterEditor ??
+      (canOpenNativeCharacterEditor(this.ctx)
+        ? (characterId: string) => {
+            void openNativeCharacterEditor(this.ctx, characterId);
+          }
+        : undefined);
 
     const gallery = new LibraryGalleryView(
       host,
@@ -532,12 +886,14 @@ export class MediaLocalizerDrawerPanel {
         onLoadLibraryMedia: this.callbacks.onListLibraryMedia,
         onPurgeAsset: async (characterId, normalizedUrl) => {
           await this.callbacks.onPurgeCharacterCache(characterId, [normalizedUrl]);
+          clearWarmGalleryThumbs();
           this.invalidateCharacterCache(characterId);
           this.invalidateLibrarySummaries();
         },
         onOpenCharacterTab: (characterId) => {
           this.setActiveTab("character", characterId);
         },
+        onOpenCharacterEditor,
         onStateChange: (nextState) => {
           this.galleryState = {
             ...nextState,
@@ -552,8 +908,30 @@ export class MediaLocalizerDrawerPanel {
           this.galleryCache = nextCache;
         },
         onScrollToTop: () => {
-          if (this.bodyEl) {
-            this.bodyEl.scrollTop = 0;
+          this.tabScrollTops.gallery = 0;
+          this.cachedScrollContainer = null;
+          if (this.bodyEl && this.renderedTab === "gallery") {
+            this.applyTabScrollTop(0);
+          }
+        },
+        onGetScrollTop: () => {
+          const bodyEl = this.bodyEl;
+          if (
+            bodyEl &&
+            this.renderedTab === "gallery" &&
+            !this.isRenderingBody &&
+            !this.isShowingPlaceholder(bodyEl)
+          ) {
+            return this.readTabScrollTop();
+          }
+          return this.tabScrollTops.gallery;
+        },
+        onSetScrollTop: (scrollTop) => {
+          const next = Number.isFinite(scrollTop) && scrollTop >= 0 ? scrollTop : 0;
+          this.tabScrollTops.gallery = next;
+          this.cachedScrollContainer = null;
+          if (this.bodyEl && this.renderedTab === "gallery") {
+            this.applyTabScrollTop(next);
           }
         },
       },
@@ -568,9 +946,6 @@ export class MediaLocalizerDrawerPanel {
   }
 
   private renderLibraryTab(body: HTMLElement): void {
-    const scanBox = document.createElement("div");
-    scanBox.className = "ml-section-box";
-
     const topBar = document.createElement("div");
     topBar.className = "ml-header-bar";
 
@@ -578,8 +953,9 @@ export class MediaLocalizerDrawerPanel {
     info.className = "ml-inline-title";
     const title = document.createElement("span");
     title.className = "ml-title";
-    title.textContent = "Library Scanner & Batch Operations";
+    title.textContent = "Library Scanner & Batch";
     info.append(
+      createIcon("layers", 14),
       title,
       createInfoTip(
         "Scans characters, World Books, and Regex scripts locally with zero network traffic so you can batch-download or clear storage.",
@@ -594,8 +970,8 @@ export class MediaLocalizerDrawerPanel {
           ? "Rescan Library"
           : "Scan Library",
       title: "Scan all characters, linked World Books, and Regex scripts locally",
-      className: `ml-btn is-primary ${this.libraryScanning ? "is-busy" : ""}`,
-      size: 14,
+      className: `ml-btn is-primary is-sm ${this.libraryScanning ? "is-busy" : ""}`,
+      size: 13,
       disabled: this.libraryScanning,
       onClick: async () => {
         const mountGen = this.mountGen;
@@ -611,6 +987,8 @@ export class MediaLocalizerDrawerPanel {
           this.librarySummariesStale = false;
           this.libraryTotalRemote = res.totalUniqueRemote;
           this.libraryPage = 1;
+          this.tabScrollTops.library = 0;
+          this.innerScrollTops.set("library-char-list", 0);
           this.librarySelectedCharIds = new Set(
             res.characters
               .filter((c) => c.remoteCount + c.failedCount > 0)
@@ -630,40 +1008,93 @@ export class MediaLocalizerDrawerPanel {
     });
 
     topBar.append(info, scanBtn);
-    scanBox.appendChild(topBar);
-    body.appendChild(scanBox);
 
-    if (!this.librarySummaries) return;
+    if (!this.librarySummaries) {
+      const scanSection = document.createElement("div");
+      scanSection.className = "ml-section";
+      const intro = document.createElement("div");
+      intro.className = "ml-lib-intro";
+      intro.textContent =
+        "Scan your character cards, linked World Books, and Regex scripts locally with zero network traffic to filter by section, batch-download, or purge cached media.";
+      scanSection.append(topBar, intro);
+      body.appendChild(scanSection);
+      return;
+    }
+
+    const scanSection = document.createElement("div");
+    scanSection.className = "ml-section";
+    scanSection.appendChild(topBar);
+
+    const summaryStrip = document.createElement("div");
+    summaryStrip.className = "ml-stat-strip";
+    const totalLocal = this.librarySummaries.reduce((sum, c) => sum + c.localizedCount, 0);
+    const totalFailed = this.librarySummaries.reduce((sum, c) => sum + c.failedCount, 0);
+    const totalBytes = this.librarySummaries.reduce((sum, c) => sum + c.localizedBytes, 0);
+    const addLibChip = (label: string, variant: string) => {
+      const chip = document.createElement("span");
+      chip.className = `ml-stat-chip ${variant}`;
+      chip.textContent = label;
+      summaryStrip.appendChild(chip);
+    };
+    addLibChip(`${this.librarySummaries.length} chars`, "is-muted");
+    addLibChip(
+      `${this.libraryTotalRemote} remote`,
+      this.libraryTotalRemote > 0 ? "is-warn" : "is-muted",
+    );
+    addLibChip(
+      `${totalLocal} local${totalBytes > 0 ? ` (${formatBytes(totalBytes)})` : ""}`,
+      totalLocal > 0 ? "is-success" : "is-muted",
+    );
+    if (totalFailed > 0) {
+      addLibChip(`${totalFailed} failed`, "is-danger");
+    }
+    scanSection.appendChild(summaryStrip);
 
     if (this.librarySummariesStale) {
       const staleNote = document.createElement("div");
-      staleNote.className = "ml-section-box ml-subtitle";
-      staleNote.textContent =
+      staleNote.className = "ml-warn-banner";
+      const staleText = document.createElement("span");
+      staleText.textContent =
         "Library media changed since last scan. Click Rescan Library to refresh counts.";
-      body.appendChild(staleNote);
+      staleNote.append(createIcon("alert", 14), staleText);
+      scanSection.appendChild(staleNote);
     }
+    body.appendChild(scanSection);
 
-    const filterBox = document.createElement("div");
-    filterBox.className = "ml-section-box";
+    const filterSection = document.createElement("div");
+    filterSection.className = "ml-section";
 
     const secHeader = document.createElement("div");
     secHeader.className = "ml-section-title";
     const secLeft = document.createElement("div");
     secLeft.className = "ml-inline-title";
+    const secStep = document.createElement("span");
+    secStep.className = "ml-step-num";
+    secStep.textContent = "1";
+    const secText = document.createElement("span");
+    secText.textContent = "Sections to Download";
     secLeft.append(
-      document.createTextNode("1. Sections to Download"),
+      secStep,
+      secText,
       createInfoTip("Only remote items found inside checked sections are queued across selected characters."),
     );
     secHeader.appendChild(secLeft);
-    filterBox.appendChild(secHeader);
+    filterSection.appendChild(secHeader);
 
     let charHeaderTitle!: HTMLSpanElement;
+    let charHeaderText!: HTMLSpanElement;
     let listSlotEl!: HTMLElement;
     let footerSlotEl!: HTMLElement;
     const cardCheckboxes = new Map<string, HTMLInputElement>();
+    const cardElements = new Map<string, HTMLElement>();
 
     const updateHeaderSummary = () => {
-      charHeaderTitle.textContent = `2. Characters (${this.librarySelectedCharIds.size} selected · ${this.libraryTotalRemote} unique remote)`;
+      const text = `Characters (${this.librarySelectedCharIds.size} sel · ${this.libraryTotalRemote} remote)`;
+      if (charHeaderText) {
+        charHeaderText.textContent = text;
+      } else {
+        charHeaderTitle.textContent = `2. ${text}`;
+      }
     };
 
     const buildCharDetails = (c: LibraryCharacterSummary): HTMLElement => {
@@ -796,6 +1227,7 @@ export class MediaLocalizerDrawerPanel {
                 for (const id of targetIds) {
                   this.invalidateCharacterCache(id);
                 }
+                clearWarmGalleryThumbs();
                 this.invalidateGalleryCache();
               }, "library");
               if (
@@ -885,6 +1317,7 @@ export class MediaLocalizerDrawerPanel {
       const slot = document.createElement("div");
       slot.className = "ml-stack";
       cardCheckboxes.clear();
+      cardElements.clear();
 
       const visibleChars = (this.librarySummaries ?? []).filter(
         (c) => !this.libraryOnlyWithRemote || c.remoteCount + c.failedCount > 0,
@@ -897,63 +1330,82 @@ export class MediaLocalizerDrawerPanel {
       const endIndex = Math.min(totalItems, startIndex + LIBRARY_BATCH_PAGE_SIZE);
       const pageChars = visibleChars.slice(startIndex, endIndex);
 
-      if (totalItems > 0) {
+      if (totalPages > 1) {
         const pagBar = document.createElement("div");
         pagBar.className = "ml-gallery-pagination";
 
         const pagInfo = document.createElement("div");
         pagInfo.className = "ml-gallery-pagination-info";
         const pagText = document.createElement("span");
-        pagText.textContent =
-          totalPages > 1
-            ? `Showing ${startIndex + 1}–${endIndex} of ${totalItems} characters`
-            : `${totalItems} character${totalItems === 1 ? "" : "s"}`;
+        pagText.textContent = `Showing ${startIndex + 1}–${endIndex} of ${totalItems} characters`;
         pagInfo.appendChild(pagText);
         pagBar.appendChild(pagInfo);
 
-        if (totalPages > 1) {
-          const pagActions = document.createElement("div");
-          pagActions.className = "ml-gallery-pagination-actions";
-          const prevBtn = createIconButton({
-            icon: "chevron-left",
-            label: "Prev",
-            title: "Previous page",
-            className: "ml-btn is-sm",
-            size: 12,
-            disabled: page <= 1,
-            onClick: () => {
-              this.libraryPage = Math.max(1, page - 1);
-              rerenderCharList();
-            },
-          });
-          const pageLabel = document.createElement("span");
-          pageLabel.className = "ml-url-sources";
-          pageLabel.textContent = `Page ${page} / ${totalPages}`;
-          const nextBtn = createIconButton({
-            icon: "chevron-right",
-            label: "Next",
-            title: "Next page",
-            className: "ml-btn is-sm",
-            size: 12,
-            disabled: page >= totalPages,
-            onClick: () => {
-              this.libraryPage = Math.min(totalPages, page + 1);
-              rerenderCharList();
-            },
-          });
-          pagActions.append(prevBtn, pageLabel, nextBtn);
-          pagBar.appendChild(pagActions);
-        }
+        const pagActions = document.createElement("div");
+        pagActions.className = "ml-gallery-pagination-actions";
+        const prevBtn = createIconButton({
+          icon: "chevron-left",
+          label: "Prev",
+          title: "Previous page",
+          className: "ml-btn is-sm",
+          size: 12,
+          disabled: page <= 1,
+          onClick: () => {
+            this.libraryPage = Math.max(1, page - 1);
+            rerenderCharList({ resetListScroll: true });
+          },
+        });
+        const pageLabel = document.createElement("span");
+        pageLabel.className = "ml-url-sources";
+        pageLabel.textContent = `Page ${page} / ${totalPages}`;
+        const nextBtn = createIconButton({
+          icon: "chevron-right",
+          label: "Next",
+          title: "Next page",
+          className: "ml-btn is-sm",
+          size: 12,
+          disabled: page >= totalPages,
+          onClick: () => {
+            this.libraryPage = Math.min(totalPages, page + 1);
+            rerenderCharList({ resetListScroll: true });
+          },
+        });
+        pagActions.append(prevBtn, pageLabel, nextBtn);
+        pagBar.appendChild(pagActions);
         slot.appendChild(pagBar);
       }
 
       const charList = document.createElement("div");
-      charList.className = "ml-url-list";
+      charList.className = "ml-url-list is-tall";
       charList.dataset.scrollId = "library-char-list";
+      charList.addEventListener(
+        "scroll",
+        () => {
+          if (
+            !this.isRenderingBody &&
+            typeof charList.scrollTop === "number" &&
+            Number.isFinite(charList.scrollTop)
+          ) {
+            this.innerScrollTops.set("library-char-list", Math.max(0, charList.scrollTop));
+          }
+        },
+        { passive: true },
+      );
+      if (pageChars.length === 0) {
+        const emptyList = document.createElement("div");
+        emptyList.className = "ml-empty";
+        emptyList.textContent =
+          (this.librarySummaries?.length ?? 0) === 0
+            ? "No character cards found in your library."
+            : "All scanned characters are localized. Uncheck \"Remote only\" to view them.";
+        charList.appendChild(emptyList);
+      }
       for (const c of pageChars) {
         const isExpanded = this.libraryExpandedCharIds.has(c.characterId);
+        const isSelected = this.librarySelectedCharIds.has(c.characterId);
         const card = document.createElement("div");
-        card.className = `ml-lib-item-card ${isExpanded ? "is-expanded" : ""}`;
+        card.className = `ml-lib-item-card ${isExpanded ? "is-expanded" : ""} ${isSelected ? "is-selected" : ""}`.trim();
+        cardElements.set(c.characterId, card);
 
         const row = document.createElement("div");
         row.className = "ml-lib-row";
@@ -963,19 +1415,37 @@ export class MediaLocalizerDrawerPanel {
         const cb = document.createElement("input");
         cb.type = "checkbox";
         cb.className = "ml-row-checkbox";
-        cb.checked = this.librarySelectedCharIds.has(c.characterId);
+        cb.checked = isSelected;
         cb.addEventListener("click", (e) => e.stopPropagation());
         cb.addEventListener("change", () => {
-          if (cb.checked) this.librarySelectedCharIds.add(c.characterId);
-          else this.librarySelectedCharIds.delete(c.characterId);
+          if (cb.checked) {
+            this.librarySelectedCharIds.add(c.characterId);
+            card.classList.add("is-selected");
+          } else {
+            this.librarySelectedCharIds.delete(c.characterId);
+            card.classList.remove("is-selected");
+          }
           updateSummaryAndFooter();
         });
         cardCheckboxes.set(c.characterId, cb);
 
+        const dot = document.createElement("span");
+        const dotVariant =
+          c.failedCount > 0
+            ? "is-danger"
+            : c.remoteCount > 0
+              ? "is-warn"
+              : c.localizedCount > 0
+                ? "is-success"
+                : "is-muted";
+        dot.className = `ml-status-dot ${dotVariant}`;
+        dot.setAttribute("aria-hidden", "true");
+
         const nameSpan = document.createElement("span");
-        nameSpan.style.fontWeight = "500";
+        nameSpan.className = "ml-lib-char-name";
         nameSpan.textContent = c.characterName;
-        left.append(cb, nameSpan);
+        nameSpan.title = c.characterName;
+        left.append(cb, dot, nameSpan);
 
         const right = document.createElement("div");
         right.className = "ml-header-actions";
@@ -984,13 +1454,17 @@ export class MediaLocalizerDrawerPanel {
         badge.className = `ml-badge ${pending > 0 ? "is-warn" : "is-success"}`;
         badge.textContent =
           pending > 0
-            ? `${pending} remote (${c.localizedCount}/${c.totalUnique} local)`
+            ? `${pending} rem · ${c.localizedCount}/${c.totalUnique}`
             : `${c.localizedCount}/${c.totalUnique} local`;
+        badge.title =
+          pending > 0
+            ? `${pending} remote/failed, ${c.localizedCount} of ${c.totalUnique} localized`
+            : `${c.localizedCount} of ${c.totalUnique} localized`;
         right.appendChild(badge);
 
         if (c.localizedBytes > 0) {
           const sizeBadge = document.createElement("span");
-          sizeBadge.className = "ml-badge";
+          sizeBadge.className = "ml-badge is-muted";
           sizeBadge.textContent = formatBytes(c.localizedBytes);
           right.appendChild(sizeBadge);
         }
@@ -1032,10 +1506,27 @@ export class MediaLocalizerDrawerPanel {
       return slot;
     };
 
-    const rerenderCharList = () => {
+    const rerenderCharList = (options?: { resetListScroll?: boolean }) => {
+      const prevBodyScroll = this.readTabScrollTop();
+      const prevCharList = listSlotEl.querySelector<HTMLElement>(
+        '[data-scroll-id="library-char-list"]',
+      );
+      const prevListScroll = options?.resetListScroll
+        ? 0
+        : prevCharList && typeof prevCharList.scrollTop === "number"
+          ? Math.max(0, prevCharList.scrollTop)
+          : (this.innerScrollTops.get("library-char-list") ?? 0);
       const nextSlot = buildCharListSlot();
       listSlotEl.replaceWith(nextSlot);
       listSlotEl = nextSlot;
+      this.innerScrollTops.set("library-char-list", prevListScroll);
+      const nextCharList = nextSlot.querySelector<HTMLElement>(
+        '[data-scroll-id="library-char-list"]',
+      );
+      if (nextCharList) {
+        nextCharList.scrollTop = prevListScroll;
+      }
+      this.applyTabScrollTop(prevBodyScroll);
     };
 
     const secRow = document.createElement("div");
@@ -1058,11 +1549,21 @@ export class MediaLocalizerDrawerPanel {
       });
       secRow.appendChild(pill);
     }
-    filterBox.appendChild(secRow);
+    filterSection.appendChild(secRow);
+    body.appendChild(filterSection);
+
+    const charsSection = document.createElement("div");
+    charsSection.className = "ml-section";
 
     const charHeader = document.createElement("div");
-    charHeader.className = "ml-section-title";
+    charHeader.className = "ml-batch-char-header";
     charHeaderTitle = document.createElement("span");
+    charHeaderTitle.className = "ml-section-title";
+    const charStep = document.createElement("span");
+    charStep.className = "ml-step-num";
+    charStep.textContent = "2";
+    charHeaderText = document.createElement("span");
+    charHeaderTitle.append(charStep, charHeaderText);
     updateHeaderSummary();
 
     const charHeaderBtns = document.createElement("div");
@@ -1078,7 +1579,7 @@ export class MediaLocalizerDrawerPanel {
       if (onlyRemoteCb.checked === this.libraryOnlyWithRemote) return;
       this.libraryOnlyWithRemote = onlyRemoteCb.checked;
       this.libraryPage = 1;
-      rerenderCharList();
+      rerenderCharList({ resetListScroll: true });
       updateSummaryAndFooter();
     });
     onlyRemoteLabel.append(onlyRemoteCb, document.createTextNode("Remote only"));
@@ -1093,6 +1594,7 @@ export class MediaLocalizerDrawerPanel {
           this.librarySelectedCharIds.add(c.characterId);
           const cb = cardCheckboxes.get(c.characterId);
           if (cb) cb.checked = true;
+          cardElements.get(c.characterId)?.classList.add("is-selected");
         }
       }
       updateSummaryAndFooter();
@@ -1107,74 +1609,168 @@ export class MediaLocalizerDrawerPanel {
       for (const cb of cardCheckboxes.values()) {
         cb.checked = false;
       }
+      for (const card of cardElements.values()) {
+        card.classList.remove("is-selected");
+      }
       updateSummaryAndFooter();
     });
 
     charHeaderBtns.append(onlyRemoteLabel, selAllBtn, clearAllBtn);
     charHeader.append(charHeaderTitle, charHeaderBtns);
-    filterBox.appendChild(charHeader);
+    charsSection.appendChild(charHeader);
 
     listSlotEl = buildCharListSlot();
-    filterBox.appendChild(listSlotEl);
+    charsSection.appendChild(listSlotEl);
 
     footerSlotEl = buildFooter();
-    filterBox.appendChild(footerSlotEl);
-    body.appendChild(filterBox);
+    charsSection.appendChild(footerSlotEl);
+    body.appendChild(charsSection);
   }
 
   private renderSettingsTab(body: HTMLElement): void {
     // 1. Storage & Cache Summary
-    const statsBox = document.createElement("div");
-    statsBox.className = "ml-section-box";
-    const statsTitle = document.createElement("div");
-    statsTitle.className = "ml-section-title";
-    statsTitle.textContent = "Localized Cache Summary";
-
+    const statsSection = document.createElement("div");
+    statsSection.className = "ml-section";
     const statsRow = document.createElement("div");
     statsRow.className = "ml-header-bar";
-    const statsInfo = document.createElement("div");
-    statsInfo.textContent = `${this.stats.totalAssets} cached URLs · ${formatBytes(
-      this.stats.totalSizeBytes,
-    )} total · ${this.stats.totalFailedUrls} failed`;
+    const statsLeft = document.createElement("div");
+    statsLeft.className = "ml-inline-stats";
+    const statsTitle = document.createElement("span");
+    statsTitle.className = "ml-section-title";
+    const statsTitleText = document.createElement("span");
+    statsTitleText.textContent = "Localized Cache Summary";
+    statsTitle.append(createIcon("database", 14), statsTitleText);
 
-    const clearFailedBtn = document.createElement("button");
-    clearFailedBtn.type = "button";
-    clearFailedBtn.className = "ml-btn is-sm";
-    clearFailedBtn.disabled = this.stats.totalFailedUrls === 0;
-    clearFailedBtn.textContent = `Clear Failed (${this.stats.totalFailedUrls})`;
-    clearFailedBtn.addEventListener("click", async () => {
-      const mountGen = this.mountGen;
-      await this.guard(async () => {
-        await this.callbacks.onClearFailed();
-        this.invalidateCharacterCache();
-        if (this.librarySummaries !== null) {
-          this.librarySummariesStale = true;
+    const statsStrip = document.createElement("div");
+    statsStrip.className = "ml-stat-strip";
+    const addStatChip = (label: string, variant: string) => {
+      const chip = document.createElement("span");
+      chip.className = `ml-stat-chip ${variant}`;
+      chip.textContent = label;
+      statsStrip.appendChild(chip);
+    };
+    addStatChip(`${this.stats.totalAssets} URLs`, "is-info");
+    addStatChip(formatBytes(this.stats.totalSizeBytes), "is-muted");
+    addStatChip(
+      `${this.stats.totalFailedUrls} failed`,
+      this.stats.totalFailedUrls > 0 ? "is-danger" : "is-muted",
+    );
+    statsLeft.append(statsTitle, statsStrip);
+
+    const clearFailedBtn = createIconButton({
+      icon: "trash",
+      label: `Clear Failed (${this.stats.totalFailedUrls})`,
+      title: "Clear all recorded failed download URLs",
+      className: "ml-btn is-sm",
+      size: 12,
+      disabled: this.stats.totalFailedUrls === 0,
+      onClick: async () => {
+        const mountGen = this.mountGen;
+        await this.guard(async () => {
+          await this.callbacks.onClearFailed();
+          this.invalidateCharacterCache();
+          if (this.librarySummaries !== null) {
+            this.librarySummariesStale = true;
+          }
+        }, "settings");
+        if (this.activeTab === "settings" && this.bodyEl && this.mountGen === mountGen) {
+          this.renderBody();
         }
-      }, "settings");
-      if (this.activeTab === "settings" && this.bodyEl && this.mountGen === mountGen) {
-        this.renderBody();
-      }
+      },
     });
 
-    statsRow.append(statsInfo, clearFailedBtn);
-    statsBox.append(statsTitle, statsRow);
-    body.appendChild(statsBox);
+    statsRow.append(statsLeft, clearFailedBtn);
+    statsSection.appendChild(statsRow);
+    body.appendChild(statsSection);
+
+    // 1b. Display & Thumbnails
+    const displaySection = document.createElement("div");
+    displaySection.className = "ml-section";
+    const displayTitleRow = document.createElement("div");
+    displayTitleRow.className = "ml-section-title";
+    const displayTitleLeft = document.createElement("div");
+    displayTitleLeft.className = "ml-inline-title";
+    const displayTitleText = document.createElement("span");
+    displayTitleText.textContent = "Display & Thumbnails";
+    displayTitleLeft.append(
+      createIcon("image", 14),
+      displayTitleText,
+      createInfoTip(
+        "Choose Small (S), Medium (M), or Large (L) thumbnail presets independently for Gallery and Character Media views. Large also loads higher-resolution thumbnails for local images.",
+      ),
+    );
+    displayTitleRow.appendChild(displayTitleLeft);
+    displaySection.appendChild(displayTitleRow);
+
+    const displayGrid = document.createElement("div");
+    displayGrid.className = "ml-check-grid";
+
+    const addThumbSizeCard = (
+      label: string,
+      control: HTMLElement,
+    ) => {
+      const card = document.createElement("div");
+      card.className = "ml-check-card";
+      const lbl = document.createElement("span");
+      lbl.textContent = label;
+      card.append(lbl, control);
+      displayGrid.appendChild(card);
+    };
+
+    addThumbSizeCard(
+      "Gallery Thumbnails",
+      createThumbnailSizeSegmented(this.galleryState.thumbnailSize, (nextSize) => {
+        this.galleryState = {
+          ...this.galleryState,
+          thumbnailSize: nextSize,
+        };
+        savePrefsToStorage(
+          GALLERY_PREFS_STORAGE_KEY,
+          sanitizeGalleryPreferences(this.galleryState),
+        );
+      }),
+    );
+
+    addThumbSizeCard(
+      "Character Media Thumbnails",
+      createThumbnailSizeSegmented(
+        this.characterUiState.thumbnailSize,
+        (nextSize) => {
+          this.characterUiState = {
+            ...this.characterUiState,
+            thumbnailSize: nextSize,
+          };
+          savePrefsToStorage(
+            CHARACTER_PREFS_STORAGE_KEY,
+            sanitizeCharacterPreferences(this.characterUiState, true),
+          );
+          this.characterWidget?.applySharedPreferences({ thumbnailSize: nextSize });
+          this.options?.onCharacterPrefsUpdated?.();
+        },
+      ),
+    );
+
+    displaySection.appendChild(displayGrid);
+    body.appendChild(displaySection);
 
     // 2. Global Download Defaults (applies to one-click Localize, Portrait button, and Library Batch)
-    const defaultsBox = document.createElement("div");
-    defaultsBox.className = "ml-section-box";
+    const defaultsSection = document.createElement("div");
+    defaultsSection.className = "ml-section";
     const defTitleRow = document.createElement("div");
     defTitleRow.className = "ml-section-title";
     const defTitleLeft = document.createElement("div");
     defTitleLeft.className = "ml-inline-title";
+    const defTitleText = document.createElement("span");
+    defTitleText.textContent = "Global Download Defaults";
     defTitleLeft.append(
-      document.createTextNode("Global Download Defaults"),
+      createIcon("sliders", 14),
+      defTitleText,
       createInfoTip(
         "Used by the one-click Localize button across Character tabs and Portrait Panel unless a card defines Custom overrides.",
       ),
     );
     defTitleRow.appendChild(defTitleLeft);
-    defaultsBox.appendChild(defTitleRow);
+    defaultsSection.appendChild(defTitleRow);
 
     const sharedState = {
       sections: new Set(this.settings.defaultSections),
@@ -1183,7 +1779,7 @@ export class MediaLocalizerDrawerPanel {
       batchCap: this.settings.defaultBatchCap,
     };
 
-    defaultsBox.appendChild(
+    defaultsSection.appendChild(
       renderSharedDownloadConfigControls({
         state: sharedState,
         sectionTip: "Default card sections included for one-click media localization.",
@@ -1201,16 +1797,21 @@ export class MediaLocalizerDrawerPanel {
         },
       }),
     );
-    body.appendChild(defaultsBox);
+    body.appendChild(defaultsSection);
 
     // 3. Automation & Guardrails
-    const formBox = document.createElement("div");
-    formBox.className = "ml-section-box";
+    const formSection = document.createElement("div");
+    formSection.className = "ml-section";
 
     const formTitle = document.createElement("div");
     formTitle.className = "ml-section-title";
-    formTitle.textContent = "Automation & Guardrails";
-    formBox.appendChild(formTitle);
+    const formTitleText = document.createElement("span");
+    formTitleText.textContent = "Automation & Guardrails";
+    formTitle.append(createIcon("shield", 14), formTitleText);
+    formSection.appendChild(formTitle);
+
+    const toggleGrid = document.createElement("div");
+    toggleGrid.className = "ml-setting-toggle-grid";
 
     const addToggleSetting = (
       label: string,
@@ -1221,9 +1822,12 @@ export class MediaLocalizerDrawerPanel {
         | "autoLinkGallery"
         | "adoptNativeGalleryImages"
         | "deleteImagesOnPurge",
+      isCaution = false,
     ) => {
       const row = document.createElement("div");
-      row.className = "ml-setting-toggle-row";
+      row.className = isCaution
+        ? "ml-setting-toggle-row is-caution"
+        : "ml-setting-toggle-row";
       const lbl = document.createElement("label");
       lbl.className = "ml-toggle-label";
       const cb = document.createElement("input");
@@ -1237,7 +1841,7 @@ export class MediaLocalizerDrawerPanel {
       });
       lbl.append(cb, document.createTextNode(label));
       row.append(lbl, createInfoTip(tip));
-      formBox.appendChild(row);
+      toggleGrid.appendChild(row);
     };
 
     addToggleSetting(
@@ -1264,7 +1868,15 @@ export class MediaLocalizerDrawerPanel {
       "Delete images from native Gallery & storage when purging",
       "When off, removing localized media only unlinks it from Media Localizer while keeping Gallery items.",
       "deleteImagesOnPurge",
+      true,
     );
+
+    formSection.appendChild(toggleGrid);
+
+    const limitsLabel = document.createElement("div");
+    limitsLabel.className = "ml-subsection-label";
+    limitsLabel.textContent = "Queue & Safety Limits";
+    formSection.appendChild(limitsLabel);
 
     const numGrid = document.createElement("div");
     numGrid.className = "ml-check-grid";
@@ -1341,7 +1953,7 @@ export class MediaLocalizerDrawerPanel {
         ),
     );
 
-    formBox.appendChild(numGrid);
-    body.appendChild(formBox);
+    formSection.appendChild(numGrid);
+    body.appendChild(formSection);
   }
 }

@@ -42,6 +42,9 @@ const EXT_TO_MIME: Record<string, string> = {
   apng: "image/png",
   jpg: "image/jpeg",
   jpeg: "image/jpeg",
+  jfif: "image/jpeg",
+  pjp: "image/jpeg",
+  pjpeg: "image/jpeg",
   gif: "image/gif",
   webp: "image/webp",
   avif: "image/avif",
@@ -219,82 +222,105 @@ export function detectMediaMimeType(
   headerMimeType?: string | null,
   urlPath?: string,
 ): { mimeType: string; ext: string } {
-  if (bytes.byteLength >= 12) {
-    // PNG: 89 50 4E 47 0D 0A 1A 0A
-    if (
-      bytes[0] === 0x89 &&
-      bytes[1] === 0x50 &&
-      bytes[2] === 0x4e &&
-      bytes[3] === 0x47
-    ) {
-      return { mimeType: "image/png", ext: "png" };
+  // PNG: 89 50 4E 47 0D 0A 1A 0A
+  if (
+    bytes.byteLength >= 8 &&
+    bytes[0] === 0x89 &&
+    bytes[1] === 0x50 &&
+    bytes[2] === 0x4e &&
+    bytes[3] === 0x47 &&
+    bytes[4] === 0x0d &&
+    bytes[5] === 0x0a &&
+    bytes[6] === 0x1a &&
+    bytes[7] === 0x0a
+  ) {
+    return { mimeType: "image/png", ext: "png" };
+  }
+  // JPEG / JFIF / PJP / PJPEG: FF D8 FF
+  if (
+    bytes.byteLength >= 3 &&
+    bytes[0] === 0xff &&
+    bytes[1] === 0xd8 &&
+    bytes[2] === 0xff
+  ) {
+    return { mimeType: "image/jpeg", ext: "jpg" };
+  }
+  // GIF: GIF87a / GIF89a
+  if (
+    bytes.byteLength >= 6 &&
+    bytes[0] === 0x47 &&
+    bytes[1] === 0x49 &&
+    bytes[2] === 0x46 &&
+    bytes[3] === 0x38 &&
+    (bytes[4] === 0x37 || bytes[4] === 0x39) &&
+    bytes[5] === 0x61
+  ) {
+    return { mimeType: "image/gif", ext: "gif" };
+  }
+  // WEBP: RIFF....WEBP
+  if (
+    bytes.byteLength >= 12 &&
+    bytes[0] === 0x52 &&
+    bytes[1] === 0x49 &&
+    bytes[2] === 0x46 &&
+    bytes[3] === 0x46 &&
+    bytes[8] === 0x57 &&
+    bytes[9] === 0x45 &&
+    bytes[10] === 0x42 &&
+    bytes[11] === 0x50
+  ) {
+    return { mimeType: "image/webp", ext: "webp" };
+  }
+  // BMP: "BM" + reserved 00 00 00 00 at bytes 6..9
+  if (
+    bytes.byteLength >= 10 &&
+    bytes[0] === 0x42 &&
+    bytes[1] === 0x4d &&
+    bytes[6] === 0 &&
+    bytes[7] === 0 &&
+    bytes[8] === 0 &&
+    bytes[9] === 0
+  ) {
+    return { mimeType: "image/bmp", ext: "bmp" };
+  }
+  // ICO: 00 00 01 00
+  if (
+    bytes.byteLength >= 4 &&
+    bytes[0] === 0x00 &&
+    bytes[1] === 0x00 &&
+    bytes[2] === 0x01 &&
+    bytes[3] === 0x00
+  ) {
+    return { mimeType: "image/x-icon", ext: "ico" };
+  }
+  // WEBM / MKV: 1A 45 DF A3
+  if (
+    bytes.byteLength >= 4 &&
+    bytes[0] === 0x1a &&
+    bytes[1] === 0x45 &&
+    bytes[2] === 0xdf &&
+    bytes[3] === 0xa3
+  ) {
+    return { mimeType: "video/webm", ext: "webm" };
+  }
+  // ISO Base Media (MP4 / AVIF): ....ftyp
+  if (
+    bytes.byteLength >= 12 &&
+    bytes[4] === 0x66 &&
+    bytes[5] === 0x74 &&
+    bytes[6] === 0x79 &&
+    bytes[7] === 0x70
+  ) {
+    const brand = String.fromCharCode(
+      bytes[8] ?? 0,
+      bytes[9] ?? 0,
+      bytes[10] ?? 0,
+      bytes[11] ?? 0,
+    ).toLowerCase();
+    if (brand === "avif" || brand === "avis" || brand === "mif1") {
+      return { mimeType: "image/avif", ext: "avif" };
     }
-    // JPEG: FF D8 FF
-    if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
-      return { mimeType: "image/jpeg", ext: "jpg" };
-    }
-    // GIF: GIF87a / GIF89a
-    if (
-      bytes[0] === 0x47 &&
-      bytes[1] === 0x49 &&
-      bytes[2] === 0x46 &&
-      bytes[3] === 0x38
-    ) {
-      return { mimeType: "image/gif", ext: "gif" };
-    }
-    // WEBP: RIFF....WEBP
-    if (
-      bytes[0] === 0x52 &&
-      bytes[1] === 0x49 &&
-      bytes[2] === 0x46 &&
-      bytes[3] === 0x46 &&
-      bytes[8] === 0x57 &&
-      bytes[9] === 0x45 &&
-      bytes[10] === 0x42 &&
-      bytes[11] === 0x50
-    ) {
-      return { mimeType: "image/webp", ext: "webp" };
-    }
-    // BMP: "BM" + plausible header (file size field must not exceed actual length by much)
-    if (bytes[0] === 0x42 && bytes[1] === 0x4d && bytes[6] === 0 && bytes[7] === 0 && bytes[8] === 0 && bytes[9] === 0) {
-      return { mimeType: "image/bmp", ext: "bmp" };
-    }
-    // ICO: 00 00 01 00
-    if (
-      bytes[0] === 0x00 &&
-      bytes[1] === 0x00 &&
-      bytes[2] === 0x01 &&
-      bytes[3] === 0x00
-    ) {
-      return { mimeType: "image/x-icon", ext: "ico" };
-    }
-    // WEBM / MKV: 1A 45 DF A3
-    if (
-      bytes[0] === 0x1a &&
-      bytes[1] === 0x45 &&
-      bytes[2] === 0xdf &&
-      bytes[3] === 0xa3
-    ) {
-      return { mimeType: "video/webm", ext: "webm" };
-    }
-    // ISO Base Media (MP4 / AVIF): ....ftyp
-    if (
-      bytes[4] === 0x66 &&
-      bytes[5] === 0x74 &&
-      bytes[6] === 0x79 &&
-      bytes[7] === 0x70
-    ) {
-      const brand = String.fromCharCode(
-        bytes[8] ?? 0,
-        bytes[9] ?? 0,
-        bytes[10] ?? 0,
-        bytes[11] ?? 0,
-      ).toLowerCase();
-      if (brand === "avif" || brand === "avis" || brand === "mif1") {
-        return { mimeType: "image/avif", ext: "avif" };
-      }
-      return { mimeType: "video/mp4", ext: "mp4" };
-    }
+    return { mimeType: "video/mp4", ext: "mp4" };
   }
 
   // Check text prefix (UTF-8/UTF-16/UTF-32 with BOM & comment/PI stripping) for HTML/SVG/XML/script
@@ -332,7 +358,7 @@ export function detectMediaMimeType(
     throw new Error("Remote server returned XML/markup content instead of media");
   }
 
-  // Reject disallowed or non-media Content-Type headers before body/extension fallbacks
+  // Reject disallowed or non-media Content-Type headers before body/extension checks
   const cleanHeader = (headerMimeType ?? "").split(";")[0]?.trim().toLowerCase() ?? "";
   if (cleanHeader === "image/svg+xml" || cleanHeader === "image/svg") {
     throw new Error("SVG media (image/svg+xml) is disallowed for security reasons");
@@ -350,35 +376,46 @@ export function detectMediaMimeType(
     throw new Error(`Unsupported response content-type: ${cleanHeader}`);
   }
 
-  // Reject JSON or plain-text error bodies before trusting image/* headers or URL extensions
+  // Defense-in-depth SVG rejection by URL extension
+  const urlExtMatch = urlPath ? /\.([a-z0-9]{2,5})(?:$|[?#])/i.exec(urlPath) : null;
+  const urlExt = urlExtMatch?.[1]?.toLowerCase() ?? "";
+  if (urlExt === "svg") {
+    throw new Error("SVG media is disallowed for security reasons");
+  }
+
+  // Reject JSON or plain-text error bodies of any length before binary container checks
   if (printableText) {
     if (looksLikeJsonBody(bytes, strippedHead)) {
       throw new Error("Unrecognized media format: remote server returned JSON instead of media");
     }
-    if (bytes.byteLength >= 8) {
+    if (bytes.byteLength >= 1) {
       throw new Error("Unrecognized media format: remote server returned plain text instead of media");
     }
   }
 
-  if (cleanHeader && MIME_TO_EXT[cleanHeader]) {
-    return { mimeType: cleanHeader, ext: MIME_TO_EXT[cleanHeader]! };
+  // QuickTime .mov container without leading ftyp atom: moov / mdat / wide / free at offset 4
+  if (bytes.byteLength >= 8) {
+    const atom = String.fromCharCode(
+      bytes[4]!,
+      bytes[5]!,
+      bytes[6]!,
+      bytes[7]!,
+    );
+    if (atom === "moov" || atom === "mdat" || atom === "wide" || atom === "free") {
+      const boxSize =
+        ((bytes[0]! << 24) | (bytes[1]! << 16) | (bytes[2]! << 8) | bytes[3]!) >>> 0;
+      if (boxSize === 0 || boxSize === 1 || (boxSize >= 8 && boxSize <= 0x7fffffff)) {
+        return { mimeType: "video/mp4", ext: "mp4" };
+      }
+    }
   }
 
-  // Fallback to URL extension (e.g. CDNs serving `application/octet-stream`)
-  if (urlPath) {
-    const extMatch = /\.([a-z0-9]{2,5})(?:$|[?#])/i.exec(urlPath);
-    const ext = extMatch?.[1]?.toLowerCase() ?? "";
-    if (ext === "svg") {
-      throw new Error("SVG media is disallowed for security reasons");
-    }
-    if (ext && EXT_TO_MIME[ext]) {
-      const mime = EXT_TO_MIME[ext]!;
-      return { mimeType: mime, ext: MIME_TO_EXT[mime] ?? ext };
-    }
-  }
-
+  // Never trust bare image Content-Type or URL extension headers when magic bytes fail to match.
+  const expectedMime =
+    (urlExt && EXT_TO_MIME[urlExt]) ||
+    (cleanHeader && MIME_TO_EXT[cleanHeader] ? cleanHeader : "");
   throw new Error(
-    `Unrecognized media format${cleanHeader ? ` (content-type: ${cleanHeader})` : ""}`,
+    `Unrecognized media format${cleanHeader ? ` (content-type: ${cleanHeader})` : ""}${expectedMime && expectedMime !== cleanHeader ? ` (expected ${expectedMime})` : ""}`,
   );
 }
 
@@ -704,7 +741,7 @@ export async function downloadAndStoreMedia(
             normalizedUrl,
             rawUrls: Array.from(new Set([...rawUrls, normalizedUrl])),
             imageId: cand.imageId,
-            localUrl: `/api/v1/images/${cand.imageId}`,
+            localUrl: `/api/v1/images/${encodeURIComponent(cand.imageId)}`,
             mimeType: cand.mimeType && cand.mimeType !== "image/svg+xml"
               ? cand.mimeType
               : mimeType,
@@ -739,7 +776,7 @@ export async function downloadAndStoreMedia(
     normalizedUrl,
     rawUrls: Array.from(new Set([...rawUrls, normalizedUrl])),
     imageId: uploaded.id,
-    localUrl: uploaded.url || `/api/v1/images/${uploaded.id}`,
+    localUrl: uploaded.url || `/api/v1/images/${encodeURIComponent(uploaded.id)}`,
     mimeType: uploaded.mime_type || mimeType,
     sizeBytes: bytes.byteLength,
     filename,

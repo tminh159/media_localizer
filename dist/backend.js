@@ -33,8 +33,8 @@ var DEFAULT_SETTINGS = {
 
 // src/shared/url-scanner.ts
 var VIDEO_EXT_RE = /\.(?:mp4|webm|mov|m4v|ogv)$/i;
-var IMAGE_EXT_RE = /\.(?:png|jpe?g|gif|webp|avif|svg|bmp|ico|apng)$/i;
-var EXCLUDED_ASSET_EXT_RE = /\.(?:woff2?|ttf|otf|eot|css|js|mjs|json|xml|html?|txt|pdf|zip|rar|7z|mp3|wav|ogg|flac|m4a)$/i;
+var IMAGE_EXT_RE = /\.(?:png|jpe?g|jfif|pjp|pjpeg|gif|webp|avif|bmp|ico|apng)$/i;
+var EXCLUDED_ASSET_EXT_RE = /\.(?:svg|woff2?|ttf|otf|eot|css|js|mjs|json|xml|html?|txt|pdf|zip|rar|7z|mp3|wav|ogg|flac|m4a)$/i;
 var EXCLUDED_DOMAIN_RE = /^(?:fonts\.googleapis\.com|fonts\.gstatic\.com|use\.fontawesome\.com|cdnjs\.cloudflare\.com)$/i;
 var MAX_MD_ALT_LEN = 2048;
 var MAX_MD_REF_LEN = 512;
@@ -945,7 +945,7 @@ function deriveUrlFilenameParts(normalizedUrl) {
     const rawSeg = decodeURIComponent(parsed.pathname.split("/").filter(Boolean).pop() ?? "media");
     const extMatch = /\.([a-z0-9]{2,5})$/i.exec(rawSeg);
     const queryFormat = parsed.searchParams.get("format")?.trim().toLowerCase() ?? "";
-    const validQueryExt = /^(?:png|jpe?g|gif|webp|avif|svg|bmp|ico|apng|mp4|webm|mov|m4v|ogv)$/i.test(queryFormat) ? queryFormat : "";
+    const validQueryExt = /^(?:png|jpe?g|jfif|pjp|pjpeg|gif|webp|avif|bmp|ico|apng|mp4|webm|mov|m4v|ogv)$/i.test(queryFormat) ? queryFormat : "";
     const ext = extMatch?.[1]?.toLowerCase() || validQueryExt;
     const basename = !extMatch && validQueryExt ? `${rawSeg}.${validQueryExt}` : rawSeg;
     const cleanedStem = rawSeg.replace(/[^a-zA-Z0-9._-]/g, "_").replace(/\.[a-z0-9]{2,5}$/i, "").slice(0, 48);
@@ -964,7 +964,7 @@ function deriveUrlFilenameParts(normalizedUrl) {
 }
 var NATIVE_IMG_TAGS = new Set(["img"]);
 var NATIVE_BARE_URL_RE = /\bhttps?:\/\/[^\s<>"']+/gi;
-var NATIVE_IMAGE_PATH_RE = /\.(?:apng|avif|bmp|gif|heic|heif|ico|jpe?g|jfif|pjp|pjpeg|png|svg|webp)$/i;
+var NATIVE_IMAGE_PATH_RE = /\.(?:apng|avif|bmp|gif|heic|heif|ico|jpe?g|jfif|pjp|pjpeg|png|webp)$/i;
 var NATIVE_TRAILING_PUNCTUATION_CHARS = "),.;!?'\"`]}\\";
 function normalizeNativeExtractedCandidateUrl(raw) {
   let candidate = raw.trim();
@@ -1545,6 +1545,9 @@ var EXT_TO_MIME = {
   apng: "image/png",
   jpg: "image/jpeg",
   jpeg: "image/jpeg",
+  jfif: "image/jpeg",
+  pjp: "image/jpeg",
+  pjpeg: "image/jpeg",
   gif: "image/gif",
   webp: "image/webp",
   avif: "image/avif",
@@ -1690,35 +1693,33 @@ function looksLikeJsonBody(bytes, strippedText) {
   return /^(?:\{\s*(?:"(?:[^"\\]|\\.)*"\s*:|\})|\[\s*(?:\{|"|-?\d|true\b|false\b|null\b|\]))/.test(strippedText);
 }
 function detectMediaMimeType(bytes, headerMimeType, urlPath) {
-  if (bytes.byteLength >= 12) {
-    if (bytes[0] === 137 && bytes[1] === 80 && bytes[2] === 78 && bytes[3] === 71) {
-      return { mimeType: "image/png", ext: "png" };
+  if (bytes.byteLength >= 8 && bytes[0] === 137 && bytes[1] === 80 && bytes[2] === 78 && bytes[3] === 71 && bytes[4] === 13 && bytes[5] === 10 && bytes[6] === 26 && bytes[7] === 10) {
+    return { mimeType: "image/png", ext: "png" };
+  }
+  if (bytes.byteLength >= 3 && bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255) {
+    return { mimeType: "image/jpeg", ext: "jpg" };
+  }
+  if (bytes.byteLength >= 6 && bytes[0] === 71 && bytes[1] === 73 && bytes[2] === 70 && bytes[3] === 56 && (bytes[4] === 55 || bytes[4] === 57) && bytes[5] === 97) {
+    return { mimeType: "image/gif", ext: "gif" };
+  }
+  if (bytes.byteLength >= 12 && bytes[0] === 82 && bytes[1] === 73 && bytes[2] === 70 && bytes[3] === 70 && bytes[8] === 87 && bytes[9] === 69 && bytes[10] === 66 && bytes[11] === 80) {
+    return { mimeType: "image/webp", ext: "webp" };
+  }
+  if (bytes.byteLength >= 10 && bytes[0] === 66 && bytes[1] === 77 && bytes[6] === 0 && bytes[7] === 0 && bytes[8] === 0 && bytes[9] === 0) {
+    return { mimeType: "image/bmp", ext: "bmp" };
+  }
+  if (bytes.byteLength >= 4 && bytes[0] === 0 && bytes[1] === 0 && bytes[2] === 1 && bytes[3] === 0) {
+    return { mimeType: "image/x-icon", ext: "ico" };
+  }
+  if (bytes.byteLength >= 4 && bytes[0] === 26 && bytes[1] === 69 && bytes[2] === 223 && bytes[3] === 163) {
+    return { mimeType: "video/webm", ext: "webm" };
+  }
+  if (bytes.byteLength >= 12 && bytes[4] === 102 && bytes[5] === 116 && bytes[6] === 121 && bytes[7] === 112) {
+    const brand = String.fromCharCode(bytes[8] ?? 0, bytes[9] ?? 0, bytes[10] ?? 0, bytes[11] ?? 0).toLowerCase();
+    if (brand === "avif" || brand === "avis" || brand === "mif1") {
+      return { mimeType: "image/avif", ext: "avif" };
     }
-    if (bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255) {
-      return { mimeType: "image/jpeg", ext: "jpg" };
-    }
-    if (bytes[0] === 71 && bytes[1] === 73 && bytes[2] === 70 && bytes[3] === 56) {
-      return { mimeType: "image/gif", ext: "gif" };
-    }
-    if (bytes[0] === 82 && bytes[1] === 73 && bytes[2] === 70 && bytes[3] === 70 && bytes[8] === 87 && bytes[9] === 69 && bytes[10] === 66 && bytes[11] === 80) {
-      return { mimeType: "image/webp", ext: "webp" };
-    }
-    if (bytes[0] === 66 && bytes[1] === 77 && bytes[6] === 0 && bytes[7] === 0 && bytes[8] === 0 && bytes[9] === 0) {
-      return { mimeType: "image/bmp", ext: "bmp" };
-    }
-    if (bytes[0] === 0 && bytes[1] === 0 && bytes[2] === 1 && bytes[3] === 0) {
-      return { mimeType: "image/x-icon", ext: "ico" };
-    }
-    if (bytes[0] === 26 && bytes[1] === 69 && bytes[2] === 223 && bytes[3] === 163) {
-      return { mimeType: "video/webm", ext: "webm" };
-    }
-    if (bytes[4] === 102 && bytes[5] === 116 && bytes[6] === 121 && bytes[7] === 112) {
-      const brand = String.fromCharCode(bytes[8] ?? 0, bytes[9] ?? 0, bytes[10] ?? 0, bytes[11] ?? 0).toLowerCase();
-      if (brand === "avif" || brand === "avis" || brand === "mif1") {
-        return { mimeType: "image/avif", ext: "avif" };
-      }
-      return { mimeType: "video/mp4", ext: "mp4" };
-    }
+    return { mimeType: "video/mp4", ext: "mp4" };
   }
   const headText = decodeTextPrefix(bytes);
   const { stripped: strippedHead, sawXmlDecl } = stripLeadingMarkupNoise(headText);
@@ -1742,29 +1743,30 @@ function detectMediaMimeType(bytes, headerMimeType, urlPath) {
   if (cleanHeader.startsWith("text/") || cleanHeader === "application/json" || cleanHeader.endsWith("+json") || cleanHeader === "application/xml" || cleanHeader.endsWith("+xml") || cleanHeader === "application/xhtml+xml" || cleanHeader === "application/javascript" || cleanHeader === "application/ecmascript") {
     throw new Error(`Unsupported response content-type: ${cleanHeader}`);
   }
+  const urlExtMatch = urlPath ? /\.([a-z0-9]{2,5})(?:$|[?#])/i.exec(urlPath) : null;
+  const urlExt = urlExtMatch?.[1]?.toLowerCase() ?? "";
+  if (urlExt === "svg") {
+    throw new Error("SVG media is disallowed for security reasons");
+  }
   if (printableText) {
     if (looksLikeJsonBody(bytes, strippedHead)) {
       throw new Error("Unrecognized media format: remote server returned JSON instead of media");
     }
-    if (bytes.byteLength >= 8) {
+    if (bytes.byteLength >= 1) {
       throw new Error("Unrecognized media format: remote server returned plain text instead of media");
     }
   }
-  if (cleanHeader && MIME_TO_EXT[cleanHeader]) {
-    return { mimeType: cleanHeader, ext: MIME_TO_EXT[cleanHeader] };
-  }
-  if (urlPath) {
-    const extMatch = /\.([a-z0-9]{2,5})(?:$|[?#])/i.exec(urlPath);
-    const ext = extMatch?.[1]?.toLowerCase() ?? "";
-    if (ext === "svg") {
-      throw new Error("SVG media is disallowed for security reasons");
-    }
-    if (ext && EXT_TO_MIME[ext]) {
-      const mime = EXT_TO_MIME[ext];
-      return { mimeType: mime, ext: MIME_TO_EXT[mime] ?? ext };
+  if (bytes.byteLength >= 8) {
+    const atom = String.fromCharCode(bytes[4], bytes[5], bytes[6], bytes[7]);
+    if (atom === "moov" || atom === "mdat" || atom === "wide" || atom === "free") {
+      const boxSize = (bytes[0] << 24 | bytes[1] << 16 | bytes[2] << 8 | bytes[3]) >>> 0;
+      if (boxSize === 0 || boxSize === 1 || boxSize >= 8 && boxSize <= 2147483647) {
+        return { mimeType: "video/mp4", ext: "mp4" };
+      }
     }
   }
-  throw new Error(`Unrecognized media format${cleanHeader ? ` (content-type: ${cleanHeader})` : ""}`);
+  const expectedMime = urlExt && EXT_TO_MIME[urlExt] || (cleanHeader && MIME_TO_EXT[cleanHeader] ? cleanHeader : "");
+  throw new Error(`Unrecognized media format${cleanHeader ? ` (content-type: ${cleanHeader})` : ""}${expectedMime && expectedMime !== cleanHeader ? ` (expected ${expectedMime})` : ""}`);
 }
 function deriveBaseFilename(normalizedUrl, ext) {
   try {
@@ -2006,7 +2008,7 @@ async function downloadAndStoreMedia(spindle2, options) {
             normalizedUrl,
             rawUrls: Array.from(new Set([...rawUrls, normalizedUrl])),
             imageId: cand.imageId,
-            localUrl: `/api/v1/images/${cand.imageId}`,
+            localUrl: `/api/v1/images/${encodeURIComponent(cand.imageId)}`,
             mimeType: cand.mimeType && cand.mimeType !== "image/svg+xml" ? cand.mimeType : mimeType,
             sizeBytes: bytes.byteLength,
             filename,
@@ -2030,7 +2032,7 @@ async function downloadAndStoreMedia(spindle2, options) {
     normalizedUrl,
     rawUrls: Array.from(new Set([...rawUrls, normalizedUrl])),
     imageId: uploaded.id,
-    localUrl: uploaded.url || `/api/v1/images/${uploaded.id}`,
+    localUrl: uploaded.url || `/api/v1/images/${encodeURIComponent(uploaded.id)}`,
     mimeType: uploaded.mime_type || mimeType,
     sizeBytes: bytes.byteLength,
     filename,
@@ -2116,7 +2118,28 @@ async function fetchMissingImageMetadata(spindle2, userId, imageIds, imageMetaBy
   }));
   return confirmedMissingIds;
 }
-async function reconcileCharacterGalleryWithIndex(spindle2, indexStore, userId, character, scanItems) {
+async function reconcileCharacterGalleryWithIndex(spindle2, indexStore, userId, character, scanItems, options) {
+  const emptyResult = () => ({
+    indexChanged: false,
+    adoptedCount: 0,
+    prunedCount: 0,
+    pendingGalleryLinks: [],
+    unmatchedGalleryCandidates: []
+  });
+  if (options?.isStale?.()) {
+    return emptyResult();
+  }
+  const preScanState = await indexStore.getState(userId);
+  if (options?.isStale?.()) {
+    return emptyResult();
+  }
+  const preGalleryItemIdsByUrl = new Map;
+  for (const entry of Object.values(preScanState.assets)) {
+    if (!entry.characterIds.includes(character.id))
+      continue;
+    const preId = entry.galleryItemIds && Object.hasOwn(entry.galleryItemIds, character.id) ? entry.galleryItemIds[character.id] : undefined;
+    preGalleryItemIdsByUrl.set(entry.normalizedUrl, preId);
+  }
   let galleryItems = null;
   if (typeof spindle2.characters?.getGallery === "function") {
     try {
@@ -2204,12 +2227,13 @@ async function reconcileCharacterGalleryWithIndex(spindle2, indexStore, userId, 
     if (!entry.characterIds.includes(character.id))
       continue;
     const knownGalleryItemId = entry.galleryItemIds && Object.hasOwn(entry.galleryItemIds, character.id) ? entry.galleryItemIds[character.id] : undefined;
+    const preGalleryItemId = preGalleryItemIdsByUrl.get(entry.normalizedUrl);
     const inNativeGallery = galleryByImageId.has(entry.imageId);
     const inNativeExpressions = expressionInfo.allImageIds.has(entry.imageId);
     if (knownGalleryItemId === NATIVE_EXPRESSION_SENTINEL) {
-      if (!inNativeExpressions && !inNativeGallery)
+      if (preGalleryItemId === NATIVE_EXPRESSION_SENTINEL && !inNativeExpressions && !inNativeGallery)
         continue;
-    } else if (galleryItems !== null && knownGalleryItemId && !inNativeGallery) {
+    } else if (galleryItems !== null && knownGalleryItemId && !inNativeGallery && preGalleryItemId !== undefined && knownGalleryItemId === preGalleryItemId) {
       continue;
     }
     if (!inNativeGallery && !imageMetaById.has(entry.imageId)) {
@@ -2217,9 +2241,20 @@ async function reconcileCharacterGalleryWithIndex(spindle2, indexStore, userId, 
     }
   }
   const confirmedMissingIds = await fetchMissingImageMetadata(spindle2, userId, verifyMissingIds, new Map);
+  if (options?.isStale?.()) {
+    return emptyResult();
+  }
   const {
     result: { indexChanged, prunedCount, adoptedCount, claimedImageIds }
   } = await indexStore.batchUpdate(userId, (tx) => {
+    if (options?.isStale?.()) {
+      return {
+        indexChanged: false,
+        prunedCount: 0,
+        adoptedCount: 0,
+        claimedImageIds: new Set
+      };
+    }
     const state = tx.state;
     const adoptEnabled = state.settings.adoptNativeGalleryImages;
     let localIndexChanged = false;
@@ -2230,10 +2265,11 @@ async function reconcileCharacterGalleryWithIndex(spindle2, indexStore, userId, 
       if (!entry.characterIds.includes(character.id))
         continue;
       const knownGalleryItemId = entry.galleryItemIds && Object.hasOwn(entry.galleryItemIds, character.id) ? entry.galleryItemIds[character.id] : undefined;
+      const preGalleryItemId = preGalleryItemIdsByUrl.get(entry.normalizedUrl);
       const inNativeGallery = galleryByImageId.has(entry.imageId);
       const inNativeExpressions = expressionInfo.allImageIds.has(entry.imageId);
       if (knownGalleryItemId === NATIVE_EXPRESSION_SENTINEL) {
-        if (!inNativeExpressions && !inNativeGallery) {
+        if (preGalleryItemId === NATIVE_EXPRESSION_SENTINEL && !inNativeExpressions && !inNativeGallery) {
           const removed = tx.unlinkByCharacterImageId(character.id, entry.imageId, undefined);
           if (removed > 0) {
             localPrunedCount += removed;
@@ -2241,7 +2277,7 @@ async function reconcileCharacterGalleryWithIndex(spindle2, indexStore, userId, 
           }
           continue;
         }
-      } else if (galleryItems !== null && knownGalleryItemId && !inNativeGallery) {
+      } else if (galleryItems !== null && knownGalleryItemId && !inNativeGallery && preGalleryItemId !== undefined && knownGalleryItemId === preGalleryItemId) {
         const removed = tx.unlinkByCharacterImageId(character.id, entry.imageId, knownGalleryItemId);
         if (removed > 0) {
           localPrunedCount += removed;
@@ -2299,7 +2335,7 @@ async function reconcileCharacterGalleryWithIndex(spindle2, indexStore, userId, 
         normalizedUrl: item.normalizedUrl,
         rawUrls: item.rawUrls,
         imageId: cand.imageId,
-        localUrl: `/api/v1/images/${cand.imageId}`,
+        localUrl: `/api/v1/images/${encodeURIComponent(cand.imageId)}`,
         mimeType: cand.mimeType || "image/png",
         sizeBytes: cand.byteSize || 0,
         filename,
@@ -2600,17 +2636,22 @@ function refreshScanResultWithIndexState(scan, assets, failedUrls) {
 }
 
 // src/shared/download-config.ts
+var MAX_FILTER_ARRAY_ITEMS = 5000;
+var MAX_FILTER_STRING_LEN = 2048;
 function uniqueStrings(values) {
   if (!Array.isArray(values))
     return;
   const out = [];
   const seen = new Set;
   for (const item of values) {
+    if (out.length >= MAX_FILTER_ARRAY_ITEMS)
+      break;
     if (typeof item !== "string")
       continue;
     const trimmed = item.trim();
-    if (!trimmed || seen.has(trimmed))
+    if (!trimmed || trimmed.length > MAX_FILTER_STRING_LEN || seen.has(trimmed)) {
       continue;
+    }
     seen.add(trimmed);
     out.push(trimmed);
   }
@@ -2622,6 +2663,8 @@ function uniqueNumbers(values) {
   const out = [];
   const seen = new Set;
   for (const item of values) {
+    if (out.length >= MAX_FILTER_ARRAY_ITEMS)
+      break;
     if (typeof item !== "number" || !Number.isFinite(item))
       continue;
     const n = Math.floor(item);
@@ -2888,7 +2931,7 @@ function sanitizeAssetEntry(key, raw) {
     normalizedUrl,
     rawUrls: strArr(e.rawUrls),
     imageId: e.imageId,
-    localUrl: typeof e.localUrl === "string" && e.localUrl ? e.localUrl : `/api/v1/images/${e.imageId}`,
+    localUrl: typeof e.localUrl === "string" && e.localUrl ? e.localUrl : `/api/v1/images/${encodeURIComponent(e.imageId)}`,
     mimeType: typeof e.mimeType === "string" ? e.mimeType : "image/png",
     sizeBytes: typeof e.sizeBytes === "number" ? e.sizeBytes : 0,
     filename: typeof e.filename === "string" ? e.filename : "media",
@@ -3043,12 +3086,44 @@ function applyRemoveByImageId(state, imageId) {
   return { changed: removed > 0, result: removed };
 }
 var MAX_CACHED_USERS = 500;
+var MAX_FAILED_URLS = 2000;
+function capFailedUrlsRecord(failedUrls) {
+  const entries = Object.entries(failedUrls);
+  if (entries.length <= MAX_FAILED_URLS) {
+    return failedUrls;
+  }
+  entries.sort((a, b) => (b[1].lastAttemptAt || 0) - (a[1].lastAttemptAt || 0));
+  const capped = createNullProtoRecord();
+  for (let i = 0;i < MAX_FAILED_URLS; i++) {
+    const [k, v] = entries[i];
+    capped[k] = v;
+  }
+  return capped;
+}
+function computeStorageStats(state) {
+  const entries = Object.values(state.assets);
+  const seenImageIds = new Set;
+  let totalSizeBytes = 0;
+  for (const entry of entries) {
+    if (!seenImageIds.has(entry.imageId)) {
+      seenImageIds.add(entry.imageId);
+      totalSizeBytes += entry.sizeBytes || 0;
+    }
+  }
+  return {
+    totalAssets: entries.length,
+    totalSizeBytes,
+    totalFailedUrls: Object.keys(state.failedUrls).length,
+    settings: state.settings
+  };
+}
 
 class MediaIndexStore {
   userStorage;
   cache = new Map;
   loading = new Map;
   writeLocks = new Map;
+  corruptBackedUpUsers = new Set;
   tmpSeq = 0;
   constructor(userStorage) {
     this.userStorage = userStorage;
@@ -3113,9 +3188,11 @@ class MediaIndexStore {
       parsed = candidate;
     } catch (err) {
       console.warn("[media_localizer] Corrupt media_index.json; preserving a backup and starting fresh:", err);
-      if (text) {
+      const backupKey = typeof userId === "string" && userId.trim().length > 0 ? userId : "__default__";
+      if (text && !this.corruptBackedUpUsers.has(backupKey)) {
         try {
           await this.userStorage.write(`media_index.corrupt-${Date.now()}.json`, text, userId);
+          this.corruptBackedUpUsers.add(backupKey);
         } catch {}
       }
       return createDefaultUserState();
@@ -3131,7 +3208,7 @@ class MediaIndexStore {
         }
       }
     }
-    const failedUrls = createNullProtoRecord();
+    let failedUrls = createNullProtoRecord();
     if (parsed.failedUrls && typeof parsed.failedUrls === "object") {
       for (const [key, raw] of Object.entries(parsed.failedUrls)) {
         if (!isSafeRecordKey(key))
@@ -3140,6 +3217,7 @@ class MediaIndexStore {
         if (rec)
           failedUrls[key] = rec;
       }
+      failedUrls = capFailedUrlsRecord(failedUrls);
     }
     const characterOverrides = createNullProtoRecord();
     if (parsed.characterOverrides && typeof parsed.characterOverrides === "object") {
@@ -3306,6 +3384,9 @@ class MediaIndexStore {
         error,
         lastAttemptAt: Date.now()
       });
+      if (Object.keys(draft.failedUrls).length > MAX_FAILED_URLS) {
+        draft.failedUrls = capFailedUrlsRecord(draft.failedUrls);
+      }
       return { changed: true, result: undefined };
     });
   }
@@ -3399,23 +3480,13 @@ class MediaIndexStore {
   async removeByImageId(userId, imageId) {
     return this.mutateState(userId, (draft) => applyRemoveByImageId(draft, imageId));
   }
+  peekStorageStats(userId) {
+    const cached = this.cache.get(userId);
+    return cached ? computeStorageStats(cached) : null;
+  }
   async getStorageStats(userId) {
     const state = await this.getState(userId);
-    const entries = Object.values(state.assets);
-    const seenImageIds = new Set;
-    let totalSizeBytes = 0;
-    for (const entry of entries) {
-      if (!seenImageIds.has(entry.imageId)) {
-        seenImageIds.add(entry.imageId);
-        totalSizeBytes += entry.sizeBytes || 0;
-      }
-    }
-    return {
-      totalAssets: entries.length,
-      totalSizeBytes,
-      totalFailedUrls: Object.keys(state.failedUrls).length,
-      settings: state.settings
-    };
+    return computeStorageStats(state);
   }
   async buildActiveDisplayUrlMap(userId) {
     const state = typeof userId === "string" && userId.trim().length > 0 ? await this.getState(userId) : await this.loadState(undefined);
@@ -3499,6 +3570,7 @@ class UserDownloadQueue {
   enqueueLock = Promise.resolve();
   inFlight = new Map;
   cancelledCharacterUrls = new Map;
+  activeWorkerLoops = new Set;
   constructor(userId, spindle2, indexStore, onUpdate) {
     this.userId = userId;
     this.spindle = spindle2;
@@ -3577,6 +3649,7 @@ class UserDownloadQueue {
         this.pendingTasks = [...incoming];
         this.inFlight.clear();
         this.cancelledCharacterUrls.clear();
+        this.activeWorkerLoops.clear();
         const gen = ++this.generation;
         this.progress = {
           status: incoming.length > 0 ? "running" : "completed",
@@ -3593,7 +3666,7 @@ class UserDownloadQueue {
         };
         this.emit();
         if (incoming.length > 0) {
-          const run = this.runWorkers(this.currentOptions.concurrency, gen).finally(() => {
+          const run = this.runWorkers(gen).finally(() => {
             if (this.runPromise === run) {
               this.runPromise = null;
             }
@@ -3619,6 +3692,7 @@ class UserDownloadQueue {
           this.progress.skippedByCapCount += skippedByCapCount;
         }
         this.emit();
+        this.spawnWorkerLoops(this.currentOptions.concurrency, this.generation);
       }
       return this.getProgress();
     });
@@ -3642,6 +3716,7 @@ class UserDownloadQueue {
     this.resumeResolver = null;
     resolve?.();
     this.emit();
+    this.spawnWorkerLoops(this.currentOptions.concurrency, this.generation);
     return this.getProgress();
   }
   skipCurrent(targetUrl) {
@@ -3653,6 +3728,7 @@ class UserDownloadQueue {
       for (const ctrl of controls) {
         if (ctrl.url === target.url) {
           ctrl.skipped = true;
+          ctrl.abortScope = "url";
           ctrl.controller.abort(new DOMException("Skipped by user", "AbortError"));
         }
       }
@@ -3722,6 +3798,7 @@ class UserDownloadQueue {
       if (active.characterId === characterId && (!urlSet || urlSet.has(active.url))) {
         if (!active.skipped) {
           active.skipped = true;
+          active.abortScope = "character";
           active.controller.abort(new DOMException("Cancelled by character purge", "AbortError"));
           affected++;
         }
@@ -3748,6 +3825,7 @@ class UserDownloadQueue {
     resolve?.();
     for (const active of this.activeControls.values()) {
       active.skipped = true;
+      active.abortScope = "all";
       active.controller.abort(new DOMException("Cancelled by user", "AbortError"));
     }
     if (this.activeTaskCount === 0 && this.activeControls.size === 0) {
@@ -3756,20 +3834,31 @@ class UserDownloadQueue {
     this.emit();
     return this.getProgress();
   }
-  async runWorkers(concurrency, gen) {
+  spawnWorkerLoops(targetCount, gen) {
+    if (this.cancelRequested || gen !== this.generation)
+      return;
+    const maxAllowed = Math.min(targetCount, this.activeWorkerLoops.size + this.pendingTasks.length);
+    while (this.activeWorkerLoops.size < maxAllowed && this.pendingTasks.length > 0 && !this.cancelRequested && gen === this.generation) {
+      const loopPromise = this.workerLoop(gen).finally(() => {
+        this.activeWorkerLoops.delete(loopPromise);
+      });
+      this.activeWorkerLoops.add(loopPromise);
+    }
+  }
+  async runWorkers(gen) {
     while (!this.cancelRequested && gen === this.generation) {
       if (this.pauseGate) {
         await this.pauseGate;
       }
       if (this.cancelRequested || gen !== this.generation)
         break;
-      if (this.pendingTasks.length === 0)
+      if (this.pendingTasks.length === 0 && this.activeWorkerLoops.size === 0) {
         break;
-      const workers = [];
-      for (let i = 0;i < concurrency; i++) {
-        workers.push(this.workerLoop(gen));
       }
-      await Promise.allSettled(workers);
+      this.spawnWorkerLoops(this.currentOptions.concurrency, gen);
+      if (this.activeWorkerLoops.size === 0)
+        break;
+      await Promise.allSettled(Array.from(this.activeWorkerLoops));
     }
     if (gen !== this.generation)
       return;
@@ -3811,7 +3900,7 @@ class UserDownloadQueue {
         const outcome = await prior.catch(() => "failed");
         if (gen !== this.generation)
           return;
-        if (this.cancelRequested || outcome === "aborted" || this.isTaskCancelledForCharacter(task.characterId, key)) {
+        if (this.cancelRequested || outcome === "aborted" || outcome === "aborted_url" || this.isTaskCancelledForCharacter(task.characterId, key)) {
           this.progress.completedCount++;
           this.progress.skippedCount++;
           this.emit();
@@ -3872,11 +3961,17 @@ class UserDownloadQueue {
     const checkAbortedOrStale = () => {
       if (gen !== this.generation)
         return "aborted";
-      if (this.cancelRequested || this.isTaskCancelledForCharacter(task.characterId, task.normalizedUrl)) {
+      if (this.cancelRequested) {
         this.progress.completedCount++;
         this.progress.skippedCount++;
         this.emit();
         return "aborted";
+      }
+      if (this.isTaskCancelledForCharacter(task.characterId, task.normalizedUrl)) {
+        this.progress.completedCount++;
+        this.progress.skippedCount++;
+        this.emit();
+        return "aborted_character";
       }
       return null;
     };
@@ -3954,12 +4049,21 @@ class UserDownloadQueue {
             });
           } catch {}
         }
+        const scope = control.abortScope;
         this.activeControls.delete(controlId);
         controlId = null;
-        if (gen === this.generation) {
-          this.progress.completedCount++;
-          this.progress.skippedCount++;
-          this.emit();
+        if (gen !== this.generation) {
+          return "aborted";
+        }
+        this.progress.completedCount++;
+        this.progress.skippedCount++;
+        this.emit();
+        if (this.cancelRequested || scope === "all")
+          return "aborted";
+        if (scope === "url")
+          return "aborted_url";
+        if (scope === "character" || this.isTaskCancelledForCharacter(task.characterId, task.normalizedUrl)) {
+          return "aborted_character";
         }
         return "aborted";
       }
@@ -3991,6 +4095,14 @@ class UserDownloadQueue {
       if (isAborted) {
         this.progress.skippedCount++;
         this.emit();
+        const scope = control?.abortScope;
+        if (this.cancelRequested || scope === "all")
+          return "aborted";
+        if (scope === "url")
+          return "aborted_url";
+        if (scope === "character" || this.isTaskCancelledForCharacter(task.characterId, task.normalizedUrl)) {
+          return "aborted_character";
+        }
         return "aborted";
       }
       const errorMessage = err instanceof Error ? err.message : String(err);
@@ -4187,6 +4299,17 @@ var pendingGalleryLinksCache = new Map;
 var characterScanCache = new Map;
 var inFlightAutoLocalize = new Set;
 var failedWorldBookPromises = new WeakSet;
+var MAX_INVALIDATION_EPOCHS = 1e4;
+var characterInvalidationEpochs = new Map;
+function getCharacterInvalidationEpoch(userId, characterId) {
+  return characterInvalidationEpochs.get(`${userId}:${characterId}`) ?? 0;
+}
+function bumpCharacterInvalidationEpoch(userId, characterId) {
+  const key = `${userId}:${characterId}`;
+  const next = (characterInvalidationEpochs.get(key) ?? 0) + 1;
+  setBoundedMapEntry(characterInvalidationEpochs, key, next, MAX_INVALIDATION_EPOCHS);
+  return next;
+}
 function recordKnownUser(userId) {
   if (knownUsers.has(userId)) {
     knownUsers.delete(userId);
@@ -4283,10 +4406,14 @@ function invalidateRegexScanCaches(scope, scopeId, targetUsers) {
 }
 async function syncUrlMapToFrontend(userId) {
   try {
-    const urlMapPayload = await indexStore.buildActiveDisplayUrlMap(userId);
+    const [urlMapPayload, stats] = await Promise.all([
+      indexStore.buildActiveDisplayUrlMap(userId),
+      indexStore.getStorageStats(userId)
+    ]);
     spindle.sendToFrontend({
       type: "URL_MAP_UPDATED",
-      urlMapPayload
+      urlMapPayload,
+      stats
     }, userId);
   } catch (err) {
     logWarn("Failed to sync URL map:", err);
@@ -4325,10 +4452,12 @@ function scheduleUrlMapSync(userId) {
 }
 var queueManager = new MediaQueueManager(spindle, indexStore, (userId, progress, newAsset) => {
   try {
+    const stats = newAsset || progress.status === "completed" || progress.status === "cancelled" ? indexStore.peekStorageStats(userId) ?? undefined : undefined;
     spindle.sendToFrontend({
       type: "QUEUE_PROGRESS",
       progress,
-      ...newAsset ? { newAsset } : {}
+      ...newAsset ? { newAsset } : {},
+      ...stats ? { stats } : {}
     }, userId);
   } catch (err) {
     logWarn("Failed to send QUEUE_PROGRESS to frontend:", err);
@@ -4489,12 +4618,25 @@ async function fetchCharacterRegexScripts(characterId, userId) {
   return { scripts: regexScripts, failed };
 }
 async function performCharacterScan(userId, characterId, includeResources = true, worldBookCache, options) {
+  if (typeof userId === "string" && userId.trim().length > 0) {
+    recordKnownUser(userId);
+  }
+  const startEpoch = getCharacterInvalidationEpoch(userId, characterId);
+  const isInvalidated = () => getCharacterInvalidationEpoch(userId, characterId) !== startEpoch;
   const character = options?.preloadedCharacter ?? await spindle.characters.get(characterId, userId);
   if (!character) {
     throw new Error(`Character not found: ${characterId}`);
   }
   const state = await indexStore.getState(userId);
   const override = state.characterOverrides[characterId] ?? null;
+  if (isInvalidated()) {
+    return scanCharacterMedia(character, [], [], {
+      override,
+      localizedByNormalizedUrl: new Map(Object.entries(state.assets)),
+      failedByNormalizedUrl: new Map(Object.entries(state.failedUrls)),
+      scanBareUrls: state.settings.scanBareUrls
+    });
+  }
   const cacheKey = `${userId}:${characterId}`;
   const wbIds = includeResources ? extractCharacterWorldBookIds(character) : [];
   const wbIdsKey = `${includeResources ? "1" : "0"}:${wbIds.join(",")}`;
@@ -4565,7 +4707,7 @@ async function performCharacterScan(userId, characterId, includeResources = true
       failedByNormalizedUrl: failedMap,
       scanBareUrls: state.settings.scanBareUrls
     });
-    if (updatedAtKey !== "" && !resourceFetchFailed) {
+    if (!isInvalidated() && updatedAtKey !== "" && !resourceFetchFailed) {
       setBoundedMapEntry(characterScanCache, cacheKey, {
         userId,
         characterId,
@@ -4579,6 +4721,9 @@ async function performCharacterScan(userId, characterId, includeResources = true
       }, MAX_CHARACTER_CACHE_ENTRIES);
     }
   }
+  if (isInvalidated()) {
+    return scan;
+  }
   const itemsToLink = scan.items.filter((item) => item.status === "localized" && item.localizedEntry && !item.localizedEntry.characterIds.includes(characterId));
   let linkedAny = false;
   if (itemsToLink.length > 0) {
@@ -4589,7 +4734,13 @@ async function performCharacterScan(userId, characterId, includeResources = true
     });
     linkedAny = linkBatch.changed;
   }
-  const reconciliation = await reconcileCharacterGalleryWithIndex(spindle, indexStore, userId, character, scan.items);
+  if (isInvalidated()) {
+    return scan;
+  }
+  const reconciliation = await reconcileCharacterGalleryWithIndex(spindle, indexStore, userId, character, scan.items, { isStale: isInvalidated });
+  if (isInvalidated()) {
+    return scan;
+  }
   if (reconciliation.unmatchedGalleryCandidates.length > 0) {
     setBoundedMapEntry(unmatchedGalleryCache, cacheKey, {
       userId,
@@ -4770,6 +4921,10 @@ async function enqueueDownloadInternal(userId, rawFilter, useCharacterOverrides,
   if (charIds.length === 0) {
     throw new Error("Select at least one character to localize");
   }
+  const startEpochs = new Map;
+  for (const charId of charIds) {
+    startEpochs.set(charId, getCharacterInvalidationEpoch(userId, charId));
+  }
   const state = await indexStore.getState(userId);
   const settings = state.settings;
   const tasks = [];
@@ -4778,14 +4933,32 @@ async function enqueueDownloadInternal(userId, rawFilter, useCharacterOverrides,
   const hasValidFilterMaxItems = typeof filter.maxItems === "number" && Number.isFinite(filter.maxItems) && filter.maxItems >= 0;
   let resolvedMaxItems = hasValidFilterMaxItems ? Math.floor(filter.maxItems) : settings.defaultBatchCap;
   for (const charId of charIds) {
-    const scan = preloadedScans?.get(charId) ?? await performCharacterScan(userId, charId, true, worldBookCache);
+    if (getCharacterInvalidationEpoch(userId, charId) !== startEpochs.get(charId)) {
+      continue;
+    }
+    let scan;
+    try {
+      scan = preloadedScans?.get(charId) ?? await performCharacterScan(userId, charId, true, worldBookCache);
+    } catch (err) {
+      logWarn(`Skipping character ${charId} during enqueue:`, err);
+      continue;
+    }
+    if (getCharacterInvalidationEpoch(userId, charId) !== startEpochs.get(charId)) {
+      continue;
+    }
     const unmatchedCandidates = getLruMapEntry(unmatchedGalleryCache, `${userId}:${scan.characterId}`)?.items;
     const effective = useCharacterOverrides ? buildEffectiveFilter(settings, scan) : null;
     if (effective && charIds.length === 1 && !hasValidFilterMaxItems && typeof effective.maxItems === "number" && Number.isFinite(effective.maxItems) && effective.maxItems >= 0) {
       resolvedMaxItems = Math.floor(effective.maxItems);
     }
     const charFilter = effective ? { ...effective, ...definedFilter } : definedFilter;
-    const matchingItems = filterScanItemsForDownload(scan, charFilter);
+    let matchingItems = filterScanItemsForDownload(scan, charFilter);
+    if (charIds.length > 1 && useCharacterOverrides && !hasValidFilterMaxItems && effective && typeof effective.maxItems === "number" && Number.isFinite(effective.maxItems) && effective.maxItems > 0) {
+      const perCharCap = Math.floor(effective.maxItems);
+      if (matchingItems.length > perCharCap) {
+        matchingItems = matchingItems.slice(0, perCharCap);
+      }
+    }
     for (const item of matchingItems) {
       tasks.push({
         characterId: scan.characterId,
@@ -4796,6 +4969,7 @@ async function enqueueDownloadInternal(userId, rawFilter, useCharacterOverrides,
       });
     }
   }
+  const validTasks = tasks.filter((t) => getCharacterInvalidationEpoch(userId, t.characterId) === startEpochs.get(t.characterId));
   const clampPositiveInt = (raw, fallback, min, max) => {
     const value = typeof raw === "number" && Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : fallback;
     return Math.min(max, Math.max(min, value));
@@ -4806,7 +4980,7 @@ async function enqueueDownloadInternal(userId, rawFilter, useCharacterOverrides,
   const concurrency = clampPositiveInt(filter.concurrency, settings.concurrency, MIN_CONCURRENCY, MAX_CONCURRENCY);
   const queueProgress = await queueManager.getQueue(userId).startOrAppendBatch({
     userId,
-    tasks,
+    tasks: validTasks,
     maxItems,
     maxFileSizeBytes,
     timeoutMs,
@@ -4900,17 +5074,31 @@ async function handleFrontendRpcAction(userId, action, payload = {}) {
       if (inFlightAutoLocalize.has(lockKey))
         return { started: false };
       inFlightAutoLocalize.add(lockKey);
+      const startEpoch = getCharacterInvalidationEpoch(userId, characterId);
+      const isInvalidated = () => getCharacterInvalidationEpoch(userId, characterId) !== startEpoch;
       try {
         const state = await indexStore.getState(userId);
+        if (isInvalidated())
+          return { started: false };
         if (!state.settings.autoLocalizeOnOpen)
           return { started: false };
         if (state.autoLocalizedCharacterIds.includes(characterId)) {
           return { started: false };
         }
-        const scan = await performCharacterScan(userId, characterId, true);
+        let scan;
+        try {
+          scan = await performCharacterScan(userId, characterId, true);
+        } catch (err) {
+          logWarn(`auto_localize_character scan skipped for ${characterId}:`, err);
+          return { started: false };
+        }
+        if (isInvalidated())
+          return { started: false };
         const filter = buildEffectiveFilter(state.settings, scan);
         const matching = filterScanItemsForDownload(scan, filter);
         if (matching.length === 0) {
+          if (isInvalidated())
+            return { started: false };
           await indexStore.markAutoLocalized(userId, characterId);
           return { started: false };
         }
@@ -4918,6 +5106,10 @@ async function handleFrontendRpcAction(userId, action, payload = {}) {
           [characterId, scan]
         ]);
         const result = await enqueueDownloadInternal(userId, { ...filter, characterIds: [characterId] }, false, preloadedScans);
+        if (isInvalidated()) {
+          queueManager.getQueue(userId).cancelCharacterTasks(characterId);
+          return { started: false };
+        }
         await indexStore.markAutoLocalized(userId, characterId);
         return { started: true, queueProgress: result.queueProgress };
       } finally {
@@ -4976,6 +5168,7 @@ async function handleFrontendRpcAction(userId, action, payload = {}) {
       let removedCount = 0;
       const userQueue = queueManager.getQueue(userId);
       for (const characterId of targetCharacterIds) {
+        bumpCharacterInvalidationEpoch(userId, characterId);
         userQueue.cancelCharacterTasks(characterId, urls);
         evictCharacterCaches(characterId, [userId]);
         const res = await indexStore.removeCharacterAssets(userId, characterId, urls);
@@ -5133,6 +5326,9 @@ spindle.on("CHARACTER_DELETED", async (event, rawUserId) => {
   if (!characterId)
     return;
   evictCharacterCaches(characterId, explicitUserId ? [explicitUserId] : null);
+  for (const userId of targetUsers) {
+    bumpCharacterInvalidationEpoch(userId, characterId);
+  }
   for (const userId of targetUsers) {
     try {
       queueManager.getQueue(userId).cancelCharacterTasks(characterId);

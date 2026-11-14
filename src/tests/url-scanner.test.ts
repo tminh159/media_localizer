@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { sanitizeOverride } from "../shared/download-config.ts";
 import {
   deriveUrlFilenameParts,
   extractMediaTokensFromText,
@@ -247,6 +248,54 @@ describe("url-scanner", () => {
     expect(urls).toContain("http://avatars.charhub.io/avatars/upper2.jpg");
     expect(urls).toContain("https://avatars.charhub.io/avatars/nested.webp");
     expect(urls).toContain("https://avatars.charhub.io/avatars/trailing.png");
+  });
+
+  test("[M-01 & L-07] excludes .svg URLs while supporting .jfif/.pjp/.pjpeg parity", () => {
+    const sample = `
+      ![Badge](https://img.shields.io/badge/build-passing.svg)
+      <img src="https://cdn.example.com/divider.SVG?v=2" />
+      <div style="background-image: url('https://cdn.example.com/pattern.svg')"></div>
+      Bare svg: https://cdn.example.com/bare.svg
+      ![Jfif](https://cdn.example.com/photo.jfif)
+      <img src="https://cdn.example.com/photo2.pjp" />
+      Bare pjpeg: https://cdn.example.com/photo3.pjpeg
+    `;
+    const tokens = extractMediaTokensFromText(sample, { scanBareUrls: true });
+    const urls = tokens.map((t) => t.normalizedUrl);
+    expect(urls).toEqual([
+      "https://cdn.example.com/photo.jfif",
+      "https://cdn.example.com/photo2.pjp",
+      "https://cdn.example.com/photo3.pjpeg",
+    ]);
+
+    expect(deriveUrlFilenameParts("https://cdn.example.com/pic?format=jfif").ext).toBe("jfif");
+    expect(deriveUrlFilenameParts("https://cdn.example.com/pic?format=pjp").ext).toBe("pjp");
+    expect(deriveUrlFilenameParts("https://cdn.example.com/pic?format=pjpeg").ext).toBe("pjpeg");
+    expect(deriveUrlFilenameParts("https://cdn.example.com/pic?format=svg").ext).toBe("");
+
+    const nativeUrls = extractNativeGalleryUrlsFromCharacter({
+      id: "char-svg-native",
+      name: "SvgNative",
+      first_mes: "Bare https://cdn.example.com/badge.svg and https://cdn.example.com/ok.jfif",
+    });
+    expect(nativeUrls).toEqual(["https://cdn.example.com/ok.jfif"]);
+  });
+
+  test("[L-09] sanitizeOverride caps filter array lengths and string lengths", () => {
+    const manyDomains = Array.from({ length: 5050 }, (_, i) => `d${i}.example.com`);
+    const manyIndices = Array.from({ length: 5050 }, (_, i) => i);
+    const tooLongUrl = `https://cdn.example.com/${"a".repeat(2050)}.png`;
+
+    const sanitized = sanitizeOverride({
+      domains: [tooLongUrl, ...manyDomains],
+      excludedUrls: [tooLongUrl, "https://cdn.example.com/ok.png"],
+      greetingIndices: manyIndices,
+    });
+
+    expect(sanitized.domains?.length).toBe(5000);
+    expect(sanitized.domains).not.toContain(tooLongUrl);
+    expect(sanitized.excludedUrls).toEqual(["https://cdn.example.com/ok.png"]);
+    expect(sanitized.greetingIndices?.length).toBe(5000);
   });
 });
 

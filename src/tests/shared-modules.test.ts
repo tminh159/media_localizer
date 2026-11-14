@@ -26,13 +26,20 @@ import {
     type QueueJobProgress,
     type SectionCountSummary,
 } from "../shared/types";
-import { installMockDom, MockEvent } from "./helpers/mock-dom";
+import { installMockDom, MockEvent, MockKeyboardEvent } from "./helpers/mock-dom";
 import {
+    CHARACTER_PREFS_STORAGE_KEY,
     cleanupUiHelpers,
+    createInfoTip,
     createLazyMediaElement,
+    GALLERY_PREFS_STORAGE_KEY,
+    loadPrefsFromStorage,
     openMediaLightbox,
+    reobserveLazyMedia,
     sanitizeSafeMediaUrl,
+    savePrefsToStorage,
 } from "../ui/ui-helpers";
+import { MEDIA_LOCALIZER_STYLES } from "../ui/styles";
 import { NonDestructiveDisplaySwapper } from "../ui/display-swapper";
 import { NativeGalleryTabIntegrator } from "../ui/gallery-integrator";
 import { PortraitPanelLocalizeController } from "../ui/portrait-button";
@@ -1403,6 +1410,485 @@ describe("frontend lifecycle, ordering, bulk purge & permission retries", () => 
         } finally {
             cleanupUiHelpers();
             envDenied.domEnv.restore();
+        }
+    });
+});
+
+describe("audit fixes regression tests (ui-helpers, styles, gallery-integrator, display-swapper, portrait-button)", () => {
+    test("H-01: reobserveLazyMedia re-observes detached cached media elements and falls back when IntersectionObserver is absent", () => {
+        const domEnv = installMockDom();
+        try {
+            const card = domEnv.document.createElement("div");
+            const img = createLazyMediaElement({
+                src: "/api/v1/images/cached-1",
+                alt: "Cached",
+                mediaKind: "image",
+                className: "ml-thumb",
+            }) as any;
+            const vid = createLazyMediaElement({
+                src: "https://cdn.example.com/clip.mp4",
+                alt: "Clip",
+                mediaKind: "video",
+                className: "ml-thumb",
+            }) as any;
+            card.append(img, vid);
+            domEnv.document.body.appendChild(card);
+
+            const obs = (globalThis as any).IntersectionObserver.instances[0] as {
+                observedTargets: Set<any>;
+                trigger: (entries: Array<{ target: any; isIntersecting: boolean }>) => void;
+            };
+            expect(obs.observedTargets.has(img)).toBe(true);
+            expect(obs.observedTargets.has(vid)).toBe(true);
+
+            // Detach card and prune before viewport intersection
+            card.remove();
+            obs.trigger([
+                { target: img, isIntersecting: false },
+                { target: vid, isIntersecting: false },
+            ]);
+            expect(obs.observedTargets.has(img)).toBe(false);
+            expect(obs.observedTargets.has(vid)).toBe(false);
+            expect(img.getAttribute("src")).toBeNull();
+            expect(vid.getAttribute("src")).toBeNull();
+
+            // Re-attach cached card and call reobserveLazyMedia(card) + direct element call
+            domEnv.document.body.appendChild(card);
+            reobserveLazyMedia(card as unknown as Element);
+            expect(obs.observedTargets.has(img)).toBe(true);
+            expect(obs.observedTargets.has(vid)).toBe(true);
+
+            // Intersect img only
+            obs.trigger([{ target: img, isIntersecting: true }]);
+            expect(img.getAttribute("src")).toBe("/api/v1/images/cached-1?size=sm");
+            expect(obs.observedTargets.has(img)).toBe(false);
+
+            // Calling reobserveLazyMedia again must not re-observe already-loaded img
+            reobserveLazyMedia(img as unknown as Element);
+            expect(obs.observedTargets.has(img)).toBe(false);
+
+            // Detach vid, prune, then simulate IntersectionObserver unavailable -> immediate src assignment
+            vid.remove();
+            obs.trigger([{ target: vid, isIntersecting: false }]);
+            expect(vid.getAttribute("src")).toBeNull();
+
+            const savedIO = (globalThis as any).IntersectionObserver;
+            (globalThis as any).IntersectionObserver = undefined;
+            try {
+                domEnv.document.body.appendChild(vid);
+                reobserveLazyMedia(vid);
+                expect(vid.getAttribute("src")).toBe("https://cdn.example.com/clip.mp4");
+            } finally {
+                (globalThis as any).IntersectionObserver = savedIO;
+            }
+        } finally {
+            cleanupUiHelpers();
+            domEnv.restore();
+        }
+    });
+
+    test("H-03 & M-08: prefs storage helpers, NativeGalleryTabIntegrator sync, and pendingExternalRefreshWhileQueueActive", async () => {
+        const domEnv = installMockDom();
+        const origLocalStorage = globalThis.localStorage;
+        const store = new Map<string, string>();
+        (globalThis as any).localStorage = {
+            getItem: (k: string) => store.get(k) ?? null,
+            setItem: (k: string, v: string) => {
+                store.set(k, String(v));
+            },
+            removeItem: (k: string) => {
+                store.delete(k);
+            },
+        };
+
+        try {
+            expect(GALLERY_PREFS_STORAGE_KEY).toBe("lumiverse.media_localizer.gallery_prefs.v1");
+            expect(CHARACTER_PREFS_STORAGE_KEY).toBe("lumiverse.media_localizer.character_prefs.v1");
+
+            savePrefsToStorage(CHARACTER_PREFS_STORAGE_KEY, {
+                thumbnailSize: "lg",
+                mediaViewMode: "list",
+                showDownloadConfig: true,
+                showDownloadedMedia: true,
+            });
+            const loaded = loadPrefsFromStorage<Record<string, unknown>>(
+                CHARACTER_PREFS_STORAGE_KEY,
+                (raw) => raw as Record<string, unknown>,
+                () => ({}),
+            );
+            expect(loaded.thumbnailSize).toBe("lg");
+
+            store.set(GALLERY_PREFS_STORAGE_KEY, "{not-valid-json");
+            expect(
+                loadPrefsFromStorage(
+                    GALLERY_PREFS_STORAGE_KEY,
+                    () => ({ ok: true }),
+                    () => ({ ok: false }),
+                ),
+            ).toEqual({ ok: false });
+
+            const galleryTab = domEnv.document.createElement("div");
+            galleryTab.className = "Editor_galleryTab_sync";
+            domEnv.document.body.appendChild(galleryTab);
+
+            const ctx = {
+                ui: {
+                    characterEditor: {
+                        getState: () => ({
+                            open: true,
+                            characterId: "char-sync",
+                            activeTabId: "gallery",
+                            extensions: {},
+                        }),
+                        onChange: () => () => {},
+                    },
+                },
+            } as any;
+
+            const scanHistory: Array<{ charId: string; forceRefresh: boolean | undefined }> = [];
+            let prefsUpdatedNotified = 0;
+
+            const integrator = new NativeGalleryTabIntegrator(
+                ctx,
+                DEFAULT_SETTINGS,
+                makeIdleQueueProgress(),
+                {
+                    onScanCharacter: async (charId, forceRefresh) => {
+                        scanHistory.push({ charId, forceRefresh });
+                        const scan = makeScanResult(charId, 1);
+                        scan.items[0] = {
+                            ...scan.items[0]!,
+                            status: "localized",
+                            localizedEntry: {
+                                normalizedUrl: scan.items[0]!.normalizedUrl,
+                                rawUrls: scan.items[0]!.rawUrls,
+                                imageId: "img-sync-1",
+                                localUrl: "/api/v1/images/img-sync-1",
+                                mimeType: "image/png",
+                                sizeBytes: 512,
+                                filename: "pic-0.png",
+                                localizedAt: 1000,
+                                characterIds: [charId],
+                                galleryItemIds: {},
+                            },
+                        };
+                        return scan;
+                    },
+                    onSaveCharacterOverride: async () => null,
+                    onStartDownload: async () => {},
+                    onPurgeCharacterCache: async () => {},
+                    onClearFailedUrls: async () => {},
+                    onQueueControl: async () => {},
+                },
+                {
+                    onCharacterPrefsUpdated: () => {
+                        prefsUpdatedNotified++;
+                    },
+                },
+            );
+
+            integrator.start();
+            await new Promise((r) => setTimeout(r, 15));
+
+            const host = galleryTab.querySelector(".ml-gallery-host") as unknown as HTMLElement;
+            expect(host).not.toBeNull();
+            // Inherited lg size while staying collapsed in Native Gallery
+            const widgetEl = host.querySelector(".ml-widget") as unknown as HTMLElement;
+            expect(widgetEl.classList.contains("is-thumb-lg")).toBe(true);
+            expect(host.querySelector(".ml-asset-grid")).toBeNull();
+            expect(host.querySelector(".ml-options-panel")).toBeNull();
+
+            // Expand Downloaded Media and click Small ("S") -> updates shared storage (preserving Drawer's showDownloadedMedia: true) and notifies
+            (host.querySelector('button[title="Expand Downloaded Media"]') as any).click();
+            const smBtn = host.querySelector('button[title="Small thumbnails"]') as any;
+            expect(smBtn).not.toBeNull();
+            smBtn.click();
+
+            expect(prefsUpdatedNotified).toBe(1);
+            const savedAfterClick = JSON.parse(store.get(CHARACTER_PREFS_STORAGE_KEY)!);
+            expect(savedAfterClick.thumbnailSize).toBe("sm");
+            expect(savedAfterClick.showDownloadedMedia).toBe(true);
+            expect((host.querySelector(".ml-widget") as unknown as HTMLElement).classList.contains("is-thumb-sm")).toBe(true);
+
+            // Drawer updates storage to md -> syncPreferencesFromStorage updates mounted embedded widget without collapsing it
+            savePrefsToStorage(CHARACTER_PREFS_STORAGE_KEY, {
+                ...savedAfterClick,
+                thumbnailSize: "md",
+            });
+            integrator.syncPreferencesFromStorage();
+            expect((host.querySelector(".ml-widget") as unknown as HTMLElement).classList.contains("is-thumb-md")).toBe(true);
+            expect(host.querySelector(".ml-media-list")).not.toBeNull();
+
+            // M-08: queue running -> native gallery card added -> queue completes -> triggers forced refreshScan(true)
+            const galleryObserver = domEnv.mutationObservers.instances.find((inst) =>
+                inst.observed.some((o) => o.target === galleryTab),
+            )!;
+            integrator.updateExternalState(DEFAULT_SETTINGS, {
+                ...makeIdleQueueProgress(),
+                status: "running",
+                totalQueued: 1,
+            });
+            const card = domEnv.document.createElement("div");
+            card.className = "Editor_galleryCard_new";
+            galleryTab.appendChild(card);
+            galleryObserver.trigger([{ target: galleryTab }]);
+            await new Promise((r) => setTimeout(r, 640));
+            const countWhileRunning = scanHistory.length;
+
+            integrator.updateExternalState(DEFAULT_SETTINGS, {
+                ...makeIdleQueueProgress(),
+                status: "completed",
+                totalQueued: 1,
+                completedCount: 1,
+            });
+            await new Promise((r) => setTimeout(r, 15));
+            expect(scanHistory.length).toBe(countWhileRunning + 1);
+            expect(scanHistory[scanHistory.length - 1]?.forceRefresh).toBe(true);
+
+            integrator.stop();
+        } finally {
+            (globalThis as any).localStorage = origLocalStorage;
+            cleanupUiHelpers();
+            domEnv.restore();
+        }
+    });
+
+    test("M-09 & L-08: DisplaySwapper observes same-origin iframe mutations/errors, fast-paths <style>, and PortraitPanel skips subtree scans when mounted", async () => {
+        const domEnv = installMockDom();
+        try {
+            // 1. Same-origin iframe observation & style fast-path
+            const iframe = domEnv.document.createElement("iframe") as any;
+            const iframeDoc = new (domEnv.document.constructor as any)();
+            const iframeImg = iframeDoc.createElement("img");
+            iframeImg.setAttribute("src", "https://cdn.example.com/in-frame.png");
+            iframeDoc.body.appendChild(iframeImg);
+            iframe.contentDocument = iframeDoc;
+
+            const plainStyle = domEnv.document.createElement("style");
+            plainStyle.textContent = ".foo { color: red; }";
+            let resolveBaseCalls = 0;
+
+            domEnv.document.body.append(iframe, plainStyle);
+
+            const ctx = { getActiveChat: () => ({ characterId: "char-1" }) } as any;
+            const swapper = new NonDestructiveDisplaySwapper(ctx);
+            const origResolveBase = (swapper as any).resolveBase.bind(swapper);
+            (swapper as any).resolveBase = (el: Element, name: string, current: string) => {
+                if (el === (plainStyle as any)) resolveBaseCalls++;
+                return origResolveBase(el, name, current);
+            };
+
+            swapper.start();
+            swapper.updateMap({
+                characterUrlMaps: {
+                    "char-1": {
+                        "https://cdn.example.com/in-frame.png": "/api/v1/images/in-frame",
+                        "https://cdn.example.com/dyn.png": "/api/v1/images/dyn",
+                        "https://cdn.example.com/err.png": "/api/v1/images/err",
+                    },
+                },
+                allUrlsMap: {},
+                updatedAt: 10,
+            });
+
+            // <style> without url() and without data-ml-original-css skipped resolveBase
+            expect(resolveBaseCalls).toBe(0);
+            expect(iframeImg.getAttribute("src")).toBe("/api/v1/images/in-frame");
+
+            // Dynamic DOM mutation inside iframe triggers schedulePass()
+            const iframeObserver = domEnv.mutationObservers.instances.find((inst) =>
+                inst.observed.some((o) => o.target === iframeDoc.documentElement),
+            );
+            expect(iframeObserver).toBeDefined();
+
+            const dynImg = iframeDoc.createElement("img");
+            dynImg.setAttribute("src", "https://cdn.example.com/dyn.png");
+            iframeDoc.body.appendChild(dynImg);
+            iframeObserver!.trigger([
+                {
+                    type: "childList",
+                    target: iframeDoc.body,
+                    addedNodes: [dynImg],
+                    removedNodes: [],
+                    attributeName: null,
+                },
+            ]);
+            domEnv.window.flushAnimationFrames();
+            expect(dynImg.getAttribute("src")).toBe("/api/v1/images/dyn");
+
+            // Capture-phase error listener inside iframe swaps failed media immediately
+            const errImg = iframeDoc.createElement("img");
+            errImg.setAttribute("src", "https://cdn.example.com/err.png");
+            iframeDoc.body.appendChild(errImg);
+            const errEv = new MockEvent("error", { bubbles: false });
+            errEv.target = errImg;
+            iframeDoc.dispatchEvent(errEv);
+            expect(errImg.getAttribute("src")).toBe("/api/v1/images/err");
+
+            expect(iframeDoc.getListenerCount("error")).toBe(1);
+            swapper.stop();
+            expect(iframeDoc.getListenerCount("error")).toBe(0);
+            expect(iframeImg.getAttribute("src")).toBe("https://cdn.example.com/in-frame.png");
+
+            // 2. PortraitPanelLocalizeController skips querySelector on external addedNodes when mountedPanel is connected
+            const outer = domEnv.document.createElement("div");
+            outer.className = "panelOuter";
+            const panel = domEnv.document.createElement("div");
+            panel.className = "panel";
+            const nameEl = domEnv.document.createElement("div");
+            nameEl.className = "name";
+            panel.appendChild(nameEl);
+            outer.appendChild(panel);
+            const chatFeed = domEnv.document.createElement("div");
+            chatFeed.className = "chatFeed";
+            domEnv.document.body.append(outer, chatFeed);
+
+            const controller = new PortraitPanelLocalizeController({
+                getActiveCharacterId: () => "char-1",
+                getPendingCount: () => 1,
+                getQueueProgress: () => makeIdleQueueProgress(),
+                onLocalizeActiveCharacter: async () => {},
+                onOpenCharacterTab: () => {},
+            });
+            controller.start();
+
+            const msgNode = domEnv.document.createElement("div");
+            let queryCalls = 0;
+            const origQs = msgNode.querySelector.bind(msgNode);
+            msgNode.querySelector = ((sel: string) => {
+                queryCalls++;
+                return origQs(sel);
+            }) as any;
+
+            const relevantWhileMounted = (controller as any).isRelevantMutation({
+                type: "childList",
+                target: chatFeed,
+                addedNodes: [msgNode],
+                removedNodes: [],
+                attributeName: null,
+            });
+            expect(relevantWhileMounted).toBe(false);
+            expect(queryCalls).toBe(0);
+
+            controller.stop();
+        } finally {
+            cleanupUiHelpers();
+            domEnv.restore();
+        }
+    });
+
+    test("L-01, L-02 & styles: Lightbox Escape stopPropagation + video preservation, InfoTip cleanup/alignment, URL parens, and standalone widget rules", async () => {
+        const domEnv = installMockDom();
+        try {
+            // 1. Balanced vs unbalanced parenthesis guard in sanitizeSafeMediaUrl
+            expect(sanitizeSafeMediaUrl("https://example.com/char_(v2).webp")).toBe(
+                "https://example.com/char_(v2).webp",
+            );
+            expect(sanitizeSafeMediaUrl("https://example.com/a)b.png")).toBeNull();
+            expect(sanitizeSafeMediaUrl("https://example.com/a(b.png")).toBeNull();
+
+            // 2. Styles verification
+            expect(MEDIA_LOCALIZER_STYLES).toContain(".ml-widget.is-drawer");
+            expect(MEDIA_LOCALIZER_STYLES).toContain(".ml-widget.is-embedded");
+            expect(MEDIA_LOCALIZER_STYLES).toContain(".ml-combined-bar .ml-tip-popover");
+            expect(MEDIA_LOCALIZER_STYLES).not.toContain("var(--ml-asset-thumb-height, 76px)");
+
+            // 3. Lightbox Escape/Arrow stopPropagation + non-active async remove preserves video element
+            let hostKeydowns = 0;
+            const hostKeyListener = () => {
+                hostKeydowns++;
+            };
+            domEnv.document.addEventListener("keydown", hostKeyListener);
+
+            let resolveSlide1Remove!: () => void;
+            openMediaLightbox(
+                [
+                    {
+                        id: "slide-1",
+                        localUrl: "/api/v1/images/slide-1",
+                        mediaKind: "image",
+                        title: "Slide 1",
+                        onRemove: async () =>
+                            new Promise<void>((r) => {
+                                resolveSlide1Remove = r;
+                            }),
+                    },
+                    {
+                        id: "slide-2",
+                        localUrl: "https://cdn.example.com/slide-2.mp4",
+                        mediaKind: "video",
+                        title: "Slide 2",
+                    },
+                ],
+                0,
+            );
+
+            const removeBtn = domEnv.document.querySelector(
+                'button[title*="Remove this localized asset"]',
+            ) as any;
+            removeBtn.click();
+
+            // Step to slide-2 with ArrowRight
+            const rightEv = new MockKeyboardEvent("keydown", { key: "ArrowRight", cancelable: true });
+            domEnv.window.dispatchEvent(rightEv);
+            expect(rightEv.propagationStopped).toBe(true);
+
+            const videoBeforeResolve = domEnv.document.querySelector("video.ml-lightbox-media");
+            expect(videoBeforeResolve).not.toBeNull();
+
+            // Settle slide-1 removal: slide-2 video DOM element must remain untouched
+            resolveSlide1Remove();
+            await new Promise((r) => setTimeout(r, 15));
+            const videoAfterResolve = domEnv.document.querySelector("video.ml-lightbox-media");
+            expect(videoAfterResolve).toBe(videoBeforeResolve);
+            expect(domEnv.document.body.textContent).toContain("1 / 1");
+
+            // Escape closes lightbox and calls stopPropagation()
+            const escEv = new MockKeyboardEvent("keydown", { key: "Escape", cancelable: true });
+            domEnv.window.dispatchEvent(escEv);
+            expect(escEv.propagationStopped).toBe(true);
+            expect(domEnv.document.querySelector(".ml-lightbox-backdrop")).toBeNull();
+            expect(hostKeydowns).toBe(0);
+            domEnv.document.removeEventListener("keydown", hostKeyListener);
+
+            // 4. InfoTip smart alignment + detached trigger cleanup
+            const drawerBody = domEnv.document.createElement("div") as any;
+            drawerBody.className = "ml-drawer-body";
+            drawerBody.getBoundingClientRect = () => ({
+                left: 0,
+                right: 300,
+                width: 300,
+                top: 0,
+                bottom: 500,
+                height: 500,
+            });
+            const tip = createInfoTip("Right-edge help tip") as any;
+            tip.getBoundingClientRect = () => ({
+                left: 260,
+                right: 276,
+                width: 16,
+                top: 10,
+                bottom: 26,
+                height: 16,
+            });
+            drawerBody.appendChild(tip);
+            domEnv.document.body.appendChild(drawerBody);
+
+            const tipBtn = tip.querySelector(".ml-tip-btn") as any;
+            tipBtn.click();
+            expect(tip.classList.contains("is-open")).toBe(true);
+            expect(tip.classList.contains("is-align-right")).toBe(true);
+            expect(domEnv.document.getListenerCount("click")).toBe(1);
+
+            // Detach open tip and trigger document click -> closes and removes document listeners
+            tip.remove();
+            domEnv.document.dispatchEvent(new MockEvent("click", { bubbles: true }));
+            expect(tip.classList.contains("is-open")).toBe(false);
+            expect(domEnv.document.getListenerCount("click")).toBe(0);
+            expect(domEnv.document.getListenerCount("keydown")).toBe(0);
+        } finally {
+            cleanupUiHelpers();
+            domEnv.restore();
         }
     });
 });

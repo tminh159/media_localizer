@@ -141,7 +141,34 @@ export async function reconcileCharacterGalleryWithIndex(
   userId: string,
   character: CharacterDTO,
   scanItems: DiscoveredMediaItem[],
+  options?: { isStale?: () => boolean },
 ): Promise<GalleryReconciliationResult> {
+  const emptyResult = (): GalleryReconciliationResult => ({
+    indexChanged: false,
+    adoptedCount: 0,
+    prunedCount: 0,
+    pendingGalleryLinks: [],
+    unmatchedGalleryCandidates: [],
+  });
+  if (options?.isStale?.()) {
+    return emptyResult();
+  }
+  // Snapshot each asset's pre-fetch galleryItemId for this character before any async
+  // host calls so concurrent `record_gallery_links` RPCs cannot be falsely pruned.
+  const preScanState = await indexStore.getState(userId);
+  if (options?.isStale?.()) {
+    return emptyResult();
+  }
+  const preGalleryItemIdsByUrl = new Map<string, string | undefined>();
+  for (const entry of Object.values(preScanState.assets)) {
+    if (!entry.characterIds.includes(character.id)) continue;
+    const preId =
+      entry.galleryItemIds && Object.hasOwn(entry.galleryItemIds, character.id)
+        ? entry.galleryItemIds[character.id]
+        : undefined;
+    preGalleryItemIdsByUrl.set(entry.normalizedUrl, preId);
+  }
+
   let galleryItems: CharacterGalleryItemDTO[] | null = null;
   if (typeof spindle.characters?.getGallery === "function") {
     try {
@@ -245,12 +272,19 @@ export async function reconcileCharacterGalleryWithIndex(
       entry.galleryItemIds && Object.hasOwn(entry.galleryItemIds, character.id)
         ? entry.galleryItemIds[character.id]
         : undefined;
+    const preGalleryItemId = preGalleryItemIdsByUrl.get(entry.normalizedUrl);
     const inNativeGallery = galleryByImageId.has(entry.imageId);
     const inNativeExpressions = expressionInfo.allImageIds.has(entry.imageId);
 
     if (knownGalleryItemId === NATIVE_EXPRESSION_SENTINEL) {
-      if (!inNativeExpressions && !inNativeGallery) continue;
-    } else if (galleryItems !== null && knownGalleryItemId && !inNativeGallery) {
+      if (preGalleryItemId === NATIVE_EXPRESSION_SENTINEL && !inNativeExpressions && !inNativeGallery) continue;
+    } else if (
+      galleryItems !== null &&
+      knownGalleryItemId &&
+      !inNativeGallery &&
+      preGalleryItemId !== undefined &&
+      knownGalleryItemId === preGalleryItemId
+    ) {
       continue;
     }
     if (!inNativeGallery && !imageMetaById.has(entry.imageId)) {
@@ -264,10 +298,21 @@ export async function reconcileCharacterGalleryWithIndex(
     verifyMissingIds,
     new Map<string, ImageDTO>(),
   );
+  if (options?.isStale?.()) {
+    return emptyResult();
+  }
 
   const {
     result: { indexChanged, prunedCount, adoptedCount, claimedImageIds },
   } = await indexStore.batchUpdate(userId, (tx) => {
+    if (options?.isStale?.()) {
+      return {
+        indexChanged: false,
+        prunedCount: 0,
+        adoptedCount: 0,
+        claimedImageIds: new Set<string>(),
+      };
+    }
     const state = tx.state;
     const adoptEnabled = state.settings.adoptNativeGalleryImages;
     let localIndexChanged = false;
@@ -289,11 +334,16 @@ export async function reconcileCharacterGalleryWithIndex(
         entry.galleryItemIds && Object.hasOwn(entry.galleryItemIds, character.id)
           ? entry.galleryItemIds[character.id]
           : undefined;
+      const preGalleryItemId = preGalleryItemIdsByUrl.get(entry.normalizedUrl);
       const inNativeGallery = galleryByImageId.has(entry.imageId);
       const inNativeExpressions = expressionInfo.allImageIds.has(entry.imageId);
 
       if (knownGalleryItemId === NATIVE_EXPRESSION_SENTINEL) {
-        if (!inNativeExpressions && !inNativeGallery) {
+        if (
+          preGalleryItemId === NATIVE_EXPRESSION_SENTINEL &&
+          !inNativeExpressions &&
+          !inNativeGallery
+        ) {
           // Pass undefined for galleryItemId so other native expressions sharing the sentinel are not unlinked.
           const removed = tx.unlinkByCharacterImageId(
             character.id,
@@ -306,7 +356,13 @@ export async function reconcileCharacterGalleryWithIndex(
           }
           continue;
         }
-      } else if (galleryItems !== null && knownGalleryItemId && !inNativeGallery) {
+      } else if (
+        galleryItems !== null &&
+        knownGalleryItemId &&
+        !inNativeGallery &&
+        preGalleryItemId !== undefined &&
+        knownGalleryItemId === preGalleryItemId
+      ) {
         // If this asset was previously linked in the character's native Gallery and is no longer there,
         // the user removed it from the Gallery while the extension was off (or in another tab).
         const removed = tx.unlinkByCharacterImageId(
@@ -388,7 +444,7 @@ export async function reconcileCharacterGalleryWithIndex(
         normalizedUrl: item.normalizedUrl,
         rawUrls: item.rawUrls,
         imageId: cand.imageId,
-        localUrl: `/api/v1/images/${cand.imageId}`,
+        localUrl: `/api/v1/images/${encodeURIComponent(cand.imageId)}`,
         mimeType: cand.mimeType || "image/png",
         sizeBytes: cand.byteSize || 0,
         filename,

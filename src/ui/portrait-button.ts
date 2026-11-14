@@ -71,9 +71,12 @@ export class PortraitPanelLocalizeController {
     }
 
     const mountedPanel = this.wrapEl?.parentElement ?? null;
+    const isMountedConnected = Boolean(
+      mountedPanel && mountedPanel.isConnected !== false,
+    );
     if (
+      isMountedConnected &&
       mountedPanel &&
-      mountedPanel.isConnected !== false &&
       (mountedPanel.contains(target) || target.contains?.(mountedPanel))
     ) {
       return true;
@@ -87,6 +90,7 @@ export class PortraitPanelLocalizeController {
       const el = node as Element;
       if (el.classList?.contains(WRAP_CLASS)) return true;
       if (el.matches?.('[class*="panelOuter"], [class*="panel"]')) return true;
+      if (isMountedConnected) return false;
       return el.querySelector?.('[class*="panelOuter"] [class*="panel"]') !== null;
     };
 
